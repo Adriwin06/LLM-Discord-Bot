@@ -130,15 +130,24 @@ class EventHandler(commands.Cog):
             
             summarize_every_messages = settings.get("summarize_every_messages", self.bot.config.DEFAULT_SUMMARIZE_EVERY_MESSAGES)
             if msg_count >= summarize_every_messages:
+                logging.info(f"Triggering channel summary update for {channel_id} due to message count ({msg_count} >= {summarize_every_messages})")
                 await self.bot.context_manager.update_channel_summary(guild_id, channel_id)
             else:
                 # Check time-based trigger only if message count not met
                 summarize_every_hours = settings.get("summarize_every_hours", self.bot.config.DEFAULT_SUMMARIZE_EVERY_HOURS)
                 last_summary_time_str = channel_data.get("last_summary_time")
                 if last_summary_time_str:
-                    last_summary_time = datetime.fromisoformat(last_summary_time_str)
-                    if (datetime.now(timezone.utc) - last_summary_time).total_seconds() > summarize_every_hours * 3600:
-                        await self.bot.context_manager.update_channel_summary(guild_id, channel_id)
+                    try:
+                        last_summary_time = datetime.fromisoformat(last_summary_time_str)
+                        hours_since_summary = (datetime.now(timezone.utc) - last_summary_time).total_seconds() / 3600
+                        if hours_since_summary >= summarize_every_hours:
+                            logging.info(f"Triggering channel summary update for {channel_id} due to time ({hours_since_summary:.1f} hours >= {summarize_every_hours} hours)")
+                            await self.bot.context_manager.update_channel_summary(guild_id, channel_id)
+                    except ValueError as e:
+                        logging.warning(f"Invalid last_summary_time format for channel {channel_id}: {last_summary_time_str} - {e}")
+                elif msg_count >= 10:  # Create initial summary after some activity
+                    logging.info(f"Creating initial channel summary for {channel_id} after {msg_count} messages")
+                    await self.bot.context_manager.update_channel_summary(guild_id, channel_id)
 
             # User Profile Trigger
             user_data = data["users"][user_id]

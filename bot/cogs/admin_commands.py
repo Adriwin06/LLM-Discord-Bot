@@ -191,7 +191,161 @@ class AdminCommands(commands.Cog):
         except Exception as e:
             await interaction.followup.send(f"Error checking model capabilities: {str(e)}", ephemeral=True)
 
-async def setup(bot):
-    await bot.add_cog(AdminCommands(bot))
+    summary_group = app_commands.Group(name="summary", description="Manage channel summaries.")
+
+    @summary_group.command(name="view", description="View the current summary for a channel.")
+    @app_commands.checks.has_permissions(manage_messages=True)
+    async def view_summary(self, interaction: discord.Interaction, channel: discord.TextChannel = None):
+        await interaction.response.defer(ephemeral=True)
+        
+        target_channel = channel or interaction.channel
+        guild_id = str(interaction.guild.id)
+        channel_id = str(target_channel.id)
+        
+        try:
+            summary_data = await self.bot.context_manager.get_channel_summary(guild_id, channel_id)
+            
+            embed = discord.Embed(
+                title=f"Channel Summary: #{target_channel.name}",
+                color=discord.Color.blue()
+            )
+            
+            # Add summary text
+            summary_text = summary_data["summary"]
+            if len(summary_text) > 1024:
+                summary_text = summary_text[:1021] + "..."
+            embed.add_field(name="Summary", value=summary_text, inline=False)
+            
+            # Add metadata
+            last_update = summary_data.get("last_summary_time")
+            if last_update:
+                try:
+                    from datetime import datetime
+                    update_time = datetime.fromisoformat(last_update)
+                    timestamp = f"<t:{int(update_time.timestamp())}:R>"
+                except Exception:
+                    timestamp = last_update
+            else:
+                timestamp = "Never"
+            
+            embed.add_field(name="Last Updated", value=timestamp, inline=True)
+            embed.add_field(name="Messages Since Update", value=str(summary_data["messages_since_summary"]), inline=True)
+            embed.add_field(name="Messages Processed", value=str(summary_data["messages_processed"]), inline=True)
+            embed.add_field(name="Summary Type", value=summary_data["summary_type"].title(), inline=True)
+            
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            
+        except Exception as e:
+            await interaction.followup.send(f"Error retrieving channel summary: {str(e)}", ephemeral=True)
+
+    @summary_group.command(name="update", description="Force an immediate update of a channel's summary.")
+    @app_commands.checks.has_permissions(manage_messages=True)
+    async def update_summary(self, interaction: discord.Interaction, channel: discord.TextChannel = None):
+        await interaction.response.defer(ephemeral=True)
+        
+        target_channel = channel or interaction.channel
+        guild_id = str(interaction.guild.id)
+        channel_id = str(target_channel.id)
+        
+        try:
+            # Show thinking message
+            await interaction.followup.send(f"🔄 Updating summary for #{target_channel.name}... This may take a moment.", ephemeral=True)
+            
+            success = await self.bot.context_manager.force_channel_summary_update(guild_id, channel_id)
+            
+            if success:
+                await interaction.edit_original_response(content=f"✅ Successfully updated summary for #{target_channel.name}!")
+            else:
+                await interaction.edit_original_response(content=f"❌ Failed to update summary for #{target_channel.name}. Check logs for details.")
+                
+        except Exception as e:
+            await interaction.edit_original_response(content=f"❌ Error updating channel summary: {str(e)}")
+
+    @app_commands.command(name="summary_update", description="Force an immediate update of a channel's summary.")
+    @app_commands.checks.has_permissions(manage_messages=True)
+    async def summary_update(self, interaction: discord.Interaction, channel: discord.TextChannel = None):
+        """Alias for /summary update"""
+        await self.update_summary(interaction, channel)
+
+    @summary_group.command(name="clear", description="Clear a channel's summary and reset counters.")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def clear_summary(self, interaction: discord.Interaction, channel: discord.TextChannel = None):
+        await interaction.response.defer(ephemeral=True)
+        
+        target_channel = channel or interaction.channel
+        guild_id = str(interaction.guild.id)
+        channel_id = str(target_channel.id)
+        
+        try:
+            success = await self.bot.context_manager.clear_channel_summary(guild_id, channel_id)
+            
+            if success:
+                await interaction.followup.send(f"✅ Cleared summary for #{target_channel.name} and reset counters.", ephemeral=True)
+            else:
+                await interaction.followup.send(f"ℹ️ No summary found for #{target_channel.name} to clear.", ephemeral=True)
+                
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error clearing channel summary: {str(e)}", ephemeral=True)
+
+    @summary_group.command(name="settings", description="View or modify summary settings for a channel.")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def summary_settings(self, interaction: discord.Interaction, 
+                              channel: discord.TextChannel = None,
+                              summarize_every_messages: int = None,
+                              summarize_every_hours: int = None):
+        await interaction.response.defer(ephemeral=True)
+        
+        target_channel = channel or interaction.channel
+        guild_id = str(interaction.guild.id)
+        channel_id = str(target_channel.id)
+        
+        try:
+            if summarize_every_messages is not None or summarize_every_hours is not None:
+                # Update settings
+                settings = await self.bot.store.get_settings()
+                if guild_id not in settings:
+                    settings[guild_id] = {}
+                if "channel_overrides" not in settings[guild_id]:
+                    settings[guild_id]["channel_overrides"] = {}
+                if channel_id not in settings[guild_id]["channel_overrides"]:
+                    settings[guild_id]["channel_overrides"][channel_id] = {}
+                
+                if summarize_every_messages is not None:
+                    settings[guild_id]["channel_overrides"][channel_id]["summarize_every_messages"] = summarize_every_messages
+                if summarize_every_hours is not None:
+                    settings[guild_id]["channel_overrides"][channel_id]["summarize_every_hours"] = summarize_every_hours
+                
+                await self.bot.store.save_settings(settings)
+                await interaction.followup.send(f"✅ Updated summary settings for #{target_channel.name}.", ephemeral=True)
+            else:
+                # View current settings
+                current_settings = await self.bot.context_manager.get_guild_and_channel_settings(guild_id, channel_id)
+                
+                embed = discord.Embed(
+                    title=f"Summary Settings: #{target_channel.name}",
+                    color=discord.Color.orange()
+                )
+                
+                embed.add_field(
+                    name="Messages Trigger",
+                    value=f"{current_settings.get('summarize_every_messages', self.bot.config.DEFAULT_SUMMARIZE_EVERY_MESSAGES)} messages",
+                    inline=True
+                )
+                embed.add_field(
+                    name="Time Trigger", 
+                    value=f"{current_settings.get('summarize_every_hours', self.bot.config.DEFAULT_SUMMARIZE_EVERY_HOURS)} hours",
+                    inline=True
+                )
+                embed.add_field(
+                    name="Model",
+                    value=current_settings.get('model', self.bot.config.MAIN_LLM_MODEL),
+                    inline=False
+                )
+                
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error managing summary settings: {str(e)}", ephemeral=True)
+
 async def setup(bot):
     await bot.add_cog(AdminCommands(bot))

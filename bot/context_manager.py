@@ -426,68 +426,261 @@ class ContextManager:
             return f"[Could not process file: {attachment.filename} - Error: {str(e)[:50]}...]"
 
     async def update_channel_summary(self, guild_id: str, channel_id: str):
-        logging.info(f"Updating summary for channel {channel_id} in guild {guild_id}...")
-        data = await self.store.get_guild_data(guild_id)
-        settings = await self.get_guild_and_channel_settings(guild_id, channel_id)
-        
-        channel_data = data.get("channels", {}).get(channel_id, {})
-        old_summary = channel_data.get("summary", "No summary yet.")
-        
-        # Fetch recent messages since last summary
-        channel = self.bot.get_channel(int(channel_id))
-        if not channel:
-            logging.warning(f"Cannot update summary, channel {channel_id} not found.")
-            return
-
-        history_limit = settings.get("summarize_every_messages", self.config.DEFAULT_SUMMARIZE_EVERY_MESSAGES)
-        recent_messages = [msg async for msg in channel.history(limit=history_limit)]
-        recent_messages.reverse() # Oldest to newest
-        
-        if not recent_messages:
-            logging.info(f"No new messages to summarize for channel {channel_id}.")
-            return
-
-        conversation_text = "\n".join([f"{msg.author.display_name}: {msg.content}" for msg in recent_messages])
-
-        prompt = f"""
-        You are a conversation summarizer.
-        The current summary of the channel is:
-        ---
-        {old_summary}
-        ---
-        Below are the most recent messages from the channel.
-        Integrate the key topics, questions, and conclusions from these new messages into the existing summary.
-        The summary should be a concise, high-level overview of the channel's ongoing conversation.
-        Do not mention that you are updating a summary. Just provide the new, complete summary.
-
-        New Messages:
-        ---
-        {conversation_text}
-        ---
-        New, updated summary:
         """
+        Update the channel summary by integrating recent messages with the existing summary.
+        This uses an incremental approach to build a comprehensive, evolving narrative.
+        """
+        logging.info(f"Updating summary for channel {channel_id} in guild {guild_id}...")
         
         try:
+            data = await self.store.get_guild_data(guild_id)
+            settings = await self.get_guild_and_channel_settings(guild_id, channel_id)
+            
+            # Get channel and validate it exists
+            channel = self.bot.get_channel(int(channel_id))
+            if not channel:
+                logging.warning(f"Cannot update summary, channel {channel_id} not found.")
+                return
+            
+            # Get current channel data
+            channel_data = data.get("channels", {}).get(channel_id, {})
+            old_summary = channel_data.get("summary", "")
+            last_summary_time = channel_data.get("last_summary_time")
+            
+            # Determine how many messages to fetch based on settings
+            history_limit = settings.get("summarize_every_messages", self.config.DEFAULT_SUMMARIZE_EVERY_MESSAGES)
+            
+            # If we have a last summary time, try to fetch messages since then
+            # Otherwise, use the message count limit
+            after_time = None
+            if last_summary_time:
+                try:
+                    after_time = datetime.fromisoformat(last_summary_time)
+                    # Add a small buffer to avoid missing messages due to timing
+                    after_time = after_time.replace(microsecond=0)
+                except ValueError:
+                    logging.warning(f"Invalid last_summary_time format: {last_summary_time}")
+            
+            # Fetch recent messages
+            recent_messages = []
+            message_count = 0
+            
+            async for msg in channel.history(limit=min(history_limit * 2, 500), after=after_time):
+                # Filter out bot messages (except for important context)
+                if msg.author.bot and msg.author.id != self.bot.user.id:
+                    continue
+                
+                # Skip very short messages that don't add context
+                if len(msg.content.strip()) < 3 and not msg.attachments:
+                    continue
+                    
+                recent_messages.append(msg)
+                message_count += 1
+                
+                # If we have enough messages and no specific time constraint, stop
+                if not after_time and message_count >= history_limit:
+                    break
+            
+            recent_messages.reverse()  # Oldest to newest
+            
+            if not recent_messages:
+                logging.info(f"No new messages to summarize for channel {channel_id}.")
+                return
+            
+            logging.info(f"Processing {len(recent_messages)} messages for channel summary update.")
+            
+            # Build conversation text with rich context
+            conversation_lines = []
+            for msg in recent_messages:
+                # Format message with timestamp and user info
+                timestamp = msg.created_at.strftime("%Y-%m-%d %H:%M")
+                author_name = msg.author.display_name
+                
+                # Handle message content
+                content = msg.content.strip() if msg.content else ""
+                
+                # Add attachment information
+                attachment_info = ""
+                if msg.attachments:
+                    attachments = [f"[{att.filename}]" for att in msg.attachments]
+                    attachment_info = f" (attachments: {', '.join(attachments)})"
+                
+                # Handle replies
+                reply_info = ""
+                if msg.reference and msg.reference.resolved:
+                    reply_to = msg.reference.resolved.author.display_name
+                    reply_info = f" (replying to {reply_to})"
+                
+                # Combine all parts
+                if content or attachment_info:
+                    full_message = f"[{timestamp}] {author_name}{reply_info}: {content}{attachment_info}"
+                    conversation_lines.append(full_message)
+            
+            conversation_text = "\n".join(conversation_lines)
+            
+            # Determine if this is the first summary or an update
+            is_first_summary = not old_summary or old_summary.strip() == "" or old_summary == "No summary yet."
+            
+            if is_first_summary:
+                # Create initial summary
+                prompt = f"""You are a conversation summarizer for a Discord channel. 
+Analyze the following conversation and create a comprehensive summary that captures:
+- Main topics and themes discussed
+- Key questions asked and answers provided
+- Important decisions or conclusions reached
+- Notable events or announcements
+- Active participants and their contributions
+
+The summary should be well-organized, informative, and provide a clear overview of what this channel is about and what has been discussed.
+
+Channel: #{channel.name}
+Server: {channel.guild.name}
+
+Conversation History:
+---
+{conversation_text}
+---
+
+Provide a comprehensive channel summary:"""
+            else:
+                # Update existing summary incrementally
+                prompt = f"""You are a conversation summarizer for a Discord channel.
+You have an existing summary of the channel's conversation history. Now you need to integrate new messages into this summary.
+
+Current Channel Summary:
+---
+{old_summary}
+---
+
+New Messages to Integrate:
+---
+{conversation_text}
+---
+
+Instructions:
+1. Review the existing summary and the new messages
+2. Identify new topics, developments, or conclusions from the recent messages
+3. Update the existing summary by integrating the new information
+4. Maintain the chronological flow and thematic organization
+5. Remove or update outdated information if necessary
+6. Keep the summary comprehensive but concise
+
+Provide the updated, complete channel summary:"""
+            
+            # Generate the summary using the LLM
             response = await self.llm_provider.create_completion(
                 model=settings.get("model", self.config.MAIN_LLM_MODEL),
-                messages=[{"role": "user", "content": prompt}]
+                messages=[
+                    {"role": "system", "content": "You are an expert conversation summarizer. Create clear, comprehensive, and well-organized summaries that capture the essence of Discord channel conversations."},
+                    {"role": "user", "content": prompt}
+                ]
             )
-            if response and response.choices:
-                new_summary = response.choices[0].message.content
-                
-                # Update data file
-                if "channels" not in data: data["channels"] = {}
-                if channel_id not in data["channels"]: data["channels"][channel_id] = {}
-                data["channels"][channel_id]["summary"] = new_summary
-                data["channels"][channel_id]["messages_since_summary"] = 0
-                data["channels"][channel_id]["last_summary_time"] = datetime.now(timezone.utc).isoformat()
-                
-                await self.store.save_guild_data(guild_id, data)
-                logging.info(f"Successfully updated summary for channel {channel_id}.")
-            else:
+            
+            if not response or not response.choices:
                 logging.error(f"Failed to get a valid response from LLM for channel summary {channel_id}.")
+                return
+            
+            new_summary = response.choices[0].message.content.strip()
+            
+            # Validate the summary isn't empty or generic
+            if len(new_summary) < 50 or new_summary.lower().startswith("i cannot") or new_summary.lower().startswith("i can't"):
+                logging.warning(f"Generated summary for channel {channel_id} seems invalid or too short: {new_summary[:100]}...")
+                return
+            
+            # Update data file with new summary and metadata
+            if "channels" not in data:
+                data["channels"] = {}
+            if channel_id not in data["channels"]:
+                data["channels"][channel_id] = {}
+            
+            # Store the new summary and reset counters
+            data["channels"][channel_id]["summary"] = new_summary
+            data["channels"][channel_id]["messages_since_summary"] = 0
+            data["channels"][channel_id]["last_summary_time"] = datetime.now(timezone.utc).isoformat()
+            data["channels"][channel_id]["messages_processed"] = len(recent_messages)
+            data["channels"][channel_id]["summary_type"] = "initial" if is_first_summary else "incremental"
+            
+            # Save the updated data
+            await self.store.save_guild_data(guild_id, data)
+            
+            summary_type = "Initial" if is_first_summary else "Incremental"
+            logging.info(f"Successfully updated {summary_type.lower()} summary for channel #{channel.name} ({channel_id}). Processed {len(recent_messages)} messages.")
+            
         except Exception as e:
             logging.error(f"Error updating channel summary for {channel_id}: {e}")
+            # Don't re-raise to avoid breaking the message processing flow
+
+    async def get_channel_summary(self, guild_id: str, channel_id: str) -> dict:
+        """
+        Get the current channel summary and metadata.
+        
+        Returns:
+            dict: Contains summary text, last update time, message count, etc.
+        """
+        try:
+            data = await self.store.get_guild_data(guild_id)
+            channel_data = data.get("channels", {}).get(channel_id, {})
+            
+            return {
+                "summary": channel_data.get("summary", "No summary available yet."),
+                "last_summary_time": channel_data.get("last_summary_time"),
+                "messages_since_summary": channel_data.get("messages_since_summary", 0),
+                "messages_processed": channel_data.get("messages_processed", 0),
+                "summary_type": channel_data.get("summary_type", "none")
+            }
+        except Exception as e:
+            logging.error(f"Error getting channel summary for {channel_id}: {e}")
+            return {
+                "summary": "Error retrieving summary.",
+                "last_summary_time": None,
+                "messages_since_summary": 0,
+                "messages_processed": 0,
+                "summary_type": "error"
+            }
+
+    async def force_channel_summary_update(self, guild_id: str, channel_id: str) -> bool:
+        """
+        Force an immediate update of the channel summary regardless of message count or time.
+        
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            logging.info(f"Forcing channel summary update for {channel_id} in guild {guild_id}")
+            await self.update_channel_summary(guild_id, channel_id)
+            return True
+        except Exception as e:
+            logging.error(f"Error forcing channel summary update for {channel_id}: {e}")
+            return False
+
+    async def clear_channel_summary(self, guild_id: str, channel_id: str) -> bool:
+        """
+        Clear the channel summary and reset counters.
+        
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            data = await self.store.get_guild_data(guild_id)
+            
+            if "channels" in data and channel_id in data["channels"]:
+                # Clear summary but keep the channel entry
+                channel_data = data["channels"][channel_id]
+                channel_data.pop("summary", None)
+                channel_data.pop("last_summary_time", None)
+                channel_data["messages_since_summary"] = 0
+                channel_data.pop("messages_processed", None)
+                channel_data.pop("summary_type", None)
+                
+                await self.store.save_guild_data(guild_id, data)
+                logging.info(f"Cleared channel summary for {channel_id}")
+                return True
+            
+            return False  # No summary to clear
+            
+        except Exception as e:
+            logging.error(f"Error clearing channel summary for {channel_id}: {e}")
+            return False
 
     async def update_user_profile(self, guild_id: str, user_id: str):
         logging.info(f"Updating AI profile for user {user_id} in guild {guild_id}...")
