@@ -1,0 +1,20 @@
+# Bot
+discord.py
+python-dotenv
+litellm
+aiohttp
+aiofiles
+
+# Media Processing
+py-cord[voice]
+pypdf2
+python-docx
+openpyxl
+Pillow
+openai-whisper
+moviepy
+
+# Advanced Media Processing (Optional)
+pytesseract
+python-pptx
+pdfplumber
