@@ -17,17 +17,17 @@ class ProfileCommands(commands.Cog):
         guild_id = str(interaction.guild.id)
         user_id = str(user.id)
 
-        data = await self.bot.store.get_data()
-        if guild_id not in data:
-            data[guild_id] = {"users": {}}
-        if "users" not in data[guild_id]:
-            data[guild_id]["users"] = {}
-        if user_id not in data[guild_id]["users"]:
-            data[guild_id]["users"][user_id] = {}
+        fresh_data = await self.bot.store.get_data()
+        if str(guild_id) not in fresh_data:
+            fresh_data[str(guild_id)] = {}
+        if "users" not in fresh_data[str(guild_id)]:
+            fresh_data[str(guild_id)]["users"] = {}
+        if user_id not in fresh_data[str(guild_id)]["users"]:
+            fresh_data[str(guild_id)]["users"][user_id] = {}
             
-        data[guild_id]["users"][user_id]["manual_note"] = note
+        fresh_data[str(guild_id)]["users"][user_id]["manual_note"] = note
         
-        await self.bot.store.save_data(data)
+        await self.bot.store.save_data(fresh_data)
         await interaction.followup.send(f"Note added for {user.display_name}.", ephemeral=True)
 
     @note_group.command(name="view", description="Displays the profile for a user.")

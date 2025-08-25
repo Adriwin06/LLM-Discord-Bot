@@ -115,16 +115,23 @@ class EventHandler(commands.Cog):
         user_id = str(message.author.id)
 
         try:
-            data = await self.bot.store.get_guild_data(guild_id)
+            # Get fresh data to avoid conflicts
+            fresh_data = await self.bot.store.get_data()
             
             # Ensure paths exist
-            if "channels" not in data: data["channels"] = {}
-            if channel_id not in data["channels"]: data["channels"][channel_id] = {}
-            if "users" not in data: data["users"] = {}
-            if user_id not in data["users"]: data["users"][user_id] = {}
+            if str(guild_id) not in fresh_data:
+                fresh_data[str(guild_id)] = {}
+            if "channels" not in fresh_data[str(guild_id)]:
+                fresh_data[str(guild_id)]["channels"] = {}
+            if channel_id not in fresh_data[str(guild_id)]["channels"]:
+                fresh_data[str(guild_id)]["channels"][channel_id] = {}
+            if "users" not in fresh_data[str(guild_id)]:
+                fresh_data[str(guild_id)]["users"] = {}
+            if user_id not in fresh_data[str(guild_id)]["users"]:
+                fresh_data[str(guild_id)]["users"][user_id] = {}
 
             # Channel Summary Trigger
-            channel_data = data["channels"][channel_id]
+            channel_data = fresh_data[str(guild_id)]["channels"][channel_id]
             msg_count = channel_data.get("messages_since_summary", 0) + 1
             channel_data["messages_since_summary"] = msg_count
             
@@ -150,7 +157,7 @@ class EventHandler(commands.Cog):
                     await self.bot.context_manager.update_channel_summary(guild_id, channel_id)
 
             # User Profile Trigger
-            user_data = data["users"][user_id]
+            user_data = fresh_data[str(guild_id)]["users"][user_id]
             profile_msg_count = user_data.get("messages_since_profile_update", 0) + 1
             user_data["messages_since_profile_update"] = profile_msg_count
 
@@ -167,7 +174,7 @@ class EventHandler(commands.Cog):
                         await self.bot.context_manager.update_user_profile(guild_id, user_id, message.guild)
 
             # Save updated data
-            await self.bot.store.save_guild_data(guild_id, data)
+            await self.bot.store.save_data(fresh_data)
 
         except Exception as e:
             logging.error(f"Error updating counters and triggers: {e}")

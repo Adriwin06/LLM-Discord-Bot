@@ -588,20 +588,23 @@ Provide the updated, complete channel summary:"""
                 return
             
             # Update data file with new summary and metadata
-            if "channels" not in data:
-                data["channels"] = {}
-            if channel_id not in data["channels"]:
-                data["channels"][channel_id] = {}
+            fresh_data = await self.store.get_data()
+            if str(guild_id) not in fresh_data:
+                fresh_data[str(guild_id)] = {}
+            if "channels" not in fresh_data[str(guild_id)]:
+                fresh_data[str(guild_id)]["channels"] = {}
+            if channel_id not in fresh_data[str(guild_id)]["channels"]:
+                fresh_data[str(guild_id)]["channels"][channel_id] = {}
             
             # Store the new summary and reset counters
-            data["channels"][channel_id]["summary"] = new_summary
-            data["channels"][channel_id]["messages_since_summary"] = 0
-            data["channels"][channel_id]["last_summary_time"] = datetime.now(timezone.utc).isoformat()
-            data["channels"][channel_id]["messages_processed"] = len(recent_messages)
-            data["channels"][channel_id]["summary_type"] = "initial" if is_first_summary else "incremental"
+            fresh_data[str(guild_id)]["channels"][channel_id]["summary"] = new_summary
+            fresh_data[str(guild_id)]["channels"][channel_id]["messages_since_summary"] = 0
+            fresh_data[str(guild_id)]["channels"][channel_id]["last_summary_time"] = datetime.now(timezone.utc).isoformat()
+            fresh_data[str(guild_id)]["channels"][channel_id]["messages_processed"] = len(recent_messages)
+            fresh_data[str(guild_id)]["channels"][channel_id]["summary_type"] = "initial" if is_first_summary else "incremental"
             
             # Save the updated data
-            await self.store.save_guild_data(guild_id, data)
+            await self.store.save_data(fresh_data)
             
             summary_type = "Initial" if is_first_summary else "Incremental"
             logging.info(f"Successfully updated {summary_type.lower()} summary for channel #{channel.name} ({channel_id}). Processed {len(recent_messages)} messages.")
@@ -661,22 +664,26 @@ Provide the updated, complete channel summary:"""
             bool: True if successful, False otherwise
         """
         try:
-            data = await self.store.get_guild_data(guild_id)
+            fresh_data = await self.store.get_data()
             
-            if "channels" in data and channel_id in data["channels"]:
-                # Clear summary but keep the channel entry
-                channel_data = data["channels"][channel_id]
-                channel_data.pop("summary", None)
-                channel_data.pop("last_summary_time", None)
-                channel_data["messages_since_summary"] = 0
-                channel_data.pop("messages_processed", None)
-                channel_data.pop("summary_type", None)
-                
-                await self.store.save_guild_data(guild_id, data)
-                logging.info(f"Cleared channel summary for {channel_id}")
-                return True
+            if str(guild_id) not in fresh_data:
+                fresh_data[str(guild_id)] = {}
+            if "channels" not in fresh_data[str(guild_id)]:
+                fresh_data[str(guild_id)]["channels"] = {}
+            if channel_id not in fresh_data[str(guild_id)]["channels"]:
+                return False  # No summary to clear
             
-            return False  # No summary to clear
+            # Clear summary but keep the channel entry
+            channel_data = fresh_data[str(guild_id)]["channels"][channel_id]
+            channel_data.pop("summary", None)
+            channel_data.pop("last_summary_time", None)
+            channel_data["messages_since_summary"] = 0
+            channel_data.pop("messages_processed", None)
+            channel_data.pop("summary_type", None)
+            
+            await self.store.save_data(fresh_data)
+            logging.info(f"Cleared channel summary for {channel_id}")
+            return True
             
         except Exception as e:
             logging.error(f"Error clearing channel summary for {channel_id}: {e}")
@@ -690,10 +697,11 @@ Provide the updated, complete channel summary:"""
         logging.info(f"Updating AI profile for user {user_id} in guild {guild_id}...")
         
         try:
+            # Get current data and settings
             data = await self.store.get_guild_data(guild_id)
             settings = await self.get_guild_and_channel_settings(guild_id, None)
             
-            # Initialize user data if not exists
+            # Initialize guild data structure if needed
             if "users" not in data:
                 data["users"] = {}
             if user_id not in data["users"]:
@@ -711,7 +719,18 @@ Provide the updated, complete channel summary:"""
                 # Reset counters even if no messages found
                 user_data["messages_since_profile_update"] = 0
                 user_data["last_profile_update_time"] = datetime.now(timezone.utc).isoformat()
-                await self.store.save_guild_data(guild_id, data)
+                
+                # Get fresh data and update to avoid overwriting concurrent changes
+                fresh_data = await self.store.get_data()
+                if str(guild_id) not in fresh_data:
+                    fresh_data[str(guild_id)] = {}
+                if "users" not in fresh_data[str(guild_id)]:
+                    fresh_data[str(guild_id)]["users"] = {}
+                if user_id not in fresh_data[str(guild_id)]["users"]:
+                    fresh_data[str(guild_id)]["users"][user_id] = {}
+                
+                fresh_data[str(guild_id)]["users"][user_id].update(user_data)
+                await self.store.save_data(fresh_data)
                 return
             
             # Generate AI summary using LLM
@@ -725,7 +744,17 @@ Provide the updated, complete channel summary:"""
                 user_data["messages_since_profile_update"] = 0
                 user_data["last_profile_update_time"] = datetime.now(timezone.utc).isoformat()
                 
-                await self.store.save_guild_data(guild_id, data)
+                # Get fresh data and update to avoid overwriting concurrent changes
+                fresh_data = await self.store.get_data()
+                if str(guild_id) not in fresh_data:
+                    fresh_data[str(guild_id)] = {}
+                if "users" not in fresh_data[str(guild_id)]:
+                    fresh_data[str(guild_id)]["users"] = {}
+                if user_id not in fresh_data[str(guild_id)]["users"]:
+                    fresh_data[str(guild_id)]["users"][user_id] = {}
+                
+                fresh_data[str(guild_id)]["users"][user_id].update(user_data)
+                await self.store.save_data(fresh_data)
                 logging.info(f"AI profile updated successfully for user {user_id}")
             else:
                 logging.error(f"Failed to generate AI summary for user {user_id}")

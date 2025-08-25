@@ -15,27 +15,55 @@ class Store:
         self.data_lock = asyncio.Lock()
         
         # Ensure data directory and files exist
-        os.makedirs(os.path.dirname(settings_path), exist_ok=True)
-        os.makedirs(os.path.dirname(data_path), exist_ok=True)
-        os.makedirs(backup_dir, exist_ok=True)
+        try:
+            os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+            os.makedirs(os.path.dirname(data_path), exist_ok=True)
+            os.makedirs(backup_dir, exist_ok=True)
+        except Exception as e:
+            logging.error(f"Error creating directories: {e}")
 
-        if not os.path.exists(self.settings_path):
-            with open(self.settings_path, 'w') as f:
-                json.dump({}, f)
-        if not os.path.exists(self.data_path):
-            with open(self.data_path, 'w') as f:
-                json.dump({}, f)
+        # Create settings file if it doesn't exist
+        try:
+            if not os.path.exists(self.settings_path):
+                with open(self.settings_path, 'w', encoding='utf-8') as f:
+                    json.dump({}, f, indent=2)
+                logging.info(f"Created settings file: {self.settings_path}")
+        except Exception as e:
+            logging.error(f"Error creating settings file: {e}")
+            
+        # Create data file if it doesn't exist
+        try:
+            if not os.path.exists(self.data_path):
+                with open(self.data_path, 'w', encoding='utf-8') as f:
+                    json.dump({}, f, indent=2)
+                logging.info(f"Created data file: {self.data_path}")
+        except Exception as e:
+            logging.error(f"Error creating data file: {e}")
 
     async def _read_json(self, path):
         try:
             async with aiofiles.open(path, 'r', encoding='utf-8') as f:
-                return json.loads(await f.read())
-        except (FileNotFoundError, json.JSONDecodeError):
+                content = await f.read()
+                if not content.strip():
+                    return {}
+                return json.loads(content)
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            logging.warning(f"Error reading JSON file {path}: {e}. Returning empty dict.")
+            return {}
+        except Exception as e:
+            logging.error(f"Unexpected error reading JSON file {path}: {e}")
             return {}
 
     async def _write_json(self, path, data):
-        async with aiofiles.open(path, 'w', encoding='utf-8') as f:
-            await f.write(json.dumps(data, indent=2))
+        try:
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            
+            async with aiofiles.open(path, 'w', encoding='utf-8') as f:
+                await f.write(json.dumps(data, indent=2, ensure_ascii=False))
+        except Exception as e:
+            logging.error(f"Error writing JSON file {path}: {e}")
+            raise
 
     async def get_settings(self):
         async with self.settings_lock:

@@ -127,27 +127,29 @@ class AdminCommands(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         guild_id = str(interaction.guild.id)
         
-        data = await self.bot.store.get_data()
+        fresh_data = await self.bot.store.get_data()
         
         if target.lower() == "channel":
             channel_id = str(interaction.channel.id)
-            if guild_id in data and "channels" in data[guild_id] and channel_id in data[guild_id]["channels"]:
-                del data[guild_id]["channels"][channel_id]["summary"]
-                data[guild_id]["channels"][channel_id]["messages_since_summary"] = 0
-                await self.bot.store.save_data(data)
-                await interaction.followup.send(f"Context for this channel has been reset.", ephemeral=True)
+            if (str(guild_id) in fresh_data and 
+                "channels" in fresh_data[str(guild_id)] and 
+                channel_id in fresh_data[str(guild_id)]["channels"]):
+                
+                fresh_data[str(guild_id)]["channels"][channel_id].pop("summary", None)
+                fresh_data[str(guild_id)]["channels"][channel_id]["messages_since_summary"] = 0
+                await self.bot.store.save_data(fresh_data)
+                await interaction.followup.send("Context for this channel has been reset.", ephemeral=True)
             else:
-                await interaction.followup.send(f"No context to reset for this channel.", ephemeral=True)
+                await interaction.followup.send("No context to reset for this channel.", ephemeral=True)
         elif target.lower() == "guild":
-            if guild_id in data and "channels" in data[guild_id]:
-                for channel_data in data[guild_id]["channels"].values():
-                    if "summary" in channel_data:
-                        del channel_data["summary"]
+            if str(guild_id) in fresh_data and "channels" in fresh_data[str(guild_id)]:
+                for channel_data in fresh_data[str(guild_id)]["channels"].values():
+                    channel_data.pop("summary", None)
                     channel_data["messages_since_summary"] = 0
-                await self.bot.store.save_data(data)
-                await interaction.followup.send(f"Context for the entire server has been reset.", ephemeral=True)
+                await self.bot.store.save_data(fresh_data)
+                await interaction.followup.send("Context for the entire server has been reset.", ephemeral=True)
             else:
-                await interaction.followup.send(f"No context to reset for this server.", ephemeral=True)
+                await interaction.followup.send("No context to reset for this server.", ephemeral=True)
         else:
             await interaction.followup.send("Invalid target. Use 'channel' or 'guild'.", ephemeral=True)
 
