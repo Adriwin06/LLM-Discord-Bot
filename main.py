@@ -8,17 +8,18 @@ import sys
 from dotenv import load_dotenv
 import logging
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# Load environment variables from .env file
-load_dotenv()
-
 # Import core bot components
 from bot.config import Config
 from bot.store import Store
 from bot.llm_provider import LiteLLMProvider
 from bot.context_manager import ContextManager
+
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Load environment variables from .env file
+load_dotenv()
 
 class LLMDiscordBot(commands.Bot):
     def __init__(self):
