@@ -42,8 +42,9 @@ class LLMDiscordBot(commands.Bot):
         logging.info("Starting setup hook...")
         
         # Load cogs
-        for filename in os.listdir("./bot/cogs"):
-            if filename.endswith(".py"):
+        cogs_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "bot", "cogs")
+        for filename in os.listdir(cogs_path):
+            if filename.endswith(".py") and not filename.startswith("__"):
                 try:
                     await self.load_extension(f"bot.cogs.{filename[:-3]}")
                     logging.info(f"Loaded cog: {filename}")

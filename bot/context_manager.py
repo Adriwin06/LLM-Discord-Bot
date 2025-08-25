@@ -21,7 +21,7 @@ except ImportError:
     logging.warning("whisper not available. Audio transcription features will be limited.")
 
 try:
-    import moviepy.editor as mp
+    import moviepy
     MOVIEPY_AVAILABLE = True
 except ImportError:
     MOVIEPY_AVAILABLE = False
@@ -36,7 +36,7 @@ except ImportError:
     logging.warning("pytesseract not available. OCR features will be limited.")
 
 try:
-    from pptx import Presentation
+    import pptx
     PPTX_AVAILABLE = True
 except ImportError:
     PPTX_AVAILABLE = False
