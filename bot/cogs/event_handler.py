@@ -156,7 +156,7 @@ class EventHandler(commands.Cog):
 
             profile_update_messages = settings.get("profile_update_every_messages", self.bot.config.DEFAULT_PROFILE_UPDATE_EVERY_MESSAGES)
             if profile_msg_count >= profile_update_messages:
-                await self.bot.context_manager.update_user_profile(guild_id, user_id)
+                await self.bot.context_manager.update_user_profile(guild_id, user_id, message.guild)
             else:
                 # Check time-based trigger
                 profile_update_hours = settings.get("profile_update_every_hours", self.bot.config.DEFAULT_PROFILE_UPDATE_EVERY_HOURS)
@@ -164,7 +164,7 @@ class EventHandler(commands.Cog):
                 if last_profile_update_str:
                     last_profile_update_time = datetime.fromisoformat(last_profile_update_str)
                     if (datetime.now(timezone.utc) - last_profile_update_time).total_seconds() > profile_update_hours * 3600:
-                        await self.bot.context_manager.update_user_profile(guild_id, user_id)
+                        await self.bot.context_manager.update_user_profile(guild_id, user_id, message.guild)
 
             # Save updated data
             await self.bot.store.save_guild_data(guild_id, data)

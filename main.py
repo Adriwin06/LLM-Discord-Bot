@@ -45,11 +45,12 @@ class LLMDiscordBot(commands.Bot):
         cogs_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "bot", "cogs")
         for filename in os.listdir(cogs_path):
             if filename.endswith(".py") and not filename.startswith("__"):
+                cog_name = filename[:-3]
                 try:
-                    await self.load_extension(f"bot.cogs.{filename[:-3]}")
-                    logging.info(f"Loaded cog: {filename}")
+                    await self.load_extension(f"bot.cogs.{cog_name}")
+                    logging.info(f"Successfully loaded cog: {cog_name}")
                 except Exception as e:
-                    logging.error(f"Failed to load cog {filename}: {e}")
+                    logging.error(f"Failed to load cog {cog_name}: {e}")
 
         # Sync slash commands with Discord
         try:

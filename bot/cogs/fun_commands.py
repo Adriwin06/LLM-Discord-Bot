@@ -55,8 +55,8 @@ Generate a similar response that's warm and grateful, but don't copy these exact
         else:
             # Regular user targeting
             prompt_template = {
-                "insult": f"Generate a creative, personalized, and funny insult for a Discord user named {user.display_name}. Use their AI-generated profile if available to make it more specific. Profile: {{profile}}",
-                "compliment": f"Generate a creative, personalized, and heartfelt compliment for a Discord user named {user.display_name}. Use their AI-generated profile if available to make it more specific. Profile: {{profile}}"
+                "insult": f"Generate a creative, personalized, and funny insult for a Discord user named {user.display_name}. Use their profile information if available to make it more specific. Profile: {{profile}}",
+                "compliment": f"Generate a creative, personalized, and heartfelt compliment for a Discord user named {user.display_name}. Use their profile information if available to make it more specific. Profile: {{profile}}"
             }
             
             guild_id = str(interaction.guild.id)
@@ -64,7 +64,21 @@ Generate a similar response that's warm and grateful, but don't copy these exact
             
             data = await self.bot.store.get_data()
             user_data = data.get(guild_id, {}).get("users", {}).get(user_id, {})
-            profile_info = user_data.get("ai_summary", "No AI summary available.")
+            
+            # Combine AI summary and manual note for richer context
+            profile_parts = []
+            ai_summary = user_data.get("ai_summary")
+            manual_note = user_data.get("manual_note")
+            
+            if manual_note:
+                profile_parts.append(f"Admin note: {manual_note}")
+            if ai_summary:
+                profile_parts.append(f"AI analysis: {ai_summary}")
+            
+            if profile_parts:
+                profile_info = " | ".join(profile_parts)
+            else:
+                profile_info = "No profile information available - be creative with their username and general Discord user traits."
             
             prompt = prompt_template[command_type].format(profile=profile_info)
             

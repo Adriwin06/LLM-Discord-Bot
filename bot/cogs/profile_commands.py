@@ -46,11 +46,42 @@ class ProfileCommands(commands.Cog):
 
         embed = discord.Embed(title=f"Profile for {user.display_name}", color=discord.Color.blue())
         
-        manual_note = user_data.get("manual_note", "N/A")
-        ai_summary = user_data.get("ai_summary", "N/A")
-
-        embed.add_field(name="Manual Note", value=manual_note, inline=False)
-        embed.add_field(name="AI-Generated Summary", value=ai_summary, inline=False)
+        manual_note = user_data.get("manual_note")
+        ai_summary = user_data.get("ai_summary")
+        last_update = user_data.get("last_profile_update_time")
+        msg_count = user_data.get("messages_since_profile_update", 0)
+        
+        # Manual note field
+        if manual_note:
+            embed.add_field(name="Manual Note", value=manual_note, inline=False)
+        else:
+            embed.add_field(name="Manual Note", value="No manual note set.", inline=False)
+        
+        # AI summary field
+        if ai_summary:
+            # Truncate if too long for Discord embed
+            if len(ai_summary) > 1024:
+                ai_summary_display = ai_summary[:1021] + "..."
+            else:
+                ai_summary_display = ai_summary
+            embed.add_field(name="AI-Generated Summary", value=ai_summary_display, inline=False)
+        else:
+            embed.add_field(name="AI-Generated Summary", value="No AI summary available yet.", inline=False)
+        
+        # Add metadata
+        metadata_parts = []
+        if last_update:
+            try:
+                from datetime import datetime
+                update_time = datetime.fromisoformat(last_update)
+                metadata_parts.append(f"Last AI update: {update_time.strftime('%Y-%m-%d %H:%M UTC')}")
+            except Exception:
+                metadata_parts.append("Last AI update: Unknown")
+        else:
+            metadata_parts.append("Last AI update: Never")
+            
+        metadata_parts.append(f"Messages since last update: {msg_count}")
+        embed.add_field(name="Profile Info", value="\n".join(metadata_parts), inline=False)
 
         await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -59,16 +90,21 @@ class ProfileCommands(commands.Cog):
     async def refresh_ai_note(self, interaction: discord.Interaction, user: discord.Member):
         await interaction.response.defer(ephemeral=True)
         
-        # This is a placeholder for the actual logic which would be complex.
-        # It needs to gather user's recent messages and call the context_manager/llm_provider.
         logging.info(f"AI summary refresh triggered for {user.display_name} by {interaction.user}")
         
-        # Placeholder implementation
-        await self.bot.context_manager.update_user_profile(interaction.guild.id, user.id, []) # Pass empty messages for now
-        
-        await interaction.followup.send(f"AI summary refresh for {user.display_name} has been queued.", ephemeral=True)
+        try:
+            # Send initial status message
+            await interaction.followup.send(f"🔄 Updating AI summary for {user.display_name}...", ephemeral=True)
+            
+            # Perform the actual update
+            await self.bot.context_manager.update_user_profile(interaction.guild.id, user.id, interaction.guild)
+            
+            # Send completion message
+            await interaction.followup.send(f"✅ AI summary refresh for {user.display_name} completed successfully!", ephemeral=True)
+            
+        except Exception as e:
+            logging.error(f"Error refreshing AI summary for {user.display_name}: {e}")
+            await interaction.followup.send(f"❌ Failed to refresh AI summary for {user.display_name}. Check logs for details.", ephemeral=True)
 
-async def setup(bot):
-    await bot.add_cog(ProfileCommands(bot))
 async def setup(bot):
     await bot.add_cog(ProfileCommands(bot))

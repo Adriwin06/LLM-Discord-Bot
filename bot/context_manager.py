@@ -682,38 +682,198 @@ Provide the updated, complete channel summary:"""
             logging.error(f"Error clearing channel summary for {channel_id}: {e}")
             return False
 
-    async def update_user_profile(self, guild_id: str, user_id: str):
+    async def update_user_profile(self, guild_id: str, user_id: str, guild_obj=None):
+        """
+        Updates the AI-generated profile for a user by gathering their recent messages
+        across all channels in the guild and generating/updating their summary.
+        """
         logging.info(f"Updating AI profile for user {user_id} in guild {guild_id}...")
-        data = await self.store.get_guild_data(guild_id)
-        settings = await self.get_guild_and_channel_settings(guild_id, None) # Use guild-level settings
+        
+        try:
+            data = await self.store.get_guild_data(guild_id)
+            settings = await self.get_guild_and_channel_settings(guild_id, None)
+            
+            # Initialize user data if not exists
+            if "users" not in data:
+                data["users"] = {}
+            if user_id not in data["users"]:
+                data["users"][user_id] = {}
+                
+            user_data = data["users"][user_id]
+            old_summary = user_data.get("ai_summary", "")
+            manual_note = user_data.get("manual_note", "")
+            
+            # Gather recent messages from the user across all accessible channels
+            user_messages = await self._gather_user_messages(guild_id, user_id, guild_obj)
+            
+            if not user_messages:
+                logging.warning(f"No messages found for user {user_id} in guild {guild_id}")
+                # Reset counters even if no messages found
+                user_data["messages_since_profile_update"] = 0
+                user_data["last_profile_update_time"] = datetime.now(timezone.utc).isoformat()
+                await self.store.save_guild_data(guild_id, data)
+                return
+            
+            # Generate AI summary using LLM
+            new_summary = await self._generate_user_profile_summary(
+                user_messages, old_summary, manual_note, user_id, settings
+            )
+            
+            if new_summary:
+                # Update user data
+                user_data["ai_summary"] = new_summary
+                user_data["messages_since_profile_update"] = 0
+                user_data["last_profile_update_time"] = datetime.now(timezone.utc).isoformat()
+                
+                await self.store.save_guild_data(guild_id, data)
+                logging.info(f"AI profile updated successfully for user {user_id}")
+            else:
+                logging.error(f"Failed to generate AI summary for user {user_id}")
+                
+        except Exception as e:
+            logging.error(f"Error updating user profile for {user_id}: {e}")
+            
+    async def _gather_user_messages(self, guild_id: str, user_id: str, guild_obj=None, max_messages: int = 100):
+        """
+        Gathers recent messages from a user across all accessible channels in the guild.
+        """
+        if not guild_obj:
+            # Try to get guild from bot if not provided
+            try:
+                guild_obj = discord.utils.get(self.bot.guilds, id=int(guild_id))
+                if not guild_obj:
+                    logging.error(f"Guild {guild_id} not found")
+                    return []
+            except Exception as e:
+                logging.error(f"Error getting guild {guild_id}: {e}")
+                return []
+        
+        user_messages = []
+        channels_checked = 0
+        
+        try:
+            # Get user object
+            user = guild_obj.get_member(int(user_id))
+            if not user:
+                logging.warning(f"User {user_id} not found in guild {guild_id}")
+                return []
+            
+            # Iterate through all text channels the bot can access
+            for channel in guild_obj.text_channels:
+                try:
+                    # Check if bot has permission to read message history
+                    if not channel.permissions_for(guild_obj.me).read_message_history:
+                        continue
+                        
+                    channels_checked += 1
+                    
+                    # Fetch recent messages from this channel (limit per channel to avoid overload)
+                    async for message in channel.history(limit=200):  # Look through more messages to find user's
+                        if message.author.id == int(user_id):
+                            if len(user_messages) >= max_messages:
+                                break
+                                
+                            # Format message with context
+                            formatted_message = {
+                                'content': message.content or '[No text content]',
+                                'channel': channel.name,
+                                'timestamp': message.created_at.isoformat(),
+                                'has_attachments': len(message.attachments) > 0,
+                                'attachment_types': [att.content_type or 'unknown' for att in message.attachments] if message.attachments else [],
+                                'embeds_count': len(message.embeds),
+                                'reactions_count': len(message.reactions)
+                            }
+                            user_messages.append(formatted_message)
+                            
+                        if len(user_messages) >= max_messages:
+                            break
+                            
+                except discord.Forbidden:
+                    # Bot doesn't have permission to read this channel
+                    continue
+                except Exception as e:
+                    logging.warning(f"Error reading messages from channel {channel.name}: {e}")
+                    continue
+                    
+                if len(user_messages) >= max_messages:
+                    break
+            
+            # Sort messages by timestamp (oldest first for chronological context)
+            user_messages.sort(key=lambda x: x['timestamp'])
+            
+            logging.info(f"Gathered {len(user_messages)} messages from {channels_checked} channels for user {user_id}")
+            return user_messages
+            
+        except Exception as e:
+            logging.error(f"Error gathering messages for user {user_id}: {e}")
+            return []
+    
+    async def _generate_user_profile_summary(self, user_messages, old_summary, manual_note, user_id, settings):
+        """
+        Generates or updates an AI summary of the user based on their messages.
+        """
+        try:
+            model = settings.get("model", self.config.MAIN_LLM_MODEL)
+            
+            # Prepare message context (limit to prevent overly long prompts)
+            message_context = []
+            for msg in user_messages[-30:]:  # Reduced from 50 to 30 messages to keep prompt shorter
+                context_line = f"[{msg['channel']}] {msg['content'][:200]}"  # Truncate long messages
+                if msg['has_attachments']:
+                    context_line += f" [Attachments: {len(msg['attachment_types'])} files]"
+                if msg['embeds_count'] > 0:
+                    context_line += f" [Embeds: {msg['embeds_count']}]"
+                message_context.append(context_line)
+            
+            messages_text = "\n".join(message_context)
+            
+            # Build the prompt for profile generation/update (more concise)
+            if old_summary and old_summary.strip():
+                # Incremental update
+                prompt = f"""Update this user's Discord profile summary with their recent messages.
 
-        user_data = data.get("users", {}).get(user_id, {})
-        old_summary = user_data.get("ai_summary", "No AI summary yet.")
+CURRENT SUMMARY:
+{old_summary}
 
-        # This is a simplified approach. A real implementation would need to scan channels for user messages.
-        # For now, we'll simulate this by fetching from the last active channel if possible, or just note the limitation.
-        # A more robust solution would require a message database or extensive history scanning.
-        
-        # Placeholder: We can't easily get all recent messages for a user across all channels without intensive search.
-        # The logic will be based on a conceptual "recent messages" list.
-        # The trigger in event_handler.py will pass recent messages from the current channel.
-        # This is a limitation of the current design.
-        
-        # This function will be called with a list of messages by the event handler.
-        # For now, the logic here will assume it's called and needs to generate a summary.
-        # The actual message gathering is deferred to the caller.
-        
-        logging.warning(f"User profile update for {user_id} is a placeholder. It needs a robust message gathering mechanism.")
-        # In a real scenario, you would gather messages and then call the LLM like this:
-        # conversation_text = "\n".join([f"{msg.content}" for msg in user_messages])
-        # prompt = f"..."
-        # response = await self.llm_provider.create_completion(...)
-        # ... update data file ...
-        
-        # For now, just update the counters
-        if "users" not in data: data["users"] = {}
-        if user_id not in data["users"]: data["users"][user_id] = {}
-        data["users"][user_id]["messages_since_profile_update"] = 0
-        data["users"][user_id]["last_profile_update_time"] = datetime.now(timezone.utc).isoformat()
-        await self.store.save_guild_data(guild_id, data)
-        logging.info(f"Placeholder AI profile update for user {user_id} completed.")
+RECENT MESSAGES:
+{messages_text}
+
+ADMIN NOTE: {manual_note or 'None'}
+
+Provide an updated 2-paragraph summary focusing on communication style, interests, and notable traits."""
+            else:
+                # Initial profile generation
+                prompt = f"""Create a Discord user profile summary from these messages.
+
+MESSAGES:
+{messages_text}
+
+ADMIN NOTE: {manual_note or 'None'}
+
+Provide a 2-paragraph summary covering communication style, interests, activity patterns, and key traits."""
+
+            # Make the API call
+            response = await self.llm_provider.create_completion(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=2000,  # Further increased token limit
+                temperature=0.3
+            )
+            
+            if response and response.choices and len(response.choices) > 0:
+                choice = response.choices[0]
+                if choice.message and choice.message.content:
+                    return choice.message.content.strip()
+                elif choice.finish_reason == 'length':
+                    logging.error("LLM response was truncated due to token limit. Consider increasing max_tokens.")
+                    return None
+                else:
+                    logging.error(f"LLM response has no content. Finish reason: {choice.finish_reason}")
+                    return None
+            else:
+                logging.error("Empty or invalid response from LLM for user profile generation")
+                return None
+                
+        except Exception as e:
+            logging.error(f"Error generating user profile summary: {e}")
+            return None

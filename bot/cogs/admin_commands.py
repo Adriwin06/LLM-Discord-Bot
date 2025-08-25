@@ -341,5 +341,123 @@ class AdminCommands(commands.Cog):
         except Exception as e:
             await interaction.followup.send(f"❌ Error managing summary settings: {str(e)}", ephemeral=True)
 
+    @app_commands.command(name="user_profile", description="Manage user profile settings and statistics.")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def user_profile(self, interaction: discord.Interaction, 
+                          action: Literal["stats", "update", "settings"],
+                          user: discord.Member = None,
+                          profile_update_every_messages: int = None,
+                          profile_update_every_hours: int = None):
+        """
+        Manage user profile system.
+        - stats: Show profile statistics for the server
+        - update: Force update a specific user's profile  
+        - settings: Configure profile update triggers
+        """
+        await interaction.response.defer(ephemeral=True)
+        guild_id = str(interaction.guild.id)
+        
+        try:
+            if action == "stats":
+                # Show profile statistics
+                data = await self.bot.store.get_data()
+                guild_data = data.get(guild_id, {})
+                users_data = guild_data.get("users", {})
+                
+                total_users = len(users_data)
+                users_with_ai_summary = sum(1 for user_data in users_data.values() if user_data.get("ai_summary"))
+                users_with_manual_notes = sum(1 for user_data in users_data.values() if user_data.get("manual_note"))
+                
+                # Calculate average messages since last update
+                total_messages_pending = sum(user_data.get("messages_since_profile_update", 0) for user_data in users_data.values())
+                avg_messages_pending = total_messages_pending / max(total_users, 1)
+                
+                embed = discord.Embed(
+                    title="📊 User Profile Statistics",
+                    color=discord.Color.blue()
+                )
+                
+                embed.add_field(name="Total Users Tracked", value=str(total_users), inline=True)
+                embed.add_field(name="Users with AI Summary", value=str(users_with_ai_summary), inline=True)
+                embed.add_field(name="Users with Manual Notes", value=str(users_with_manual_notes), inline=True)
+                embed.add_field(name="Avg Messages Pending Update", value=f"{avg_messages_pending:.1f}", inline=True)
+                
+                # Show top users by message count since last update
+                top_users = sorted(
+                    [(user_id, user_data.get("messages_since_profile_update", 0)) 
+                     for user_id, user_data in users_data.items()],
+                    key=lambda x: x[1], reverse=True
+                )[:5]
+                
+                if top_users:
+                    top_users_text = []
+                    for user_id, msg_count in top_users:
+                        try:
+                            user_obj = interaction.guild.get_member(int(user_id))
+                            name = user_obj.display_name if user_obj else f"User {user_id}"
+                            top_users_text.append(f"{name}: {msg_count} messages")
+                        except Exception:
+                            top_users_text.append(f"User {user_id}: {msg_count} messages")
+                    
+                    embed.add_field(
+                        name="Top Users Needing Updates",
+                        value="\n".join(top_users_text),
+                        inline=False
+                    )
+                
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                
+            elif action == "update":
+                if not user:
+                    await interaction.followup.send("❌ You must specify a user to update.", ephemeral=True)
+                    return
+                
+                # Force update the user's profile
+                await interaction.followup.send(f"🔄 Starting profile update for {user.display_name}...", ephemeral=True)
+                
+                await self.bot.context_manager.update_user_profile(guild_id, str(user.id), interaction.guild)
+                
+                await interaction.edit_original_response(content=f"✅ Profile update completed for {user.display_name}.")
+                
+            elif action == "settings":
+                settings = await self.bot.store.get_settings()
+                if guild_id not in settings:
+                    settings[guild_id] = {}
+                
+                # Update settings if provided
+                if profile_update_every_messages is not None:
+                    settings[guild_id]["profile_update_every_messages"] = profile_update_every_messages
+                if profile_update_every_hours is not None:
+                    settings[guild_id]["profile_update_every_hours"] = profile_update_every_hours
+                
+                if profile_update_every_messages is not None or profile_update_every_hours is not None:
+                    await self.bot.store.save_settings(settings)
+                    await interaction.followup.send("✅ Profile update settings saved.", ephemeral=True)
+                else:
+                    # Just show current settings
+                    current_settings = settings.get(guild_id, {})
+                    
+                    embed = discord.Embed(
+                        title="⚙️ Profile Update Settings",
+                        color=discord.Color.orange()
+                    )
+                    
+                    embed.add_field(
+                        name="Messages Trigger",
+                        value=f"{current_settings.get('profile_update_every_messages', self.bot.config.DEFAULT_PROFILE_UPDATE_EVERY_MESSAGES)} messages",
+                        inline=True
+                    )
+                    embed.add_field(
+                        name="Time Trigger", 
+                        value=f"{current_settings.get('profile_update_every_hours', self.bot.config.DEFAULT_PROFILE_UPDATE_EVERY_HOURS)} hours",
+                        inline=True
+                    )
+                    
+                    await interaction.followup.send(embed=embed, ephemeral=True)
+                
+        except Exception as e:
+            logging.error(f"Error in user_profile command: {e}")
+            await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+
 async def setup(bot):
     await bot.add_cog(AdminCommands(bot))
