@@ -261,12 +261,6 @@ class AdminCommands(commands.Cog):
         except Exception as e:
             await interaction.edit_original_response(content=f"❌ Error updating channel summary: {str(e)}")
 
-    @app_commands.command(name="summary_update", description="Force an immediate update of a channel's summary.")
-    @app_commands.checks.has_permissions(manage_messages=True)
-    async def summary_update(self, interaction: discord.Interaction, channel: discord.TextChannel = None):
-        """Alias for /summary update"""
-        await self.update_summary(interaction, channel)
-
     @summary_group.command(name="clear", description="Clear a channel's summary and reset counters.")
     @app_commands.checks.has_permissions(administrator=True)
     async def clear_summary(self, interaction: discord.Interaction, channel: discord.TextChannel = None):
