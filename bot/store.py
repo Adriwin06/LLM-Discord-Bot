@@ -61,6 +61,12 @@ class Store:
         data = await self.get_data()
         return data.get(str(guild_id), {})
 
+    async def save_guild_data(self, guild_id, guild_data):
+        async with self.data_lock:
+            data = await self._read_json(self.data_path)
+            data[str(guild_id)] = guild_data
+            await self._write_json(self.data_path, data)
+
     async def backup_data(self):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         

@@ -51,6 +51,13 @@ class LLMDiscordBot(commands.Bot):
                 except Exception as e:
                     logging.error(f"Failed to load cog {filename}: {e}")
 
+        # Sync slash commands with Discord
+        try:
+            synced = await self.tree.sync()
+            logging.info(f"Synced {len(synced)} command(s) with Discord")
+        except Exception as e:
+            logging.error(f"Failed to sync commands: {e}")
+
         # Start background tasks
         self.backup_task.start()
         logging.info("Backup task started.")

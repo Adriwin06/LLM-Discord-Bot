@@ -70,3 +70,5 @@ class ProfileCommands(commands.Cog):
 
 async def setup(bot):
     await bot.add_cog(ProfileCommands(bot))
+async def setup(bot):
+    await bot.add_cog(ProfileCommands(bot))

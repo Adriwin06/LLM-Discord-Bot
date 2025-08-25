@@ -3,6 +3,7 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import logging
+from typing import Literal
 
 class AdminCommands(commands.Cog):
     def __init__(self, bot):
@@ -27,6 +28,70 @@ class AdminCommands(commands.Cog):
         
         await self.bot.store.save_settings(settings)
         await interaction.followup.send("Server LLM settings updated successfully.", ephemeral=True)
+
+    media_config_group = app_commands.Group(name="media_config", description="Configure media processing settings for the server.")
+
+    @media_config_group.command(name="set", description="Set a specific media processing setting.")
+    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.describe(
+        media_type="The type of media to configure.",
+        setting="The setting to change for this media type.",
+        value="The new value for the setting (e.g., 'true', 'false', '10')."
+    )
+    async def set_media_config(self, interaction: discord.Interaction, 
+                               media_type: Literal["images", "audio", "video", "pdf", "office_documents", "text_files", "other_files"],
+                               setting: str,
+                               value: str):
+        await interaction.response.defer(ephemeral=True)
+        guild_id = str(interaction.guild.id)
+
+        settings = await self.bot.store.get_settings()
+        if guild_id not in settings:
+            settings[guild_id] = {}
+        if "media" not in settings[guild_id]:
+            settings[guild_id]["media"] = {}
+        if media_type not in settings[guild_id]["media"]:
+            settings[guild_id]["media"][media_type] = {}
+
+        # Basic type conversion
+        try:
+            if value.lower() == "true":
+                final_value = True
+            elif value.lower() == "false":
+                final_value = False
+            elif value.isdigit():
+                final_value = int(value)
+            else:
+                final_value = float(value)
+        except ValueError:
+            final_value = value # Keep as string if conversion fails
+
+        settings[guild_id]["media"][media_type][setting] = final_value
+        
+        await self.bot.store.save_settings(settings)
+        await interaction.followup.send(f"Media config for `{media_type}` updated: set `{setting}` to `{final_value}`.", ephemeral=True)
+
+    @media_config_group.command(name="view", description="View the current media processing settings for the server.")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def view_media_config(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        guild_id = str(interaction.guild.id)
+        
+        settings = await self.bot.store.get_guild_settings(guild_id)
+        media_settings = settings.get("media", {})
+
+        embed = discord.Embed(title="Media Processing Configuration", color=discord.Color.orange())
+        
+        if not media_settings:
+            embed.description = "No custom media settings found. Using bot defaults."
+        else:
+            for media_type, config in media_settings.items():
+                value_str = "\n".join([f"**{key}:** `{value}`" for key, value in config.items()])
+                if not value_str:
+                    value_str = "No settings configured."
+                embed.add_field(name=media_type.replace("_", " ").title(), value=value_str, inline=False)
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(name="channel_override", description="Override global settings for a specific channel.")
     @app_commands.checks.has_permissions(administrator=True)
@@ -126,5 +191,7 @@ class AdminCommands(commands.Cog):
         except Exception as e:
             await interaction.followup.send(f"Error checking model capabilities: {str(e)}", ephemeral=True)
 
+async def setup(bot):
+    await bot.add_cog(AdminCommands(bot))
 async def setup(bot):
     await bot.add_cog(AdminCommands(bot))

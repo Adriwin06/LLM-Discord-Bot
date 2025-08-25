@@ -4,6 +4,7 @@ from discord.ext import commands
 import logging
 import json
 import re
+from datetime import datetime, timezone
 
 class EventHandler(commands.Cog):
     def __init__(self, bot):
@@ -17,6 +18,9 @@ class EventHandler(commands.Cog):
         # Get settings first for bypass conditions
         _, settings = await self.bot.context_manager.build_context_for_message(message)
         
+        # Update counters and trigger summaries/profiles
+        await self._update_counters_and_triggers(message, settings)
+
         # Decision making
         should_reply, reaction = await self._should_reply_or_react(message, settings)
 
@@ -104,6 +108,60 @@ class EventHandler(commands.Cog):
         except (json.JSONDecodeError, KeyError):
             logging.error(f"Failed to parse decision JSON: {response.choices[0].message.content}")
             return False, None
+
+    async def _update_counters_and_triggers(self, message: discord.Message, settings: dict):
+        guild_id = str(message.guild.id)
+        channel_id = str(message.channel.id)
+        user_id = str(message.author.id)
+
+        try:
+            data = await self.bot.store.get_guild_data(guild_id)
+            
+            # Ensure paths exist
+            if "channels" not in data: data["channels"] = {}
+            if channel_id not in data["channels"]: data["channels"][channel_id] = {}
+            if "users" not in data: data["users"] = {}
+            if user_id not in data["users"]: data["users"][user_id] = {}
+
+            # Channel Summary Trigger
+            channel_data = data["channels"][channel_id]
+            msg_count = channel_data.get("messages_since_summary", 0) + 1
+            channel_data["messages_since_summary"] = msg_count
+            
+            summarize_every_messages = settings.get("summarize_every_messages", self.bot.config.DEFAULT_SUMMARIZE_EVERY_MESSAGES)
+            if msg_count >= summarize_every_messages:
+                await self.bot.context_manager.update_channel_summary(guild_id, channel_id)
+            else:
+                # Check time-based trigger only if message count not met
+                summarize_every_hours = settings.get("summarize_every_hours", self.bot.config.DEFAULT_SUMMARIZE_EVERY_HOURS)
+                last_summary_time_str = channel_data.get("last_summary_time")
+                if last_summary_time_str:
+                    last_summary_time = datetime.fromisoformat(last_summary_time_str)
+                    if (datetime.now(timezone.utc) - last_summary_time).total_seconds() > summarize_every_hours * 3600:
+                        await self.bot.context_manager.update_channel_summary(guild_id, channel_id)
+
+            # User Profile Trigger
+            user_data = data["users"][user_id]
+            profile_msg_count = user_data.get("messages_since_profile_update", 0) + 1
+            user_data["messages_since_profile_update"] = profile_msg_count
+
+            profile_update_messages = settings.get("profile_update_every_messages", self.bot.config.DEFAULT_PROFILE_UPDATE_EVERY_MESSAGES)
+            if profile_msg_count >= profile_update_messages:
+                await self.bot.context_manager.update_user_profile(guild_id, user_id)
+            else:
+                # Check time-based trigger
+                profile_update_hours = settings.get("profile_update_every_hours", self.bot.config.DEFAULT_PROFILE_UPDATE_EVERY_HOURS)
+                last_profile_update_str = user_data.get("last_profile_update_time")
+                if last_profile_update_str:
+                    last_profile_update_time = datetime.fromisoformat(last_profile_update_str)
+                    if (datetime.now(timezone.utc) - last_profile_update_time).total_seconds() > profile_update_hours * 3600:
+                        await self.bot.context_manager.update_user_profile(guild_id, user_id)
+
+            # Save updated data
+            await self.bot.store.save_guild_data(guild_id, data)
+
+        except Exception as e:
+            logging.error(f"Error updating counters and triggers: {e}")
 
     async def _generate_and_send_reply(self, message: discord.Message, settings: dict):
         try:

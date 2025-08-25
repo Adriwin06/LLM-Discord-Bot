@@ -36,3 +36,18 @@ class Config:
 
         # Backup Configuration
         self.BACKUP_INTERVAL_HOURS = int(os.getenv("BACKUP_INTERVAL_HOURS", 24))
+
+        # Summary and Profile Update Triggers
+        self.DEFAULT_SUMMARIZE_EVERY_MESSAGES = int(os.getenv("DEFAULT_SUMMARIZE_EVERY_MESSAGES", 100))
+        self.DEFAULT_SUMMARIZE_EVERY_HOURS = int(os.getenv("DEFAULT_SUMMARIZE_EVERY_HOURS", 24))
+        self.DEFAULT_PROFILE_UPDATE_EVERY_MESSAGES = int(os.getenv("DEFAULT_PROFILE_UPDATE_EVERY_MESSAGES", 50))
+        self.DEFAULT_PROFILE_UPDATE_EVERY_HOURS = int(os.getenv("DEFAULT_PROFILE_UPDATE_EVERY_HOURS", 168))
+
+        # Media Processing Defaults
+        self.DEFAULT_MEDIA_IMAGES_ENABLED = os.getenv("DEFAULT_MEDIA_IMAGES_ENABLED", "True").lower() == "true"
+        self.DEFAULT_MEDIA_AUDIO_ENABLED = os.getenv("DEFAULT_MEDIA_AUDIO_ENABLED", "True").lower() == "true"
+        self.DEFAULT_MEDIA_VIDEO_ENABLED = os.getenv("DEFAULT_MEDIA_VIDEO_ENABLED", "True").lower() == "true"
+        self.DEFAULT_MEDIA_PDF_ENABLED = os.getenv("DEFAULT_MEDIA_PDF_ENABLED", "True").lower() == "true"
+        self.DEFAULT_MEDIA_OFFICE_DOCUMENTS_ENABLED = os.getenv("DEFAULT_MEDIA_OFFICE_DOCUMENTS_ENABLED", "True").lower() == "true"
+        self.DEFAULT_MEDIA_TEXT_FILES_ENABLED = os.getenv("DEFAULT_MEDIA_TEXT_FILES_ENABLED", "True").lower() == "true"
+        self.DEFAULT_MEDIA_OTHER_FILES_ENABLED = os.getenv("DEFAULT_MEDIA_OTHER_FILES_ENABLED", "True").lower() == "true"

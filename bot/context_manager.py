@@ -11,6 +11,7 @@ import docx
 import openpyxl
 from PIL import Image
 import io
+from datetime import datetime, timezone
 
 # Optional imports for media processing
 try:
@@ -42,6 +43,13 @@ except ImportError:
     PPTX_AVAILABLE = False
     logging.warning("python-pptx not available. PowerPoint processing will be limited.")
 
+try:
+    import pdfplumber
+    PDFPLUMBER_AVAILABLE = True
+except ImportError:
+    PDFPLUMBER_AVAILABLE = False
+    logging.warning("pdfplumber not available. Advanced PDF processing will be limited.")
+
 class ContextManager:
     def __init__(self, store: Store, llm_provider: LiteLLMProvider, bot=None):
         self.store = store
@@ -57,6 +65,18 @@ class ContextManager:
         
         final_settings = guild_settings.copy()
         final_settings.update(channel_overrides)
+        
+        # Apply default media settings from config if not present in guild settings
+        if "media" not in final_settings:
+            final_settings["media"] = {
+                "images": {"enabled": self.config.DEFAULT_MEDIA_IMAGES_ENABLED},
+                "audio": {"enabled": self.config.DEFAULT_MEDIA_AUDIO_ENABLED},
+                "video": {"enabled": self.config.DEFAULT_MEDIA_VIDEO_ENABLED},
+                "pdf": {"enabled": self.config.DEFAULT_MEDIA_PDF_ENABLED},
+                "office_documents": {"enabled": self.config.DEFAULT_MEDIA_OFFICE_DOCUMENTS_ENABLED},
+                "text_files": {"enabled": self.config.DEFAULT_MEDIA_TEXT_FILES_ENABLED},
+                "other_files": {"enabled": self.config.DEFAULT_MEDIA_OTHER_FILES_ENABLED}
+            }
         
         return final_settings
 
@@ -204,17 +224,21 @@ class ContextManager:
                     return {"type": "image_url", "image_url": {"url": attachment.url}}
                 else:
                     # Fallback: OCR for text-only models
-                    if images_config.get("ocr_enabled", True):
+                    if images_config.get("ocr_enabled", True) and TESSERACT_AVAILABLE:
                         try:
-                            # TODO: Implement OCR using PIL and pytesseract
-                            return f"[Image OCR placeholder: {attachment.filename} - OCR would extract text here]"
+                            with Image.open(io.BytesIO(file_bytes)) as img:
+                                ocr_text = pytesseract.image_to_string(img)
+                                if ocr_text.strip():
+                                    return f"--- Image OCR Text: {attachment.filename} ---\n{ocr_text.strip()}"
+                                else:
+                                    return f"[Image contains no readable text: {attachment.filename}]"
                         except Exception as e:
                             if images_config.get("description_fallback", True):
                                 return f"[Image with OCR failure: {attachment.filename} - {str(e)[:50]}...]"
                             else:
                                 return f"[Image omitted: {attachment.filename}]"
                     else:
-                        return f"[Image omitted - OCR disabled: {attachment.filename}]"
+                        return f"[Image omitted - OCR disabled or unavailable: {attachment.filename}]"
 
             # Audio processing
             elif mime_type and mime_type.startswith("audio/"):
@@ -284,14 +308,23 @@ class ContextManager:
                     # Fallback: Text extraction for all models
                     try:
                         text = ""
-                        with io.BytesIO(file_bytes) as f:
-                            reader = PyPDF2.PdfReader(f)
-                            for page_num, page in enumerate(reader.pages):
-                                page_text = page.extract_text()
-                                if pdf_config.get("preserve_formatting", True):
-                                    text += f"\n--- Page {page_num + 1} ---\n{page_text}\n"
-                                else:
-                                    text += page_text + "\n"
+                        if PDFPLUMBER_AVAILABLE:
+                            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+                                for i, page in enumerate(pdf.pages):
+                                    page_text = page.extract_text() or ""
+                                    if pdf_config.get("preserve_formatting", True):
+                                        text += f"\n--- Page {i + 1} ---\n{page_text}\n"
+                                    else:
+                                        text += page_text + "\n"
+                        else: # Fallback to PyPDF2
+                            with io.BytesIO(file_bytes) as f:
+                                reader = PyPDF2.PdfReader(f)
+                                for page_num, page in enumerate(reader.pages):
+                                    page_text = page.extract_text() or ""
+                                    if pdf_config.get("preserve_formatting", True):
+                                        text += f"\n--- Page {page_num + 1} ---\n{page_text}\n"
+                                    else:
+                                        text += page_text + "\n"
                         return f"--- PDF Content: {attachment.filename} ---\n{text.strip()}"
                     except Exception as e:
                         return f"[PDF text extraction failed: {attachment.filename} - {str(e)[:50]}...]"
@@ -325,12 +358,28 @@ class ContextManager:
                         return f"--- Document Content: {attachment.filename} ---\n{text.strip()}"
                     
                     elif file_ext == "xlsx":
-                        # TODO: Implement Excel processing with openpyxl
-                        return f"[Excel processing placeholder: {attachment.filename} - Would extract all sheets with structure preservation={preserve_structure}]"
+                        wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
+                        text = ""
+                        for sheet_name in wb.sheetnames:
+                            sheet = wb[sheet_name]
+                            if preserve_structure:
+                                text += f"\n--- Sheet: {sheet_name} ---\n"
+                            for row in sheet.iter_rows(values_only=True):
+                                text += ", ".join([str(cell) if cell is not None else "" for cell in row]) + "\n"
+                        return f"--- Excel Content: {attachment.filename} ---\n{text.strip()}"
                     
-                    elif file_ext == "pptx":
-                        # TODO: Implement PowerPoint processing with python-pptx
-                        return f"[PowerPoint processing placeholder: {attachment.filename} - Would extract slides with structure preservation={preserve_structure}]"
+                    elif file_ext == "pptx" and PPTX_AVAILABLE:
+                        prs = pptx.Presentation(io.BytesIO(file_bytes))
+                        text = ""
+                        for i, slide in enumerate(prs.slides):
+                            if preserve_structure:
+                                text += f"\n--- Slide {i+1} ---\n"
+                            for shape in slide.shapes:
+                                if hasattr(shape, "text"):
+                                    text += shape.text + "\n"
+                        return f"--- PowerPoint Content: {attachment.filename} ---\n{text.strip()}"
+                    elif file_ext == "pptx" and not PPTX_AVAILABLE:
+                        return f"[PowerPoint processing unavailable - python-pptx not installed: {attachment.filename}]"
                         
                 except Exception as e:
                     return f"[Document processing failed: {attachment.filename} - {str(e)[:50]}...]"
@@ -376,13 +425,102 @@ class ContextManager:
             logging.error(f"Error processing attachment {attachment.filename}: {e}")
             return f"[Could not process file: {attachment.filename} - Error: {str(e)[:50]}...]"
 
-    async def update_channel_summary(self, guild_id, channel_id, new_messages):
-        # This is a placeholder for the summary logic.
-        # It would involve calling the LLM with the old summary and new messages.
-        logging.info(f"Placeholder: Would update summary for channel {channel_id} in guild {guild_id}.")
-        pass
+    async def update_channel_summary(self, guild_id: str, channel_id: str):
+        logging.info(f"Updating summary for channel {channel_id} in guild {guild_id}...")
+        data = await self.store.get_guild_data(guild_id)
+        settings = await self.get_guild_and_channel_settings(guild_id, channel_id)
+        
+        channel_data = data.get("channels", {}).get(channel_id, {})
+        old_summary = channel_data.get("summary", "No summary yet.")
+        
+        # Fetch recent messages since last summary
+        channel = self.bot.get_channel(int(channel_id))
+        if not channel:
+            logging.warning(f"Cannot update summary, channel {channel_id} not found.")
+            return
 
-    async def update_user_profile(self, guild_id, user_id, new_messages):
-        # This is a placeholder for the user profile update logic.
-        logging.info(f"Placeholder: Would update profile for user {user_id} in guild {guild_id}.")
-        pass
+        history_limit = settings.get("summarize_every_messages", self.config.DEFAULT_SUMMARIZE_EVERY_MESSAGES)
+        recent_messages = [msg async for msg in channel.history(limit=history_limit)]
+        recent_messages.reverse() # Oldest to newest
+        
+        if not recent_messages:
+            logging.info(f"No new messages to summarize for channel {channel_id}.")
+            return
+
+        conversation_text = "\n".join([f"{msg.author.display_name}: {msg.content}" for msg in recent_messages])
+
+        prompt = f"""
+        You are a conversation summarizer.
+        The current summary of the channel is:
+        ---
+        {old_summary}
+        ---
+        Below are the most recent messages from the channel.
+        Integrate the key topics, questions, and conclusions from these new messages into the existing summary.
+        The summary should be a concise, high-level overview of the channel's ongoing conversation.
+        Do not mention that you are updating a summary. Just provide the new, complete summary.
+
+        New Messages:
+        ---
+        {conversation_text}
+        ---
+        New, updated summary:
+        """
+        
+        try:
+            response = await self.llm_provider.create_completion(
+                model=settings.get("model", self.config.MAIN_LLM_MODEL),
+                messages=[{"role": "user", "content": prompt}]
+            )
+            if response and response.choices:
+                new_summary = response.choices[0].message.content
+                
+                # Update data file
+                if "channels" not in data: data["channels"] = {}
+                if channel_id not in data["channels"]: data["channels"][channel_id] = {}
+                data["channels"][channel_id]["summary"] = new_summary
+                data["channels"][channel_id]["messages_since_summary"] = 0
+                data["channels"][channel_id]["last_summary_time"] = datetime.now(timezone.utc).isoformat()
+                
+                await self.store.save_guild_data(guild_id, data)
+                logging.info(f"Successfully updated summary for channel {channel_id}.")
+            else:
+                logging.error(f"Failed to get a valid response from LLM for channel summary {channel_id}.")
+        except Exception as e:
+            logging.error(f"Error updating channel summary for {channel_id}: {e}")
+
+    async def update_user_profile(self, guild_id: str, user_id: str):
+        logging.info(f"Updating AI profile for user {user_id} in guild {guild_id}...")
+        data = await self.store.get_guild_data(guild_id)
+        settings = await self.get_guild_and_channel_settings(guild_id, None) # Use guild-level settings
+
+        user_data = data.get("users", {}).get(user_id, {})
+        old_summary = user_data.get("ai_summary", "No AI summary yet.")
+
+        # This is a simplified approach. A real implementation would need to scan channels for user messages.
+        # For now, we'll simulate this by fetching from the last active channel if possible, or just note the limitation.
+        # A more robust solution would require a message database or extensive history scanning.
+        
+        # Placeholder: We can't easily get all recent messages for a user across all channels without intensive search.
+        # The logic will be based on a conceptual "recent messages" list.
+        # The trigger in event_handler.py will pass recent messages from the current channel.
+        # This is a limitation of the current design.
+        
+        # This function will be called with a list of messages by the event handler.
+        # For now, the logic here will assume it's called and needs to generate a summary.
+        # The actual message gathering is deferred to the caller.
+        
+        logging.warning(f"User profile update for {user_id} is a placeholder. It needs a robust message gathering mechanism.")
+        # In a real scenario, you would gather messages and then call the LLM like this:
+        # conversation_text = "\n".join([f"{msg.content}" for msg in user_messages])
+        # prompt = f"..."
+        # response = await self.llm_provider.create_completion(...)
+        # ... update data file ...
+        
+        # For now, just update the counters
+        if "users" not in data: data["users"] = {}
+        if user_id not in data["users"]: data["users"][user_id] = {}
+        data["users"][user_id]["messages_since_profile_update"] = 0
+        data["users"][user_id]["last_profile_update_time"] = datetime.now(timezone.utc).isoformat()
+        await self.store.save_guild_data(guild_id, data)
+        logging.info(f"Placeholder AI profile update for user {user_id} completed.")
