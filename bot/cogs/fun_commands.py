@@ -80,7 +80,7 @@ Generate a similar response that's warm and grateful, but don't copy these exact
             else:
                 profile_info = "No profile information available - be creative with their username and general Discord user traits."
             
-            prompt = prompt_template[command_type].format(profile=profile_info)
+            prompt = f"{prompt_template[command_type]}\n\nUser Profile Info:\n{profile_info}"
             
             messages = [
                 {"role": "system", "content": "You are a witty and creative assistant generating fun responses for a Discord bot."},

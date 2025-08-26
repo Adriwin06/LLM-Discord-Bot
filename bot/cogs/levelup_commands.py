@@ -1212,14 +1212,18 @@ Requirements:
     
     async def generate_fallback_message(self, message, new_level, new_role, new_prestige, is_prestige_reset, config):
         """Generate a fallback message when LLM is unavailable"""
-        base_msg = config.get("levelup_msg", "🎉 {mention} just reached level {level}!")
         
         if is_prestige_reset:
             msg = f"🌟✨ PRESTIGE ACHIEVED! ✨🌟 {message.author.mention} has reached the ultimate milestone and earned prestige level {new_level}!"
             if new_prestige:
                 msg += f" Welcome to the {new_prestige.mention} ranks!"
         else:
-            msg = base_msg.format(mention=message.author.mention, level=new_level)
+            # Use custom message if available, otherwise use default
+            base_msg = config.get("levelup_msg", "🎉 {mention} just reached level {level}!")
+            if "{mention}" in base_msg and "{level}" in base_msg:
+                msg = base_msg.format(mention=message.author.mention, level=new_level)
+            else:
+                msg = f"{message.author.mention} has reached level {new_level}!"
             if new_role:
                 msg += f" You've earned the {new_role.mention} role!"
         

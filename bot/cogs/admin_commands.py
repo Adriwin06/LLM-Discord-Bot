@@ -27,7 +27,7 @@ class AdminCommands(commands.Cog):
         })
         
         await self.bot.store.save_settings(settings)
-        await interaction.followup.send("Server LLM settings updated successfully.", ephemeral=True)
+        await interaction.followup.send("✅ Server LLM settings updated successfully.", ephemeral=True)
 
     media_config_group = app_commands.Group(name="media_config", description="Configure media processing settings for the server.")
 
@@ -100,26 +100,36 @@ class AdminCommands(commands.Cog):
         guild_id = str(interaction.guild.id)
         channel_id = str(channel.id)
 
-        settings = await self.bot.store.get_settings()
-        if guild_id not in settings:
-            settings[guild_id] = {}
-        if "channel_overrides" not in settings[guild_id]:
-            settings[guild_id]["channel_overrides"] = {}
-        if channel_id not in settings[guild_id]["channel_overrides"]:
-            settings[guild_id]["channel_overrides"][channel_id] = {}
+        try:
+            settings = await self.bot.store.get_settings()
+            if guild_id not in settings:
+                settings[guild_id] = {}
+            if "channel_overrides" not in settings[guild_id]:
+                settings[guild_id]["channel_overrides"] = {}
+            if channel_id not in settings[guild_id]["channel_overrides"]:
+                settings[guild_id]["channel_overrides"][channel_id] = {}
 
-        override_settings = {}
-        if model:
-            override_settings["model"] = model
-        if behavior_prompt:
-            override_settings["behavior_prompt"] = behavior_prompt
-        if summarize_every_messages:
-            override_settings["summarize_every_messages"] = summarize_every_messages
+            override_settings = {}
+            if model:
+                override_settings["model"] = model
+            if behavior_prompt:
+                override_settings["behavior_prompt"] = behavior_prompt
+            if summarize_every_messages:
+                override_settings["summarize_every_messages"] = summarize_every_messages
+                
+            settings[guild_id]["channel_overrides"][channel_id].update(override_settings)
             
-        settings[guild_id]["channel_overrides"][channel_id].update(override_settings)
-        
-        await self.bot.store.save_settings(settings)
-        await interaction.followup.send(f"Channel override for {channel.mention} updated.", ephemeral=True)
+            await self.bot.store.save_settings(settings)
+            await interaction.followup.send(f"✅ Channel override for {channel.mention} updated.", ephemeral=True)
+        except ValueError as e:
+            await interaction.followup.send(f"❌ Invalid input: {str(e)}", ephemeral=True)
+        except discord.errors.NotFound:
+            await interaction.followup.send("❌ Channel not found.", ephemeral=True)
+        except discord.errors.Forbidden:
+            await interaction.followup.send("❌ Bot lacks permissions to access this channel.", ephemeral=True)
+        except Exception as e:
+            logging.error(f"Error in channel_override command: {str(e)}")
+            await interaction.followup.send("❌ An unexpected error occurred while updating channel override.", ephemeral=True)
 
     @app_commands.command(name="reset_context", description="Reset the bot's context for a channel or the entire server.")
     @app_commands.checks.has_permissions(administrator=True)
@@ -340,8 +350,15 @@ class AdminCommands(commands.Cog):
                 
                 await interaction.followup.send(embed=embed, ephemeral=True)
                 
+        except ValueError as e:
+            await interaction.followup.send(f"❌ Invalid input: {str(e)}", ephemeral=True)
+        except discord.errors.NotFound:
+            await interaction.followup.send("❌ Channel not found.", ephemeral=True)
+        except discord.errors.Forbidden:
+            await interaction.followup.send("❌ Bot lacks permissions to access this channel.", ephemeral=True)
         except Exception as e:
-            await interaction.followup.send(f"❌ Error managing summary settings: {str(e)}", ephemeral=True)
+            logging.error(f"Error in summary_settings command: {str(e)}")
+            await interaction.followup.send("❌ An unexpected error occurred while managing summary settings.", ephemeral=True)
 
     @app_commands.command(name="user_profile", description="Manage user profile settings and statistics.")
     @app_commands.checks.has_permissions(administrator=True)

@@ -6,7 +6,6 @@ aiohttp
 aiofiles
 
 # Media Processing
-py-cord[voice]
 pypdf2
 python-docx
 openpyxl

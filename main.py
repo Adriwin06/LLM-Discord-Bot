@@ -3,9 +3,7 @@ import discord
 from discord.ext import commands, tasks
 import os
 import asyncio
-import signal
 import sys
-from dotenv import load_dotenv
 import logging
 
 # Import core bot components
@@ -17,9 +15,6 @@ from bot.context_manager import ContextManager
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# Load environment variables from .env file
-load_dotenv()
 
 class LLMDiscordBot(commands.Bot):
     def __init__(self):
@@ -135,12 +130,6 @@ class LLMDiscordBot(commands.Bot):
             except Exception as e:
                 logging.error(f"Error closing Discord client: {e}")
 
-def signal_handler(signum, frame):
-    """Handle shutdown signals."""
-    logging.info(f"Received signal {signum}. Initiating graceful shutdown...")
-    # This will cause the bot.run() to exit
-    raise KeyboardInterrupt()
-
 async def run_bot():
     """Run the bot with proper async handling."""
     bot = LLMDiscordBot()
@@ -181,33 +170,9 @@ async def run_bot():
 
 def main():
     """Main function to run the bot."""
-    # Set up signal handlers for graceful shutdown
-    if sys.platform != 'win32':
-        # Unix-style signal handling
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
-    
     try:
-        # On Windows, we rely on KeyboardInterrupt handling
-        if sys.platform == 'win32':
-            # On Windows, ensure we handle Ctrl+C properly
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                loop.run_until_complete(run_bot())
-            except KeyboardInterrupt:
-                logging.info("Received keyboard interrupt (Ctrl+C). Initiating shutdown...")
-                # Cancel all remaining tasks
-                pending = asyncio.all_tasks(loop)
-                for task in pending:
-                    task.cancel()
-                # Wait for tasks to complete cancellation
-                if pending:
-                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-            finally:
-                loop.close()
-        else:
-            asyncio.run(run_bot())
+        # Use asyncio.run for cross-platform compatibility
+        asyncio.run(run_bot())
     except KeyboardInterrupt:
         logging.info("Received keyboard interrupt (Ctrl+C). Shutdown complete.")
         print("\nBot stopped by user. Goodbye! 👋")

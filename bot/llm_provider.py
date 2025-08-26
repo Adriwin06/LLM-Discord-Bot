@@ -6,6 +6,18 @@ import logging
 from .config import Config
 
 class LiteLLMProvider:
+    """
+    LLM provider using LiteLLM for universal model support.
+    
+    This class implements a dual-LLM system:
+    - Main LLM: High-quality model for generating responses
+    - Decision LLM: Lightweight model for quick reply/reaction decisions
+    
+    Features:
+    - Rate limiting for both models
+    - Automatic web search support detection
+    - Vision and audio capability detection
+    """
     def __init__(self, config: Config):
         self.config = config
         self.main_llm_rate_limiter = asyncio.Semaphore(1)
@@ -14,6 +26,12 @@ class LiteLLMProvider:
         self.decision_llm_last_call = 0
 
     async def _rate_limit(self, limiter_type: str):
+        """
+        Apply rate limiting based on configuration.
+        
+        Args:
+            limiter_type: Either 'main' or 'decision' to specify which rate limiter to use
+        """
         if limiter_type == 'main':
             if not self.config.MAIN_LLM_RATE_LIMIT_ENABLED:
                 return
@@ -36,6 +54,23 @@ class LiteLLMProvider:
                 self.decision_llm_last_call = asyncio.get_event_loop().time()
 
     async def create_completion(self, model: str, messages: list, **kwargs):
+        """
+        Create a completion using the specified model.
+        
+        Automatically handles:
+        - Rate limiting based on model type
+        - API key selection based on model provider
+        - Web search capabilities for supported models
+        - JSON response format compatibility
+        
+        Args:
+            model: Model identifier (e.g., 'gpt-4o', 'gemini/gemini-1.5-pro')
+            messages: List of message dictionaries
+            **kwargs: Additional parameters for the completion
+            
+        Returns:
+            LiteLLM response object or None if error occurred
+        """
         limiter_type = 'main' if model == self.config.MAIN_LLM_MODEL else 'decision'
         await self._rate_limit(limiter_type)
         

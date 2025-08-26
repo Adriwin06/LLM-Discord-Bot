@@ -51,6 +51,16 @@ except ImportError:
     logging.warning("pdfplumber not available. Advanced PDF processing will be limited.")
 
 class ContextManager:
+    """
+    Manages conversation context for the Discord bot.
+    
+    This class handles:
+    - Building context from message history and reply chains
+    - Channel summaries and automatic updates
+    - User profile management and AI-generated summaries
+    - Media processing integration
+    - Settings inheritance (guild -> channel overrides)
+    """
     def __init__(self, store: Store, llm_provider: LiteLLMProvider, bot=None):
         self.store = store
         self.llm_provider = llm_provider

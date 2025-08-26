@@ -54,14 +54,31 @@ class Store:
             logging.error(f"Unexpected error reading JSON file {path}: {e}")
             return {}
 
-    async def _write_json(self, path, data):
+    async def _write_json(self, path: str, data: dict):
+        """Write JSON data to file with validation."""
         try:
+            # Validate data structure
+            if not isinstance(data, dict):
+                raise ValueError(f"Expected dict, got {type(data)}")
+            
             # Ensure directory exists
             os.makedirs(os.path.dirname(path), exist_ok=True)
             
-            async with aiofiles.open(path, 'w', encoding='utf-8') as f:
+            # Write to temporary file first, then move (atomic operation)
+            temp_path = f"{path}.tmp"
+            async with aiofiles.open(temp_path, 'w', encoding='utf-8') as f:
                 await f.write(json.dumps(data, indent=2, ensure_ascii=False))
+            
+            # Atomically replace the original file
+            os.replace(temp_path, path)
+            
         except Exception as e:
+            # Clean up temp file if it exists
+            if os.path.exists(f"{path}.tmp"):
+                try:
+                    os.remove(f"{path}.tmp")
+                except OSError:
+                    pass
             logging.error(f"Error writing JSON file {path}: {e}")
             raise
 
@@ -81,15 +98,18 @@ class Store:
         async with self.data_lock:
             await self._write_json(self.data_path, data)
 
-    async def get_guild_settings(self, guild_id):
+    async def get_guild_settings(self, guild_id: str) -> dict:
+        """Get settings for a specific guild by string ID."""
         settings = await self.get_settings()
         return settings.get(str(guild_id), {})
 
-    async def get_guild_data(self, guild_id):
+    async def get_guild_data(self, guild_id: str) -> dict:
+        """Get data for a specific guild by string ID."""
         data = await self.get_data()
         return data.get(str(guild_id), {})
 
-    async def save_guild_data(self, guild_id, guild_data):
+    async def save_guild_data(self, guild_id: str, guild_data: dict):
+        """Save data for a specific guild using string ID."""
         async with self.data_lock:
             data = await self._read_json(self.data_path)
             data[str(guild_id)] = guild_data
