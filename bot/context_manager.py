@@ -113,6 +113,11 @@ class ContextManager:
         
         messages = [{"role": "system", "content": system_prompt}]
 
+        # Add bot identity info as a system message
+        if self.bot and self.bot.user:
+            bot_identity = f"Bot name: {self.bot.user.name}\nBot user ID: {self.bot.user.id}"
+            messages.append({"role": "system", "content": bot_identity})
+
         # 2. Channel Summary
         channel_data = data.get("channels", {}).get(channel_id, {})
         if "summary" in channel_data:
@@ -122,9 +127,13 @@ class ContextManager:
         user_data = data.get("users", {}).get(user_id, {})
         user_profile_content = []
         if "manual_note" in user_data:
-            user_profile_content.append(f"Manual note about {message.author.display_name}: {user_data['manual_note']}")
+            user_profile_content.append(
+                f"Manual note about {message.author.display_name} (User ID: {user_id}): {user_data['manual_note']}"
+            )
         if "ai_summary" in user_data:
-            user_profile_content.append(f"AI summary of {message.author.display_name}: {user_data['ai_summary']}")
+            user_profile_content.append(
+                f"AI summary of {message.author.display_name} (User ID: {user_id}): {user_data['ai_summary']}"
+            )
         
         if user_profile_content:
             messages.append({"role": "system", "content": "\n".join(user_profile_content)})
@@ -483,7 +492,7 @@ class ContextManager:
                 # Skip very short messages that don't add context
                 if len(msg.content.strip()) < 3 and not msg.attachments:
                     continue
-                    
+                
                 recent_messages.append(msg)
                 message_count += 1
                 
