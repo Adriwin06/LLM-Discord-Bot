@@ -45,52 +45,50 @@ class EventHandler(commands.Cog):
         # Use decision LLM with context built specifically for that model
         decision_model = settings.get("decision_llm_model", self.bot.config.DECISION_LLM_MODEL)
         
-        # Show typing indicator while making decision (for longer decision processes)
-        async with message.channel.typing():
-            # Build context specifically for the decision model (includes full media processing for that model)
-            decision_context, _ = await self.bot.context_manager.build_context_for_message(message, decision_model)
-            
-            decision_prompt = """
-            You are a decision-making model for a Discord bot.
-            Based on the provided context, decide if the bot should reply, react with an emoji, or do nothing.
-            The bot should reply if it's directly addressed, asked a question, or can provide a meaningful contribution.
-            The bot should react if the message is emotional, a simple acknowledgement is needed, or contains engaging media.
-            Otherwise, the bot should do nothing.
-            
-            Respond with a single JSON object with two keys:
-            1. "action": a string, either "reply", "react", or "none".
-            2. "reaction": a string containing a single emoji if the action is "react", otherwise null.
-            
-            Example: {"action": "reply", "reaction": null}
-            Example: {"action": "react", "reaction": "👍"}
-            Example: {"action": "none", "reaction": null}
-            """
-            
-            decision_context[0]["content"] = decision_prompt
+        # Build context specifically for the decision model (includes full media processing for that model)
+        decision_context, _ = await self.bot.context_manager.build_context_for_message(message, decision_model)
+        
+        decision_prompt = """
+        You are a decision-making model for a Discord bot.
+        Based on the provided context, decide if the bot should reply, react with an emoji, or do nothing.
+        The bot should reply if it's directly addressed, asked a question, or can provide a meaningful contribution.
+        The bot should react if the message is emotional, a simple acknowledgement is needed, or contains engaging media.
+        Otherwise, the bot should do nothing.
+        
+        Respond with a single JSON object with two keys:
+        1. "action": a string, either "reply", "react", or "none".
+        2. "reaction": a string containing a single emoji if the action is "react", otherwise null.
+        
+        Example: {"action": "reply", "reaction": null}
+        Example: {"action": "react", "reaction": "👍"}
+        Example: {"action": "none", "reaction": null}
+        """
+        
+        decision_context[0]["content"] = decision_prompt
 
-            response = await self.bot.llm_provider.create_completion(
-                model=decision_model,
-                messages=decision_context,
-                response_format={"type": "json_object"}
-            )
+        response = await self.bot.llm_provider.create_completion(
+            model=decision_model,
+            messages=decision_context,
+            response_format={"type": "json_object"}
+        )
 
+        if not response or not response.choices:
+            # Fallback to main model if decision model fails and they are different
+            if decision_model != self.bot.config.MAIN_LLM_MODEL:
+                # Build context for main model and retry decision
+                main_context, _ = await self.bot.context_manager.build_context_for_message(message, self.bot.config.MAIN_LLM_MODEL)
+                main_context[0]["content"] = decision_prompt
+                
+                response = await self.bot.llm_provider.create_completion(
+                    model=self.bot.config.MAIN_LLM_MODEL,
+                    messages=main_context,
+                    response_format={"type": "json_object"}
+                )
             if not response or not response.choices:
-                # Fallback to main model if decision model fails and they are different
-                if decision_model != self.bot.config.MAIN_LLM_MODEL:
-                    # Build context for main model and retry decision
-                    main_context, _ = await self.bot.context_manager.build_context_for_message(message, self.bot.config.MAIN_LLM_MODEL)
-                    main_context[0]["content"] = decision_prompt
-                    
-                    response = await self.bot.llm_provider.create_completion(
-                        model=self.bot.config.MAIN_LLM_MODEL,
-                        messages=main_context,
-                        response_format={"type": "json_object"}
-                    )
-                if not response or not response.choices:
-                    logging.error(f"Both decision and main models failed to make a decision for message {message.id}.")
-                    return False, None
+                logging.error(f"Both decision and main models failed to make a decision for message {message.id}.")
+                return False, None
 
-        # Parse decision response (outside typing context)
+        # Parse decision response
         try:
             # Clean the response content by removing markdown code blocks if present
             raw_content = response.choices[0].message.content.strip()
