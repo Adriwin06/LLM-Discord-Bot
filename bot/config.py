@@ -16,13 +16,13 @@ class Config:
         self.DECISION_LLM_MODEL = os.getenv("DECISION_LLM_MODEL", "gemini/gemini-2.5-flash-lite")
 
         # Prompt Configuration
-        self.BEHAVIOR_PROMPT = os.getenv("BEHAVIOR_PROMPT", "You are a helpful Discord bot assistant.")
-        self.CAPABILITIES_PROMPT = os.getenv("CAPABILITIES_PROMPT", """
-This is your *CAPABILITIES_PROMPT*, IT IS VERY IMPORTANT, FOLLOW THIS EXACTLY: 
-You are a Discord bot with the following capabilities: 
-    You can reply to messages, react with emojis, mention users using their id, 
-    process images/videos/audio/documents when supported by your model, and access web search when available.
-Messages in the conversation history are formatted as '**Username** (User ID: 123456789): message content' - you can use the User ID for pinging users with <@{user_id}> syntax. (example: <@123456789>)""")
+        behavior_prompt_path = os.path.join(os.path.dirname(__file__), "../prompts/BEHAVIOR_PROMPT.md")
+        with open(behavior_prompt_path, "r", encoding="utf-8") as f:
+            self.BEHAVIOR_PROMPT = f.read().strip()
+
+        capabilities_prompt_path = os.path.join(os.path.dirname(__file__), "../prompts/CAPABILITIES_PROMPT.md")
+        with open(capabilities_prompt_path, "r", encoding="utf-8") as f:
+            self.CAPABILITIES_PROMPT = f.read().strip()
 
         # API Keys
         self.OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
