@@ -49,7 +49,7 @@ class LeaderboardView(discord.ui.View):
         
         embed = discord.Embed(
             title="LevelUp Exp Leaderboard",
-            color=0xf1c40f # Yellow
+            color=discord.Color.yellow()
         )
         embed.add_field(name="Total Experience", value=f"{int(self.total_server_xp):,} 💡")
 
@@ -172,7 +172,7 @@ class LevelUpCommands(commands.Cog):
                     if member.voice and member.voice.channel and not member.bot:
                         if self.can_gain_voice_xp(member, config):
                             self.voice_tracking[guild_id][str(member.id)] = datetime.now(timezone.utc)
-            logging.info(f"Initialized voice tracking")
+            logging.info("Initialized voice tracking")
         except Exception as e:
             logging.error(f"Error initializing voice tracking: {e}")
     
@@ -422,7 +422,7 @@ class LevelUpCommands(commands.Cog):
             rolebonus = config.get("rolebonus", {"msg": {}, "voice": {}})
             prestigedata = config.get("prestigedata", {})
             
-            embed = discord.Embed(title="LevelUp Settings", color=discord.Color.blue())
+            embed = discord.Embed(title="LevelUp Settings", color=discord.Color.red())
             embed.set_author(name=interaction.guild.name, icon_url=interaction.guild.icon.url if interaction.guild.icon else None)
 
             embed.add_field(
