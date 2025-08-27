@@ -17,7 +17,12 @@ class Config:
 
         # Prompt Configuration
         self.BEHAVIOR_PROMPT = os.getenv("BEHAVIOR_PROMPT", "You are a helpful Discord bot assistant.")
-        self.CAPABILITIES_PROMPT = os.getenv("CAPABILITIES_PROMPT", "You are a Discord bot with the following capabilities: You can reply to messages, react with emojis, mention users and roles using <mention user=\"Name\"> or <mention role=\"Name\"> syntax, process images/videos/audio/documents when supported by your model, and access web search when available.")
+        self.CAPABILITIES_PROMPT = os.getenv("CAPABILITIES_PROMPT", """
+This is your *CAPABILITIES_PROMPT*, IT IS VERY IMPORTANT, FOLLOW THIS EXACTLY: 
+You are a Discord bot with the following capabilities: 
+    You can reply to messages, react with emojis, mention users using their id, 
+    process images/videos/audio/documents when supported by your model, and access web search when available.
+Messages in the conversation history are formatted as '**Username** (User ID: 123456789): message content' - you can use the User ID for pinging users with <@{user_id}> syntax. (example: <@123456789>)""")
 
         # API Keys
         self.OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")

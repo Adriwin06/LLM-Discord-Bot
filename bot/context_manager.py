@@ -188,9 +188,13 @@ class ContextManager:
         """
         content_parts = []
         
-        # Always add text content first
+        # Add user information for identification
+        user_info = f"**{message.author.display_name}** (User ID: {message.author.id})"
         if message.content:
-            content_parts.append({"type": "text", "text": message.content})
+            content_parts.append({"type": "text", "text": f"{user_info}: {message.content}"})
+        else:
+            content_parts.append({"type": "text", "text": f"{user_info}: [empty message]"})
+
 
         if message.attachments:
             # Use specified model or default to main model for attachment processing
@@ -514,6 +518,7 @@ class ContextManager:
                 # Format message with timestamp and user info
                 timestamp = msg.created_at.strftime("%Y-%m-%d %H:%M")
                 author_name = msg.author.display_name
+                author_id = msg.author.id
                 
                 # Handle message content
                 content = msg.content.strip() if msg.content else ""
@@ -528,11 +533,12 @@ class ContextManager:
                 reply_info = ""
                 if msg.reference and msg.reference.resolved:
                     reply_to = msg.reference.resolved.author.display_name
-                    reply_info = f" (replying to {reply_to})"
+                    reply_to_id = msg.reference.resolved.author.id
+                    reply_info = f" (replying to {reply_to} [{reply_to_id}])"
                 
                 # Combine all parts
                 if content or attachment_info:
-                    full_message = f"[{timestamp}] {author_name}{reply_info}: {content}{attachment_info}"
+                    full_message = f"[{timestamp}] {author_name} [{author_id}]{reply_info}: {content}{attachment_info}"
                     conversation_lines.append(full_message)
             
             conversation_text = "\n".join(conversation_lines)

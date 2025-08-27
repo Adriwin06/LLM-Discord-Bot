@@ -983,8 +983,8 @@ class LevelUpCommands(commands.Cog):
 
             # Build context for LLM
             context_parts = []
-            if manual_note: context_parts.append(f"Manual note about {message.author.display_name}: {manual_note}")
-            if ai_summary: context_parts.append(f"AI summary of {message.author.display_name}: {ai_summary}")
+            if manual_note: context_parts.append(f"Manual note about {message.author.display_name} (User ID: {message.author.id}): {manual_note}")
+            if ai_summary: context_parts.append(f"AI summary of {message.author.display_name} (User ID: {message.author.id}): {ai_summary}")
             
             # User stats
             total_xp = user_data.get("xp", 0.0) + user_data.get("voice", 0.0)
