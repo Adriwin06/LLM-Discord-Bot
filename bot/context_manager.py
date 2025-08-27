@@ -470,8 +470,14 @@ class ContextManager:
             old_summary = channel_data.get("summary", "")
             last_summary_time = channel_data.get("last_summary_time")
             
+            # Determine if this is the first summary
+            is_first_summary = not old_summary or old_summary.strip() == "" or old_summary == "No summary yet."
+            
             # Determine how many messages to fetch based on settings
-            history_limit = settings.get("summarize_every_messages", self.config.DEFAULT_SUMMARIZE_EVERY_MESSAGES)
+            if is_first_summary:
+                history_limit = settings.get("initial_summarize_messages", self.config.INITIAL_SUMMARY_MESSAGES)
+            else:
+                history_limit = settings.get("summarize_every_messages", self.config.DEFAULT_SUMMARIZE_EVERY_MESSAGES)
             
             # If we have a last summary time, try to fetch messages since then
             # Otherwise, use the message count limit
@@ -532,9 +538,17 @@ class ContextManager:
                 # Handle replies
                 reply_info = ""
                 if msg.reference and msg.reference.resolved:
-                    reply_to = msg.reference.resolved.author.display_name
-                    reply_to_id = msg.reference.resolved.author.id
-                    reply_info = f" (replying to {reply_to} [{reply_to_id}])"
+                    if hasattr(msg.reference.resolved, 'author'):
+                        try:
+                            reply_to = msg.reference.resolved.author.display_name
+                            reply_to_id = msg.reference.resolved.author.id
+                            reply_info = f" (replying to {reply_to} [{reply_to_id}])"
+                        except AttributeError:
+                            # Handle deleted accounts
+                            reply_info = " (replying to [Deleted Account])"
+                    else:
+                        # Handle deleted messages
+                        reply_info = " (replying to [Deleted Message])"
                 
                 # Combine all parts
                 if content or attachment_info:

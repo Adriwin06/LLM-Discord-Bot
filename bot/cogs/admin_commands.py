@@ -11,7 +11,7 @@ class AdminCommands(commands.Cog):
 
     @app_commands.command(name="set_llm", description="Configure core LLM parameters for the server.")
     @app_commands.checks.has_permissions(administrator=True)
-    async def set_llm(self, interaction: discord.Interaction, model: str, behavior_prompt: str, summarize_every_messages: int = 100, summarize_every_hours: int = 24):
+    async def set_llm(self, interaction: discord.Interaction, model: str, behavior_prompt: str, summarize_every_messages: int = 100, initial_summarize_messages: int = 1000, summarize_every_hours: int = 24):
         await interaction.response.defer(ephemeral=True)
         guild_id = str(interaction.guild.id)
         
@@ -23,6 +23,7 @@ class AdminCommands(commands.Cog):
             "model": model,
             "behavior_prompt": behavior_prompt,
             "summarize_every_messages": summarize_every_messages,
+            "initial_summarize_messages": initial_summarize_messages,
             "summarize_every_hours": summarize_every_hours
         })
         
