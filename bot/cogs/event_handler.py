@@ -33,6 +33,10 @@ class EventHandler(commands.Cog):
                 logging.warning(f"Failed to add reaction '{reaction}'. It might be an invalid or custom emoji not available.")
 
     async def _should_reply_or_react(self, message: discord.Message, settings: dict):
+        # Bypass commands - don't trigger LLM for messages starting with "!"
+        if message.content.startswith("!"):
+            return False, None
+        
         # Bypass conditions
         is_reply_to_bot = message.reference and message.reference.resolved.author == self.bot.user
         mentions_bot = self.bot.user in message.mentions
