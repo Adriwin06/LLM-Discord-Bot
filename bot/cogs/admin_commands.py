@@ -5,6 +5,100 @@ from discord import app_commands
 import logging
 from typing import Literal
 
+class SummaryPaginationView(discord.ui.View):
+    def __init__(self, summary_text: str, channel_name: str, last_update: str, messages_since: int, messages_processed: int, summary_type: str):
+        super().__init__(timeout=300)  # 5 minute timeout
+        self.summary_text = summary_text
+        self.channel_name = channel_name
+        self.last_update = last_update
+        self.messages_since = messages_since
+        self.messages_processed = messages_processed
+        self.summary_type = summary_type
+        self.current_page = 0
+        
+        # Split summary into pages (approximately 1000 chars per page to leave room for formatting)
+        self.pages = []
+        if len(summary_text) <= 1000:
+            self.pages = [summary_text]
+        else:
+            # Split while preserving formatting
+            lines = summary_text.split('\n')
+            current_page = ""
+            
+            for line in lines:
+                # Check if adding this line would exceed the limit
+                if len(current_page) + len(line) + 1 > 1000:  # +1 for newline
+                    if current_page:
+                        self.pages.append(current_page.rstrip())
+                        current_page = line
+                    else:
+                        # Line itself is too long, split it
+                        if len(line) > 1000:
+                            # Split long lines by character count
+                            for i in range(0, len(line), 1000):
+                                chunk = line[i:i+1000]
+                                if i == 0 and current_page:
+                                    current_page += "\n" + chunk
+                                else:
+                                    if current_page:
+                                        self.pages.append(current_page.rstrip())
+                                    current_page = chunk
+                        else:
+                            current_page = line
+                else:
+                    if current_page:
+                        current_page += "\n" + line
+                    else:
+                        current_page = line
+            
+            if current_page:
+                self.pages.append(current_page.rstrip())
+        
+        self.update_buttons()
+
+    def update_buttons(self):
+        self.prev_button.disabled = self.current_page == 0
+        self.next_button.disabled = self.current_page >= len(self.pages) - 1
+        self.page_label.label = f"Page {self.current_page + 1}/{len(self.pages)}"
+
+    @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary, disabled=True)
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page = max(0, self.current_page - 1)
+        self.update_buttons()
+        await self.update_embed(interaction)
+
+    @discord.ui.button(label="Page 1/1", style=discord.ButtonStyle.secondary, disabled=True)
+    async def page_label(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pass  # This is just a label
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page = min(len(self.pages) - 1, self.current_page + 1)
+        self.update_buttons()
+        await self.update_embed(interaction)
+
+    async def update_embed(self, interaction: discord.Interaction):
+        embed = self.create_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    def create_embed(self):
+        embed = discord.Embed(
+            title=f"Channel Summary: #{self.channel_name}",
+            color=discord.Color.blue()
+        )
+        
+        # Add summary text for current page
+        page_text = self.pages[self.current_page] if self.current_page < len(self.pages) else ""
+        embed.add_field(name=f"Summary (Page {self.current_page + 1})", value=page_text, inline=False)
+        
+        # Add metadata
+        embed.add_field(name="Last Updated", value=self.last_update, inline=True)
+        embed.add_field(name="Messages Since Update", value=str(self.messages_since), inline=True)
+        embed.add_field(name="Messages Processed", value=str(self.messages_processed), inline=True)
+        embed.add_field(name="Summary Type", value=self.summary_type.title(), inline=True)
+        
+        return embed
+
 class AdminCommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -218,17 +312,6 @@ class AdminCommands(commands.Cog):
         try:
             summary_data = await self.bot.context_manager.get_channel_summary(guild_id, channel_id)
             
-            embed = discord.Embed(
-                title=f"Channel Summary: #{target_channel.name}",
-                color=discord.Color.blue()
-            )
-            
-            # Add summary text
-            summary_text = summary_data["summary"]
-            if len(summary_text) > 1024:
-                summary_text = summary_text[:1021] + "..."
-            embed.add_field(name="Summary", value=summary_text, inline=False)
-            
             # Add metadata
             last_update = summary_data.get("last_summary_time")
             if last_update:
@@ -241,12 +324,19 @@ class AdminCommands(commands.Cog):
             else:
                 timestamp = "Never"
             
-            embed.add_field(name="Last Updated", value=timestamp, inline=True)
-            embed.add_field(name="Messages Since Update", value=str(summary_data["messages_since_summary"]), inline=True)
-            embed.add_field(name="Messages Processed", value=str(summary_data["messages_processed"]), inline=True)
-            embed.add_field(name="Summary Type", value=summary_data["summary_type"].title(), inline=True)
+            # Create pagination view with full summary
+            summary_text = summary_data["summary"]
+            view = SummaryPaginationView(
+                summary_text=summary_text,
+                channel_name=target_channel.name,
+                last_update=timestamp,
+                messages_since=summary_data["messages_since_summary"],
+                messages_processed=summary_data["messages_processed"],
+                summary_type=summary_data["summary_type"]
+            )
             
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            embed = view.create_embed()
+            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
             
         except Exception as e:
             await interaction.followup.send(f"Error retrieving channel summary: {str(e)}", ephemeral=True)
