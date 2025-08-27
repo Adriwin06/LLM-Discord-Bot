@@ -994,13 +994,23 @@ class LevelUpCommands(commands.Cog):
             if is_prestige_reset: context_parts.append(f"This is a PRESTIGE. User is now prestige {user_data.get('prestige', 1)} and reset to level 0.")
             
             # Build the LLM prompt
-            system_prompt = f"You are a Discord bot celebrating a user's leveling achievement. Generate a personalized, enthusiastic level-up message for {message.author.mention} who just reached level {new_level}."
+            # Get server settings to incorporate behavior prompt and capability prompt
+            settings = await self.bot.store.get_guild_settings(guild_id)
+            behavior_prompt = settings.get("behavior_prompt", self.bot.config.BEHAVIOR_PROMPT)
+            system_prompt = f"{self.bot.config.CAPABILITIES_PROMPT}\n\n{behavior_prompt}\n\nYou are celebrating a user's leveling achievement. Generate a personalized, enthusiastic level-up message for {message.author.mention} who just reached level {new_level}."
+            
             user_prompt = "\n".join(context_parts)
             
             messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
+                {"role": "system", "content": system_prompt}
             ]
+            
+            # Add bot identity info as a system message
+            if self.bot and self.bot.user:
+                bot_identity = f"Bot name: {self.bot.user.name}\nBot user ID: {self.bot.user.id}"
+                messages.append({"role": "system", "content": bot_identity})
+            
+            messages.append({"role": "user", "content": user_prompt})
             
             # Call the LLM
             response = await self.bot.llm_provider.create_completion(
