@@ -206,7 +206,7 @@ class LevelUpCommands(commands.Cog):
                 "cooldown": 30, "min_length": 4, "rolebonus": {"msg": {}, "voice": {}},
                 "ignoredchannels": [], "ignoredusers": [], "prestigelevel": 8, "prestigedata": {},
                 "voice_settings": {"xp_per_minute": 2.0, "ignore_muted": True, "ignore_deafened": True, "ignore_solo": True},
-                "notify": True, "notifylog": None, "levelup_msg": "The engines are roaring! {mention} just hit level {level}. Keep burning rubber!",
+                "notify": True, "notifylog": None,
                 "message_xp": {"min": 3, "max": 6, "per_char": 0.0},
             }
             # Asynchronously save new config without blocking
@@ -345,12 +345,18 @@ class LevelUpCommands(commands.Cog):
             await interaction.response.send_message("📊 No leveling data found for this server yet!", ephemeral=True)
             return
 
-        # Sort all users with XP > 0
-        user_rankings = sorted(
-            [(uid, data) for uid, data in users_data.items() if data.get("xp", 0.0) > 0],
-            key=lambda item: item[1].get("xp", 0.0),
-            reverse=True
-        )
+        # Sort all users with XP > 0 and are currently in the guild
+        user_rankings = []
+        for uid, data in users_data.items():
+            if data.get("xp", 0.0) > 0:
+                try:
+                    member = interaction.guild.get_member(int(uid))
+                    if member is not None:
+                        user_rankings.append((uid, data))
+                except ValueError:
+                    continue
+
+        user_rankings.sort(key=lambda item: item[1].get("xp", 0.0), reverse=True)
 
         if not user_rankings:
             await interaction.response.send_message("📊 No users with XP found on the leaderboard.", ephemeral=True)
@@ -388,8 +394,7 @@ class LevelUpCommands(commands.Cog):
         enabled="Enable or disable leveling in this server",
         cooldown="Cooldown between XP gains (in seconds)",
         min_length="Minimum message length to earn XP",
-        notify="Enable level up notifications",
-        levelup_message="Custom level up message (use {mention} and {level})"
+        notify="Enable level up notifications"
     )
     @app_commands.checks.has_permissions(administrator=True)
     async def level_settings(
@@ -398,8 +403,7 @@ class LevelUpCommands(commands.Cog):
         enabled: Optional[bool] = None,
         cooldown: Optional[int] = None,
         min_length: Optional[int] = None,
-        notify: Optional[bool] = None,
-        levelup_message: Optional[str] = None
+        notify: Optional[bool] = None
     ):
         guild_id = str(interaction.guild.id)
         config = self.get_guild_config(guild_id)
@@ -410,7 +414,7 @@ class LevelUpCommands(commands.Cog):
             ch = interaction.guild.get_channel(cid)
             return ch.mention if ch else f"(deleted #{cid})"
 
-        if all(param is None for param in [enabled, cooldown, min_length, notify, levelup_message]):
+        if all(param is None for param in [enabled, cooldown, min_length, notify]):
             # --- START OF MAJOR REFACTOR ---
             # This entire block has been rewritten to exactly match the desired screenshot output.
             voice = config.get("voice_settings", {})
@@ -526,11 +530,6 @@ class LevelUpCommands(commands.Cog):
                 user_text = " ".join(f"<@{u}>" for u in ignored_users)
                 embed.add_field(name="Ignored Users", value=user_text[:1024], inline=False)
 
-            embed.add_field(
-                name="LevelUp Message",
-                value=config.get("levelup_msg", "🎉 {mention} just reached level {level}!"),
-                inline=False
-            )
             # --- END OF MAJOR REFACTOR ---
 
             await interaction.response.send_message(embed=embed)
@@ -553,13 +552,6 @@ class LevelUpCommands(commands.Cog):
         if notify is not None:
             config["notify"] = notify
             changes.append(f"Notifications: {'✅ Yes' if notify else '❌ No'}")
-        
-        if levelup_message is not None:
-            if len(levelup_message) > 500:
-                await interaction.response.send_message("❌ Level up message too long! Maximum 500 characters.", ephemeral=True)
-                return
-            config["levelup_msg"] = levelup_message
-            changes.append("Level Up Message: Updated")
         
         await self.save_levels_data()
         
@@ -883,14 +875,33 @@ class LevelUpCommands(commands.Cog):
             return
         self.last_message[last_key] = now
         
-        # Calculate XP gain for the message
         import random
-        msgxp = config.get("message_xp", {"min": 15, "max": 25})
-        xp_gain = random.randint(msgxp.get("min", 15), msgxp.get("max", 25))
+        
+        # Get message XP settings, including the new 'per_char' field
+        msgxp = config.get("message_xp", {"min": 15, "max": 25, "per_char": 0.0})
+        
+        # 1. Calculate the base random XP
+        base_xp = random.randint(msgxp.get("min", 15), msgxp.get("max", 25))
+        
+        # 2. Calculate the bonus XP based on message length
+        xp_per_char = msgxp.get("per_char", 0.0)
+        length_bonus = 0
+        
+        if xp_per_char > 0:
+            # The bonus only applies to characters beyond the minimum length requirement
+            bonus_chars = len(message.content) - min_length
+            length_bonus = bonus_chars * xp_per_char
+            
+            # 3. (Recommended) Cap the bonus to prevent abuse from very long messages.
+            # Here, we cap the bonus so it cannot be larger than the max base XP.
+            max_bonus = msgxp.get("max", 25)
+            length_bonus = min(length_bonus, max_bonus)
+
+        # 4. The final XP gain is the base XP plus the length bonus
+        xp_gain = base_xp + length_bonus
 
         user_data = self.get_user_data(guild_id, user_id)
         
-        # CORRECTED: Base old_level and new_level calculations only on the 'xp' field
         old_level = self.calculate_level_from_xp(user_data.get("xp", 0.0))
         
         user_data["xp"] = user_data.get("xp", 0.0) + xp_gain
@@ -906,9 +917,155 @@ class LevelUpCommands(commands.Cog):
             await self.handle_level_up(message, user_data, old_level, new_level, config)
 
     async def handle_level_up(self, message, user_data, old_level, new_level, config, from_voice=False):
-        # The handle_level_up and related LLM/fallback functions from the previous
-        # responses are still valid and do not need to be changed.
-        pass # Placeholder - Use the full function from my previous responses
+        """Handle level up notification and role assignment"""
+        try:
+            # Generate personalized level up message using LLM
+            levelup_msg = await self.generate_personalized_levelup_message(
+                message, user_data, old_level, new_level, config, from_voice
+            )
+            
+            # Check for notification channel
+            notifylog = config.get("notifylog")
+            if notifylog:
+                channel = message.guild.get_channel(notifylog)
+                if channel:
+                    await channel.send(levelup_msg)
+                else:
+                    await message.channel.send(levelup_msg)
+            else:
+                await message.channel.send(levelup_msg)
+                    
+        except Exception as e:
+            logging.error(f"Error handling level up for {message.author}: {e}")
+
+    async def generate_personalized_levelup_message(self, message, user_data, old_level, new_level, config, from_voice=False):
+        """Generate a personalized level up message using the LLM"""
+        try:
+            guild_id = str(message.guild.id)
+            user_id = str(message.author.id)
+            
+            # Get user profile data from store
+            bot_data = await self.bot.store.get_guild_data(guild_id)
+            user_profile = bot_data.get("users", {}).get(user_id, {})
+            manual_note = user_profile.get("manual_note", "")
+            ai_summary = user_profile.get("ai_summary", "")
+            
+            levelroles = config.get("levelroles", {})
+            prestigedata = config.get("prestigedata", {})
+            prestigelevel = config.get("prestigelevel", 10)
+            
+            new_role = None
+            new_prestige = None
+            is_prestige_reset = False
+            
+            if str(new_level) in levelroles:
+                new_role = message.guild.get_role(levelroles[str(new_level)])
+
+            if new_level >= prestigelevel:
+                current_prestige = user_data.get("prestige", 0)
+                new_prestige_level = current_prestige + 1
+                
+                if str(new_prestige_level) in prestigedata:
+                    prestige_info = prestigedata[str(new_prestige_level)]
+                    if prestige_info.get("role"):
+                        new_prestige = message.guild.get_role(prestige_info["role"])
+                    
+                    user_data["prestige"] = new_prestige_level
+                    user_data["xp"] = 0.0 # Reset XP on prestige
+                    user_data["voice"] = 0.0
+                    user_data["level"] = 0
+                    is_prestige_reset = True
+                    new_level = 0
+                    await self.save_levels_data()
+            
+            # Apply roles before generating message to have them available
+            await self.apply_role_changes(message, new_level, new_role, new_prestige, config, is_prestige_reset)
+
+            # Build context for LLM
+            context_parts = []
+            if manual_note: context_parts.append(f"Manual note about {message.author.display_name}: {manual_note}")
+            if ai_summary: context_parts.append(f"AI summary of {message.author.display_name}: {ai_summary}")
+            
+            # User stats
+            total_xp = user_data.get("xp", 0.0) + user_data.get("voice", 0.0)
+            context_parts.append(f"User is now level {new_level} with {total_xp:,.1f} total XP.")
+            if from_voice: context_parts.append("Level up was from VOICE CHAT activity.")
+            else: context_parts.append("Level up was from text messaging.")
+            if is_prestige_reset: context_parts.append(f"This is a PRESTIGE. User is now prestige {user_data.get('prestige', 1)} and reset to level 0.")
+            
+            # Build the LLM prompt
+            system_prompt = f"You are a Discord bot celebrating a user's leveling achievement. Generate a personalized, enthusiastic level-up message for {message.author.mention} who just reached level {new_level}."
+            user_prompt = "\n".join(context_parts)
+            
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ]
+            
+            # Call the LLM
+            response = await self.bot.llm_provider.create_completion(
+                model=self.bot.llm_provider.config.MAIN_LLM_MODEL,
+                messages=messages,
+                max_tokens=200,
+                temperature=0.8
+            )
+            
+            if response and response.choices:
+                levelup_msg = response.choices[0].message.content.strip()
+                return levelup_msg
+            else:
+                # Fallback to default message
+                return await self.generate_fallback_message(message, new_level, new_role, new_prestige, is_prestige_reset, config)
+                
+        except Exception as e:
+            logging.error(f"Error generating personalized level up message: {e}")
+            # Fallback to default message
+            return await self.generate_fallback_message(message, new_level, None, None, False, config)
+    
+    async def generate_fallback_message(self, message, new_level, new_role, new_prestige, is_prestige_reset, config):
+        """Generate a fallback message when LLM is unavailable"""
+        
+        if is_prestige_reset:
+            prestige_level = new_level
+            msg = f"🌟✨ PRESTIGE ACHIEVED! ✨🌟 {message.author.mention} has reached the ultimate milestone and earned prestige level {prestige_level}!"
+            if new_prestige:
+                msg += f" Welcome to the {new_prestige.mention} ranks!"
+        else:
+            msg = f"🎉 {message.author.mention} just reached level {new_level}! Great job!"
+            if new_role:
+                msg += f" You've earned the {new_role.mention} role!"
+        
+        return msg
+    
+    async def apply_role_changes(self, message, new_level, new_role, new_prestige, config, is_prestige_reset):
+        """Apply role changes for level ups and prestige"""
+        try:
+            autoremove = config.get("autoremove", True)
+            
+            if new_role:
+                await message.author.add_roles(new_role, reason=f"Level up to {new_level}")
+            
+            if new_prestige:
+                await message.author.add_roles(new_prestige, reason="Prestige achievement")
+            
+            if autoremove:
+                levelroles = config.get("levelroles", {})
+                roles_to_remove = []
+                for level_str, role_id in levelroles.items():
+                    level_int = int(level_str)
+                    # Remove if it's an old level role, or if prestiging (remove all level roles)
+                    if (not is_prestige_reset and level_int < new_level) or is_prestige_reset:
+                        if role_id != (new_role.id if new_role else None):
+                            old_role = message.guild.get_role(role_id)
+                            if old_role and old_role in message.author.roles:
+                                roles_to_remove.append(old_role)
+                if roles_to_remove:
+                    await message.author.remove_roles(*roles_to_remove, reason="Level up/Prestige")
+
+        except discord.Forbidden:
+            logging.warning(f"Cannot apply role changes for {message.author} - missing permissions")
+        except Exception as e:
+            logging.error(f"Error applying role changes for {message.author}: {e}")
 
 async def setup(bot):
     await bot.add_cog(LevelUpCommands(bot))
