@@ -924,17 +924,17 @@ class LevelUpCommands(commands.Cog):
                 message, user_data, old_level, new_level, config, from_voice
             )
             
-            # Check for notification channel
+            # Send in current channel (immediate notification)
+            if config.get("notify", True):
+                await message.channel.send(levelup_msg)
+            
+            # Also send to designated log channel if configured
             notifylog = config.get("notifylog")
             if notifylog:
                 channel = message.guild.get_channel(notifylog)
                 if channel:
                     await channel.send(levelup_msg)
-                else:
-                    await message.channel.send(levelup_msg)
-            else:
-                await message.channel.send(levelup_msg)
-                    
+                
         except Exception as e:
             logging.error(f"Error handling level up for {message.author}: {e}")
 
