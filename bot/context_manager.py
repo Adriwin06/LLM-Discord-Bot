@@ -216,7 +216,7 @@ class ContextManager:
 
             for msg in sorted_messages:
                 content = await self._format_message_content(msg, target_model)
-                role = "Bot (You)" if self.bot and msg.author.id == self.bot.user.id else "user"
+                role = "assistant" if self.bot and msg.author.id == self.bot.user.id else "user"
                 messages.append({"role": role, "content": content})
 
         # 5. Current Message or Custom Prompt
@@ -227,7 +227,7 @@ class ContextManager:
             # Add the current message only if include_current_message is True
             if include_current_message:
                 current_message_content = await self._format_message_content(message, target_model)
-                current_message_role = "Bot (You)" if self.bot and message.author.id == self.bot.user.id else "user"
+                current_message_role = "assistant" if self.bot and message.author.id == self.bot.user.id else "user"
                 messages.append({"role": current_message_role, "content": current_message_content})
 
         return messages, settings
