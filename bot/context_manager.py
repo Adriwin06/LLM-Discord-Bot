@@ -207,15 +207,16 @@ class ContextManager:
             all_messages = {msg.id: msg for msg in reply_chain}
             all_messages.update({msg.id: msg for msg in recent_messages})
             
-            # Don't include the current message itself in the history unless explicitly requested
-            if not include_current_message and message.id in all_messages:
+            # Always exclude the current message from history to prevent duplication
+            # The current message will be added separately at the end
+            if message.id in all_messages:
                 del all_messages[message.id]
 
             sorted_messages = sorted(all_messages.values(), key=lambda m: m.created_at)
 
             for msg in sorted_messages:
                 content = await self._format_message_content(msg, target_model)
-                role = "bot (you)" if self.bot and msg.author.id == self.bot.user.id else "user"
+                role = "Bot (You)" if self.bot and msg.author.id == self.bot.user.id else "user"
                 messages.append({"role": role, "content": content})
 
         # 5. Current Message or Custom Prompt
@@ -223,9 +224,11 @@ class ContextManager:
             # Use custom prompt instead of message content
             messages.append({"role": "user", "content": prompt})
         else:
-            # Use actual message content
-            current_message_content = await self._format_message_content(message, target_model)
-            messages.append({"role": "user", "content": current_message_content})
+            # Add the current message only if include_current_message is True
+            if include_current_message:
+                current_message_content = await self._format_message_content(message, target_model)
+                current_message_role = "Bot (You)" if self.bot and message.author.id == self.bot.user.id else "user"
+                messages.append({"role": current_message_role, "content": current_message_content})
 
         return messages, settings
 

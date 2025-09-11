@@ -573,6 +573,7 @@ class AdminCommands(commands.Cog):
     @app_commands.checks.has_permissions(administrator=True)
     async def show_context(self, interaction: discord.Interaction, 
                           message_id: str = None,
+                          raw_format: bool = False,
                           include_bot_identity: bool = True,
                           include_channel_summary: bool = True,
                           include_user_profiles: bool = True,
@@ -584,6 +585,7 @@ class AdminCommands(commands.Cog):
         
         Parameters:
         - message_id: Optional message ID to build context from (defaults to latest message)
+        - raw_format: Show the raw JSON format as sent to the AI, without formatting
         - Various include flags to control what context components to show
         """
         await interaction.response.defer(ephemeral=True)
@@ -623,26 +625,34 @@ class AdminCommands(commands.Cog):
             )
             
             # Format the context for display
-            context_text = ""
-            for item in context:
-                role = item.get("role", "unknown")
-                content = item.get("content", "")
-                
-                # Add role header
-                if role == "system":
-                    context_text += "**[SYSTEM MESSAGE]**\n"
-                elif role == "user":
-                    context_text += "**[USER MESSAGE]**\n"
-                elif role == "assistant":
-                    context_text += "**[ASSISTANT MESSAGE]**\n"
-                else:
-                    context_text += f"**[{role.upper()}]**\n"
-                
-                # Add content with some formatting
-                if len(content) > 500:
-                    context_text += f"{content[:500]}...\n\n"
-                else:
-                    context_text += f"{content}\n\n"
+            if raw_format:
+                # Show raw JSON format as sent to the AI
+                import json
+                context_text = "```json\n" + json.dumps(context, indent=2, ensure_ascii=False) + "\n```"
+            else:
+                # Show formatted version with role headers
+                context_text = ""
+                for item in context:
+                    role = item.get("role", "unknown")
+                    content = item.get("content", "")
+                    
+                    # Add role header
+                    if role == "system":
+                        context_text += "**[SYSTEM MESSAGE]**\n"
+                    elif role == "user":
+                        context_text += "**[USER MESSAGE]**\n"
+                    elif role == "assistant":
+                        context_text += "**[BOT (YOU)]**\n"
+                    elif role == "bot (you)":
+                        context_text += "**[BOT (YOU)]**\n"
+                    else:
+                        context_text += f"**[{role.upper()}]**\n"
+                    
+                    # Add content with some formatting
+                    if len(content) > 500:
+                        context_text += f"{content[:500]}...\n\n"
+                    else:
+                        context_text += f"{content}\n\n"
             
             # If context is too long, create a pagination view
             if len(context_text) > 1900:  # Leave room for embed formatting
