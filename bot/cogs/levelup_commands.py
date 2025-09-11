@@ -941,15 +941,6 @@ class LevelUpCommands(commands.Cog):
     async def generate_personalized_levelup_message(self, message, user_data, old_level, new_level, config, from_voice=False):
         """Generate a personalized level up message using the LLM"""
         try:
-            guild_id = str(message.guild.id)
-            user_id = str(message.author.id)
-            
-            # Get user profile data from store
-            bot_data = await self.bot.store.get_guild_data(guild_id)
-            user_profile = bot_data.get("users", {}).get(user_id, {})
-            manual_note = user_profile.get("manual_note", "")
-            ai_summary = user_profile.get("ai_summary", "")
-            
             levelroles = config.get("levelroles", {})
             prestigedata = config.get("prestigedata", {})
             prestigelevel = config.get("prestigelevel", 10)
@@ -981,36 +972,27 @@ class LevelUpCommands(commands.Cog):
             # Apply roles before generating message to have them available
             await self.apply_role_changes(message, new_level, new_role, new_prestige, config, is_prestige_reset)
 
-            # Build context for LLM
-            context_parts = []
-            if manual_note: context_parts.append(f"Manual note about {message.author.display_name} (User ID: {message.author.id}): {manual_note}")
-            if ai_summary: context_parts.append(f"AI summary of {message.author.display_name} (User ID: {message.author.id}): {ai_summary}")
+            # Build context using the context manager
+            messages, settings = await self.bot.context_manager.build_context(message)
             
-            # User stats
+            # Add level-up specific context
+            level_context_parts = []
             total_xp = user_data.get("xp", 0.0) + user_data.get("voice", 0.0)
-            context_parts.append(f"User is now level {new_level} with {total_xp:,.1f} total XP.")
-            if from_voice: context_parts.append("Level up was from VOICE CHAT activity.")
-            else: context_parts.append("Level up was from text messaging.")
-            if is_prestige_reset: context_parts.append(f"This is a PRESTIGE. User is now prestige {user_data.get('prestige', 1)} and reset to level 0.")
+            level_context_parts.append(f"User is now level {new_level} with {total_xp:,.1f} total XP.")
+            if from_voice:
+                level_context_parts.append("Level up was from VOICE CHAT activity.")
+            else:
+                level_context_parts.append("Level up was from text messaging.")
+            if is_prestige_reset:
+                level_context_parts.append(f"This is a PRESTIGE. User is now prestige {user_data.get('prestige', 1)} and reset to level 0.")
             
-            # Build the LLM prompt
-            # Get server settings to incorporate behavior prompt and capability prompt
-            settings = await self.bot.store.get_guild_settings(guild_id)
-            behavior_prompt = settings.get("behavior_prompt", self.bot.config.BEHAVIOR_PROMPT)
-            system_prompt = f"{self.bot.config.CAPABILITIES_PROMPT}\n\n{behavior_prompt}\n\nYou are celebrating a user's leveling achievement. Generate a personalized, enthusiastic level-up message for {message.author.mention} who just reached level {new_level}."
+            # Modify the system prompt to include level-up celebration context
+            celebration_context = f"\n\nYou are celebrating a user's leveling achievement. Generate a personalized, enthusiastic level-up message for {message.author.mention} who just reached level {new_level}."
+            messages[0]["content"] += celebration_context
             
-            user_prompt = "\n".join(context_parts)
-            
-            messages = [
-                {"role": "system", "content": system_prompt}
-            ]
-            
-            # Add bot identity info as a system message
-            if self.bot and self.bot.user:
-                bot_identity = f"Bot name: {self.bot.user.name}\nBot user ID: {self.bot.user.id}"
-                messages.append({"role": "system", "content": bot_identity})
-            
-            messages.append({"role": "user", "content": user_prompt})
+            # Add level-up specific context as a system message
+            level_context = "\n".join(level_context_parts)
+            messages.insert(-1, {"role": "system", "content": f"Level-up Context: {level_context}"})
             
             # Call the LLM
             response = await self.bot.llm_provider.create_completion(

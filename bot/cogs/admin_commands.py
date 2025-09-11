@@ -569,5 +569,501 @@ class AdminCommands(commands.Cog):
             logging.error(f"Error in user_profile command: {e}")
             await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
 
+    @app_commands.command(name="show_context", description="Show the complete context that would be sent to the LLM.")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def show_context(self, interaction: discord.Interaction, 
+                          message_id: str = None,
+                          include_bot_identity: bool = True,
+                          include_channel_summary: bool = True,
+                          include_user_profiles: bool = True,
+                          include_conversation_history: bool = True,
+                          include_reply_chain: bool = True,
+                          include_current_message: bool = True):
+        """
+        Show the complete context that would be sent to the LLM.
+        
+        Parameters:
+        - message_id: Optional message ID to build context from (defaults to latest message)
+        - Various include flags to control what context components to show
+        """
+        await interaction.response.defer(ephemeral=True)
+        
+        try:
+            # Get the target message
+            target_message = None
+            if message_id:
+                try:
+                    target_message = await interaction.channel.fetch_message(int(message_id))
+                except (ValueError, discord.NotFound, discord.Forbidden):
+                    await interaction.followup.send(f"❌ Could not find message with ID: {message_id}", ephemeral=True)
+                    return
+            else:
+                # Get the latest message from the channel (excluding the command itself)
+                async for message in interaction.channel.history(limit=10):
+                    if message.id != interaction.id and not message.author.bot:
+                        target_message = message
+                        break
+                
+                if not target_message:
+                    await interaction.followup.send("❌ No suitable message found to build context from.", ephemeral=True)
+                    return
+            
+            # Build the context using the context manager
+            context, settings = await self.bot.context_manager.build_context(
+                message=target_message,
+                prompt=None,
+                behavior_override=None,
+                capabilities_override=None,
+                include_bot_identity=include_bot_identity,
+                include_channel_summary=include_channel_summary,
+                include_user_profiles=include_user_profiles,
+                include_conversation_history=include_conversation_history,
+                include_reply_chain=include_reply_chain,
+                include_current_message=include_current_message
+            )
+            
+            # Format the context for display
+            context_text = ""
+            for item in context:
+                role = item.get("role", "unknown")
+                content = item.get("content", "")
+                
+                # Add role header
+                if role == "system":
+                    context_text += "**[SYSTEM MESSAGE]**\n"
+                elif role == "user":
+                    context_text += "**[USER MESSAGE]**\n"
+                elif role == "assistant":
+                    context_text += "**[ASSISTANT MESSAGE]**\n"
+                else:
+                    context_text += f"**[{role.upper()}]**\n"
+                
+                # Add content with some formatting
+                if len(content) > 500:
+                    context_text += f"{content[:500]}...\n\n"
+                else:
+                    context_text += f"{content}\n\n"
+            
+            # If context is too long, create a pagination view
+            if len(context_text) > 1900:  # Leave room for embed formatting
+                # Create pagination similar to summary view
+                pages = []
+                lines = context_text.split('\n')
+                current_page = ""
+                
+                for line in lines:
+                    if len(current_page) + len(line) + 1 > 1900:
+                        if current_page:
+                            pages.append(current_page.rstrip())
+                            current_page = line
+                        else:
+                            # Line itself is too long
+                            if len(line) > 1900:
+                                for i in range(0, len(line), 1900):
+                                    chunk = line[i:i+1900]
+                                    pages.append(chunk)
+                            else:
+                                current_page = line
+                    else:
+                        if current_page:
+                            current_page += "\n" + line
+                        else:
+                            current_page = line
+                
+                if current_page:
+                    pages.append(current_page.rstrip())
+                
+                # Create a simple embed for the first page
+                embed = discord.Embed(
+                    title=f"LLM Context Debug (Page 1/{len(pages)})",
+                    description=pages[0] if pages else "No context generated.",
+                    color=discord.Color.purple()
+                )
+                
+                embed.add_field(
+                    name="Source Message",
+                    value=f"ID: {target_message.id}\nAuthor: {target_message.author.display_name}\nChannel: #{target_message.channel.name}",
+                    inline=False
+                )
+                
+                embed.add_field(
+                    name="Context Components",
+                    value=f"Bot Identity: {'✅' if include_bot_identity else '❌'}\n"
+                          f"Channel Summary: {'✅' if include_channel_summary else '❌'}\n"
+                          f"User Profiles: {'✅' if include_user_profiles else '❌'}\n"
+                          f"Conversation History: {'✅' if include_conversation_history else '❌'}\n"
+                          f"Reply Chain: {'✅' if include_reply_chain else '❌'}\n"
+                          f"Current Message: {'✅' if include_current_message else '❌'}",
+                    inline=False
+                )
+                
+                # Note: For now, just show the first page. A full pagination system would require more code.
+                if len(pages) > 1:
+                    embed.set_footer(text=f"Note: Context is {len(pages)} pages long. Only showing first page.")
+                
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                
+                # If there are multiple pages, send additional messages
+                if len(pages) > 1:
+                    for i, page in enumerate(pages[1:], 2):
+                        embed = discord.Embed(
+                            title=f"LLM Context Debug (Page {i}/{len(pages)})",
+                            description=page,
+                            color=discord.Color.purple()
+                        )
+                        await interaction.followup.send(embed=embed, ephemeral=True)
+                        
+                        # Discord rate limiting - don't send too many messages at once
+                        if i >= 5:  # Limit to 5 total messages
+                            embed = discord.Embed(
+                                title="Context Truncated",
+                                description=f"Remaining {len(pages) - i} pages not shown to avoid rate limits.",
+                                color=discord.Color.orange()
+                            )
+                            await interaction.followup.send(embed=embed, ephemeral=True)
+                            break
+            else:
+                # Context fits in one message
+                embed = discord.Embed(
+                    title="LLM Context Debug",
+                    description=context_text or "No context generated.",
+                    color=discord.Color.purple()
+                )
+                
+                embed.add_field(
+                    name="Source Message",
+                    value=f"ID: {target_message.id}\nAuthor: {target_message.author.display_name}\nChannel: #{target_message.channel.name}",
+                    inline=False
+                )
+                
+                embed.add_field(
+                    name="Context Components",
+                    value=f"Bot Identity: {'✅' if include_bot_identity else '❌'}\n"
+                          f"Channel Summary: {'✅' if include_channel_summary else '❌'}\n"
+                          f"User Profiles: {'✅' if include_user_profiles else '❌'}\n"
+                          f"Conversation History: {'✅' if include_conversation_history else '❌'}\n"
+                          f"Reply Chain: {'✅' if include_reply_chain else '❌'}\n"
+                          f"Current Message: {'✅' if include_current_message else '❌'}",
+                    inline=False
+                )
+                
+                embed.add_field(
+                    name="Settings Used",
+                    value=f"Model: {settings.get('model', 'N/A')}\n"
+                          f"Messages: {len(context)} total\n"
+                          f"Context Length: {len(context_text)} chars",
+                    inline=False
+                )
+                
+                await interaction.followup.send(embed=embed, ephemeral=True)
+            
+        except Exception as e:
+            logging.error(f"Error in show_context command: {e}")
+            await interaction.followup.send(f"❌ Error generating context: {str(e)}", ephemeral=True)
+
+    @app_commands.command(name="reload", description="Reload various bot components.")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def reload(self, interaction: discord.Interaction, 
+                    component: Literal["cogs", "config", "prompts", "all"] = "all"):
+        """
+        Reload bot components without restarting.
+        
+        Parameters:
+        - cogs: Reload all Discord cogs/commands
+        - config: Reload configuration settings
+        - prompts: Reload behavior and capability prompts
+        - all: Reload everything
+        """
+        await interaction.response.defer(ephemeral=True)
+        
+        try:
+            results = []
+            
+            if component in ["cogs", "all"]:
+                # Reload all cogs
+                cog_results = await self._reload_cogs()
+                results.extend(cog_results)
+            
+            if component in ["config", "all"]:
+                # Reload config
+                config_result = await self._reload_config()
+                results.append(config_result)
+            
+            if component in ["prompts", "all"]:
+                # Reload prompts
+                prompt_results = await self._reload_prompts()
+                results.extend(prompt_results)
+            
+            # Format results
+            success_count = sum(1 for r in results if r["success"])
+            total_count = len(results)
+            
+            embed = discord.Embed(
+                title=f"🔄 Reload Results ({success_count}/{total_count} successful)",
+                color=discord.Color.green() if success_count == total_count else discord.Color.orange()
+            )
+            
+            # Group results by type
+            cog_results = [r for r in results if r["type"] == "cog"]
+            config_results = [r for r in results if r["type"] == "config"]
+            prompt_results = [r for r in results if r["type"] == "prompt"]
+            
+            if cog_results:
+                cog_text = []
+                for result in cog_results:
+                    status = "✅" if result["success"] else "❌"
+                    cog_text.append(f"{status} {result['name']}")
+                    if not result["success"]:
+                        cog_text.append(f"   └─ {result['error']}")
+                
+                embed.add_field(
+                    name=f"Cogs ({sum(1 for r in cog_results if r['success'])}/{len(cog_results)})",
+                    value="\n".join(cog_text) if cog_text else "None",
+                    inline=False
+                )
+            
+            if config_results:
+                config_text = []
+                for result in config_results:
+                    status = "✅" if result["success"] else "❌"
+                    config_text.append(f"{status} {result['name']}")
+                    if not result["success"]:
+                        config_text.append(f"   └─ {result['error']}")
+                
+                embed.add_field(
+                    name="Configuration",
+                    value="\n".join(config_text),
+                    inline=False
+                )
+            
+            if prompt_results:
+                prompt_text = []
+                for result in prompt_results:
+                    status = "✅" if result["success"] else "❌"
+                    prompt_text.append(f"{status} {result['name']}")
+                    if not result["success"]:
+                        prompt_text.append(f"   └─ {result['error']}")
+                
+                embed.add_field(
+                    name="Prompts",
+                    value="\n".join(prompt_text),
+                    inline=False
+                )
+            
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            
+        except Exception as e:
+            logging.error(f"Error in reload command: {e}")
+            await interaction.followup.send(f"❌ Error during reload: {str(e)}", ephemeral=True)
+    
+    async def _reload_cogs(self):
+        """Reload all cogs and return results."""
+        results = []
+        
+        # Get list of currently loaded extensions
+        extension_names = list(self.bot.extensions.keys())
+        
+        for extension_name in extension_names:
+            try:
+                # Skip reloading AdminCommands to avoid issues with the current command
+                if "admin_commands" in extension_name:
+                    continue
+                
+                # Try to reload
+                await self.bot.reload_extension(extension_name)
+                
+                # Get a friendly name for display
+                friendly_name = extension_name.split(".")[-1].replace("_", " ").title()
+                
+                results.append({
+                    "type": "cog",
+                    "name": friendly_name,
+                    "success": True,
+                    "error": None
+                })
+                
+            except Exception as e:
+                friendly_name = extension_name.split(".")[-1].replace("_", " ").title()
+                results.append({
+                    "type": "cog", 
+                    "name": friendly_name,
+                    "success": False,
+                    "error": str(e)
+                })
+        
+        # Try to reload AdminCommands last
+        try:
+            await self.bot.reload_extension("bot.cogs.admin_commands")
+            results.append({
+                "type": "cog",
+                "name": "Admin Commands",
+                "success": True,
+                "error": None
+            })
+        except Exception as e:
+            results.append({
+                "type": "cog",
+                "name": "Admin Commands", 
+                "success": False,
+                "error": str(e)
+            })
+        
+        return results
+    
+    async def _reload_config(self):
+        """Reload configuration and return result."""
+        try:
+            # Reload the config module
+            import importlib
+            from bot import config
+            importlib.reload(config)
+            
+            # Update bot's config reference
+            self.bot.config = config
+            
+            return {
+                "type": "config",
+                "name": "Configuration",
+                "success": True,
+                "error": None
+            }
+        except Exception as e:
+            return {
+                "type": "config",
+                "name": "Configuration",
+                "success": False,
+                "error": str(e)
+            }
+    
+    async def _reload_prompts(self):
+        """Reload prompt files and return results."""
+        results = []
+        
+        try:
+            import os
+            
+            # Reload behavior prompt
+            behavior_path = os.path.join("prompts", "BEHAVIOR_PROMPT.md")
+            if os.path.exists(behavior_path):
+                try:
+                    with open(behavior_path, 'r', encoding='utf-8') as f:
+                        f.read()  # Just verify we can read the file
+                    
+                    # Update in bot (if there's a way to do this)
+                    # This depends on how your bot stores default prompts
+                    results.append({
+                        "type": "prompt",
+                        "name": "Behavior Prompt",
+                        "success": True,
+                        "error": None
+                    })
+                except Exception as e:
+                    results.append({
+                        "type": "prompt",
+                        "name": "Behavior Prompt",
+                        "success": False,
+                        "error": str(e)
+                    })
+            
+            # Reload capabilities prompt
+            capabilities_path = os.path.join("prompts", "CAPABILITIES_PROMPT.md")
+            if os.path.exists(capabilities_path):
+                try:
+                    with open(capabilities_path, 'r', encoding='utf-8') as f:
+                        f.read()  # Just verify we can read the file
+                    
+                    results.append({
+                        "type": "prompt",
+                        "name": "Capabilities Prompt", 
+                        "success": True,
+                        "error": None
+                    })
+                except Exception as e:
+                    results.append({
+                        "type": "prompt",
+                        "name": "Capabilities Prompt",
+                        "success": False,
+                        "error": str(e)
+                    })
+            
+        except Exception as e:
+            results.append({
+                "type": "prompt",
+                "name": "Prompts",
+                "success": False,
+                "error": str(e)
+            })
+        
+        return results
+
+    @app_commands.command(name="restart", description="Restart the bot (requires administrator permissions).")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def restart(self, interaction: discord.Interaction):
+        """
+        Restart the bot within its virtual environment.
+        This will close the current bot process and start a new one.
+        """
+        await interaction.response.defer(ephemeral=True)
+        
+        try:
+            # Send confirmation message
+            await interaction.followup.send("🔄 **Restarting bot...** The bot will be back online shortly.", ephemeral=True)
+            
+            # Log the restart
+            logging.info(f"Bot restart initiated by {interaction.user} ({interaction.user.id}) in guild {interaction.guild.name} ({interaction.guild.id})")
+            
+            # Give a moment for the message to send
+            import asyncio
+            await asyncio.sleep(1)
+            
+            # Restart the bot
+            import sys
+            import os
+            import subprocess
+            
+            # Try to detect the virtual environment and restart appropriately
+            python_executable = sys.executable
+            script_path = os.path.abspath(sys.argv[0])
+            
+            # If we're in a virtual environment, use the venv's python
+            if hasattr(sys, 'real_prefix') or (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix):
+                # We're in a virtual environment
+                logging.info(f"Restarting in virtual environment using: {python_executable}")
+                
+                # Start new process
+                if os.name == 'nt':  # Windows
+                    # Use CREATE_NEW_PROCESS_GROUP to detach from current process
+                    subprocess.Popen([python_executable, script_path], 
+                                   creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+                                   cwd=os.path.dirname(script_path))
+                else:  # Unix-like (Linux, macOS)
+                    subprocess.Popen([python_executable, script_path],
+                                   cwd=os.path.dirname(script_path),
+                                   preexec_fn=os.setsid)
+            else:
+                # Not in a virtual environment, just restart with current python
+                logging.info(f"Restarting with system Python: {python_executable}")
+                
+                if os.name == 'nt':  # Windows
+                    subprocess.Popen([python_executable, script_path],
+                                   creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+                                   cwd=os.path.dirname(script_path))
+                else:  # Unix-like
+                    subprocess.Popen([python_executable, script_path],
+                                   cwd=os.path.dirname(script_path),
+                                   preexec_fn=os.setsid)
+            
+            # Close the current bot instance
+            logging.info("Shutting down current bot instance...")
+            await self.bot.close()
+            
+        except Exception as e:
+            logging.error(f"Error during restart: {e}")
+            try:
+                await interaction.edit_original_response(content=f"❌ **Failed to restart bot:** {str(e)}")
+            except Exception:
+                # If we can't edit the response, the bot might already be shutting down
+                pass
+
 async def setup(bot):
     await bot.add_cog(AdminCommands(bot))

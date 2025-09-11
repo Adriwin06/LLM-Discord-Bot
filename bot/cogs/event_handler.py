@@ -16,7 +16,7 @@ class EventHandler(commands.Cog):
             return
 
         # Get settings first for bypass conditions
-        _, settings = await self.bot.context_manager.build_context_for_message(message)
+        _, settings = await self.bot.context_manager.build_context(message)
         
         # Update counters and trigger summaries/profiles
         await self._update_counters_and_triggers(message, settings)
@@ -50,7 +50,7 @@ class EventHandler(commands.Cog):
         decision_model = settings.get("decision_llm_model", self.bot.config.DECISION_LLM_MODEL)
         
         # Build context specifically for the decision model (includes full media processing for that model)
-        decision_context, _ = await self.bot.context_manager.build_context_for_message(message, decision_model)
+        decision_context, _ = await self.bot.context_manager.build_context(message, decision_model)
         
         decision_prompt = """
         You are a decision-making model for a Discord bot.
@@ -80,7 +80,7 @@ class EventHandler(commands.Cog):
             # Fallback to main model if decision model fails and they are different
             if decision_model != self.bot.config.MAIN_LLM_MODEL:
                 # Build context for main model and retry decision
-                main_context, _ = await self.bot.context_manager.build_context_for_message(message, self.bot.config.MAIN_LLM_MODEL)
+                main_context, _ = await self.bot.context_manager.build_context(message, self.bot.config.MAIN_LLM_MODEL)
                 main_context[0]["content"] = decision_prompt
                 
                 response = await self.bot.llm_provider.create_completion(
@@ -188,7 +188,7 @@ class EventHandler(commands.Cog):
             # Start typing indicator while processing
             async with message.channel.typing():
                 # Build context specifically for the main model (includes full media processing for that model)
-                main_context, _ = await self.bot.context_manager.build_context_for_message(message, main_model)
+                main_context, _ = await self.bot.context_manager.build_context(message, main_model)
                 
                 response = await self.bot.llm_provider.create_completion(model=main_model, messages=main_context)
 

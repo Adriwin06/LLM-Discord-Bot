@@ -90,15 +90,53 @@ class ContextManager:
         
         return final_settings
 
-    async def build_context_for_message(self, message: discord.Message, model_name: str = None):
+    async def build_context(self, message: discord.Message = None, channel: discord.TextChannel = None, model_name: str = None, 
+                           prompt: str = None, behavior_override: str = None, capabilities_override: str = None,
+                           include_bot_identity: bool = True, include_channel_summary: bool = True, 
+                           include_user_profiles: bool = True, include_conversation_history: bool = True,
+                           include_reply_chain: bool = True, include_current_message: bool = True):
         """
         Build context for a specific model. If model_name is not provided, uses MAIN_LLM_MODEL.
+        
+        Args:
+            message: Optional. The message to build context for. If not provided, uses the latest message from the channel.
+            channel: Optional. The channel to build context for. Required if message is not provided.
+            model_name: Optional. The model to build context for. Defaults to MAIN_LLM_MODEL.
+            prompt: Optional. Custom prompt to use instead of the current message content. Useful for cogs.
+            behavior_override: Optional. Custom behavior prompt to override the default/settings behavior prompt.
+            capabilities_override: Optional. Custom capabilities prompt to override the default capabilities prompt.
+            include_bot_identity: Optional. Include bot name and ID in system messages. Default True.
+            include_channel_summary: Optional. Include channel summary in context. Default True.
+            include_user_profiles: Optional. Include user profiles (manual notes + AI summaries). Default True.
+            include_conversation_history: Optional. Include recent message history. Default True.
+            include_reply_chain: Optional. Include reply chain context (requires include_conversation_history). Default True.
+            include_current_message: Optional. Include the current message in history (ignored if prompt is provided). Default True.
         
         According to the spec, both decision and main models should receive identical media processing
         but processed according to each model's individual capabilities.
         """
-        guild_id = str(message.guild.id)
-        channel_id = str(message.channel.id)
+        # Handle the case where no message is provided
+        if message is None:
+            if channel is None:
+                raise ValueError("Either message or channel must be provided")
+            
+            # Fetch the latest message from the channel
+            try:
+                async for latest_msg in channel.history(limit=1):
+                    message = latest_msg
+                    break
+                else:
+                    # No messages in channel
+                    raise ValueError(f"No messages found in channel {channel.name}")
+            except Exception as e:
+                raise ValueError(f"Could not fetch latest message from channel: {e}")
+        
+        # If channel wasn't provided but we have a message, get channel from message
+        if channel is None:
+            channel = message.channel
+            
+        guild_id = str(channel.guild.id)
+        channel_id = str(channel.id)
         user_id = str(message.author.id)
 
         settings = await self.get_guild_and_channel_settings(guild_id, channel_id)
@@ -107,77 +145,87 @@ class ContextManager:
         # Use specified model or default to main model
         target_model = model_name or self.config.MAIN_LLM_MODEL
 
-        # 1. System Prompts
-        behavior_prompt = settings.get("behavior_prompt", self.config.BEHAVIOR_PROMPT)
-        system_prompt = f"{self.config.CAPABILITIES_PROMPT}\n\n{behavior_prompt}"
+        # 1. System Prompts with optional overrides
+        capabilities_prompt = capabilities_override or self.config.CAPABILITIES_PROMPT
+        behavior_prompt = behavior_override or settings.get("behavior_prompt", self.config.BEHAVIOR_PROMPT)
+        system_prompt = f"{capabilities_prompt}\n\n{behavior_prompt}"
         
         messages = [{"role": "system", "content": system_prompt}]
 
         # Add bot identity info as a system message
-        if self.bot and self.bot.user:
-            bot_identity = f"Bot name: {self.bot.user.name}\nBot user ID: {self.bot.user.id}"
+        if include_bot_identity and self.bot and self.bot.user:
+            bot_identity = f"Your Bot name: {self.bot.user.name}\nYour Bot user ID: {self.bot.user.id}"
             messages.append({"role": "system", "content": bot_identity})
 
         # 2. Channel Summary
-        channel_data = data.get("channels", {}).get(channel_id, {})
-        if "summary" in channel_data:
-            messages.append({"role": "system", "content": f"Channel Summary:\n{channel_data['summary']}"})
+        if include_channel_summary:
+            channel_data = data.get("channels", {}).get(channel_id, {})
+            if "summary" in channel_data:
+                messages.append({"role": "system", "content": f"Channel Summary:\n{channel_data['summary']}"})
 
         # 3. User Profiles
-        user_data = data.get("users", {}).get(user_id, {})
-        user_profile_content = []
-        if "manual_note" in user_data:
-            user_profile_content.append(
-                f"Manual note about {message.author.display_name} (User ID: {user_id}): {user_data['manual_note']}"
-            )
-        if "ai_summary" in user_data:
-            user_profile_content.append(
-                f"AI summary of {message.author.display_name} (User ID: {user_id}): {user_data['ai_summary']}"
-            )
-        
-        if user_profile_content:
-            messages.append({"role": "system", "content": "\n".join(user_profile_content)})
+        if include_user_profiles:
+            user_data = data.get("users", {}).get(user_id, {})
+            user_profile_content = []
+            if "manual_note" in user_data:
+                user_profile_content.append(
+                    f"Manual note about {message.author.display_name} (User ID: {user_id}): {user_data['manual_note']}"
+                )
+            if "ai_summary" in user_data:
+                user_profile_content.append(
+                    f"AI summary of {message.author.display_name} (User ID: {user_id}): {user_data['ai_summary']}"
+                )
+            
+            if user_profile_content:
+                messages.append({"role": "system", "content": "\n".join(user_profile_content)})
 
         # 4. Conversation History (Reply Chain + Recent Messages)
-        history_limit = settings.get("context", {}).get("history_messages", 15)
-        reply_chain_limit = settings.get("context", {}).get("reply_chain_limit", 5)
+        if include_conversation_history:
+            history_limit = settings.get("context", {}).get("history_messages", 15)
+            reply_chain_limit = settings.get("context", {}).get("reply_chain_limit", 5)
 
-        # Fetch reply chain
-        reply_chain = []
-        current_message = message
-        for _ in range(reply_chain_limit):
-            if current_message.reference and current_message.reference.message_id:
-                try:
-                    ref_message = await message.channel.fetch_message(current_message.reference.message_id)
-                    reply_chain.insert(0, ref_message)
-                    current_message = ref_message
-                except discord.NotFound:
-                    break
-            else:
-                break
-        
-        # Fetch recent messages
-        recent_messages = [msg async for msg in message.channel.history(limit=history_limit)]
-        recent_messages.reverse() # Oldest to newest
+            # Fetch reply chain
+            reply_chain = []
+            if include_reply_chain:
+                current_message = message
+                for _ in range(reply_chain_limit):
+                    if current_message.reference and current_message.reference.message_id:
+                        try:
+                            ref_message = await message.channel.fetch_message(current_message.reference.message_id)
+                            reply_chain.insert(0, ref_message)
+                            current_message = ref_message
+                        except discord.NotFound:
+                            break
+                    else:
+                        break
+            
+            # Fetch recent messages
+            recent_messages = [msg async for msg in message.channel.history(limit=history_limit)]
+            recent_messages.reverse() # Oldest to newest
 
-        # Combine and deduplicate
-        all_messages = {msg.id: msg for msg in reply_chain}
-        all_messages.update({msg.id: msg for msg in recent_messages})
-        
-        # Don't include the current message itself in the history
-        if message.id in all_messages:
-            del all_messages[message.id]
+            # Combine and deduplicate
+            all_messages = {msg.id: msg for msg in reply_chain}
+            all_messages.update({msg.id: msg for msg in recent_messages})
+            
+            # Don't include the current message itself in the history unless explicitly requested
+            if not include_current_message and message.id in all_messages:
+                del all_messages[message.id]
 
-        sorted_messages = sorted(all_messages.values(), key=lambda m: m.created_at)
+            sorted_messages = sorted(all_messages.values(), key=lambda m: m.created_at)
 
-        for msg in sorted_messages:
-            content = await self._format_message_content(msg, target_model)
-            role = "assistant" if self.bot and msg.author.id == self.bot.user.id else "user"
-            messages.append({"role": role, "content": content})
+            for msg in sorted_messages:
+                content = await self._format_message_content(msg, target_model)
+                role = "bot (you)" if self.bot and msg.author.id == self.bot.user.id else "user"
+                messages.append({"role": role, "content": content})
 
-        # 5. Current Message
-        current_message_content = await self._format_message_content(message, target_model)
-        messages.append({"role": "user", "content": current_message_content})
+        # 5. Current Message or Custom Prompt
+        if prompt:
+            # Use custom prompt instead of message content
+            messages.append({"role": "user", "content": prompt})
+        else:
+            # Use actual message content
+            current_message_content = await self._format_message_content(message, target_model)
+            messages.append({"role": "user", "content": current_message_content})
 
         return messages, settings
 
