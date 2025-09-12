@@ -254,12 +254,29 @@ class ContextManager:
             
             for attachment in message.attachments:
                 processed_content = await self._process_attachment(attachment, target_model, media_settings)
-                if isinstance(processed_content, dict):
-                    # This is a structured content (like image_url)
+                if isinstance(processed_content, list):
+                    # This is a list of content parts (e.g., from animated GIF processing)
+                    content_parts.extend(processed_content)
+                elif isinstance(processed_content, dict):
+                    # This is a single structured content (like image_url)
                     content_parts.append(processed_content)
                 else:
                     # This is a text fallback
                     content_parts.append({"type": "text", "text": processed_content})
+
+        # Process embeds (important for Tenor GIFs and other embedded media)
+        if message.embeds:
+            target_model = model_name or self.config.MAIN_LLM_MODEL
+            media_settings = (await self.get_guild_and_channel_settings(message.guild.id, message.channel.id)).get("media", {})
+            
+            for embed in message.embeds:
+                processed_embed = await self._process_embed(embed, target_model, media_settings)
+                if isinstance(processed_embed, list):
+                    content_parts.extend(processed_embed)
+                elif isinstance(processed_embed, dict):
+                    content_parts.append(processed_embed)
+                elif processed_embed:  # Only add non-empty text
+                    content_parts.append({"type": "text", "text": processed_embed})
         
         # If we only have text content, return it as a string for simplicity
         if len(content_parts) == 1 and content_parts[0].get("type") == "text":
@@ -277,14 +294,52 @@ class ContextManager:
             # Check file size limits first
             file_size_mb = attachment.size / (1024 * 1024)
             
+            # Enhanced detection for GIFs, especially Tenor GIFs
+            is_likely_gif = (
+                mime_type == "image/gif" or 
+                file_ext == "gif" or 
+                'gif' in attachment.url.lower() or
+                'tenor.com' in attachment.url.lower() or
+                'giphy.com' in attachment.url.lower() or
+                '?format=gif' in attachment.url.lower()
+            )
+            
+            # Configure headers for better compatibility with GIF services
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Accept': 'image/gif,image/webp,image/apng,image/*,*/*;q=0.8',
+                'Accept-Encoding': 'gzip, deflate',
+                'Connection': 'keep-alive',
+            }
+            
             async with aiohttp.ClientSession() as session:
-                async with session.get(attachment.url) as resp:
+                async with session.get(attachment.url, headers=headers, allow_redirects=True, timeout=30) as resp:
                     if resp.status != 200:
-                        return f"[Could not fetch attachment: {attachment.filename}]"
+                        logging.warning(f"HTTP {resp.status} when fetching {attachment.url}")
+                        return f"[Could not fetch attachment: {attachment.filename} (HTTP {resp.status})]"
+                    
+                    # Check actual content type from response headers
+                    actual_content_type = resp.headers.get('content-type', '').lower()
+                    content_length = resp.headers.get('content-length')
+                    
+                    logging.debug(f"Fetched {attachment.url}: Content-Type={actual_content_type}, Content-Length={content_length}")
+                    
                     file_bytes = await resp.read()
+                    
+                    # Update file size based on actual downloaded content
+                    if len(file_bytes) > 0:
+                        file_size_mb = len(file_bytes) / (1024 * 1024)
+                    
+                    # Update MIME type based on actual response if it's more specific
+                    if actual_content_type.startswith('image/'):
+                        mime_type = actual_content_type
+                    
+                    # Enhanced GIF detection with actual content type
+                    if not is_likely_gif and actual_content_type == 'image/gif':
+                        is_likely_gif = True
 
-            # Image processing
-            if mime_type and mime_type.startswith("image/"):
+            # Image processing (including GIFs)
+            if (mime_type and mime_type.startswith("image/")) or is_likely_gif:
                 images_config = media_settings.get("images", {})
                 if not images_config.get("enabled", True):
                     return f"[Image processing disabled: {attachment.filename}]"
@@ -294,8 +349,137 @@ class ContextManager:
                     return f"[Image too large for processing: {attachment.filename} - {file_size_mb:.1f}MB]"
                 
                 if self.llm_provider.supports_vision(model_name):
-                    # Send directly as image data for vision-capable models
-                    return {"type": "image_url", "image_url": {"url": attachment.url}}
+                    # Check if this is an animated GIF using enhanced detection
+                    if is_likely_gif:
+                        logging.info(f"Processing potential GIF: {attachment.filename}, URL: {attachment.url}, Content-Type: {actual_content_type}, MIME: {mime_type}")
+                        # Handle animated GIF by extracting frames
+                        gif_config = images_config.get("gif", {})
+                        if gif_config.get("extract_frames", True):
+                            try:
+                                import base64
+                                
+                                # Validate that we have image data before trying to process it
+                                if len(file_bytes) == 0:
+                                    logging.warning(f"No data received for {attachment.filename}")
+                                    return {"type": "image_url", "image_url": {"url": attachment.url}}
+                                
+                                gif = Image.open(io.BytesIO(file_bytes))
+                                
+                                # Check if it's actually animated
+                                is_animated = getattr(gif, 'is_animated', False)
+                                logging.info(f"GIF analysis for {attachment.filename}: is_animated={is_animated}, format={gif.format}")
+                                if is_animated:
+                                    # Extract frames from animated GIF with equal distribution across entire length
+                                    max_frames = gif_config.get("max_frames", self.config.DEFAULT_GIF_MAX_FRAMES)
+                                    frame_quality = gif_config.get("frame_quality", self.config.DEFAULT_GIF_FRAME_QUALITY)
+                                    
+                                    frames = []
+                                    total_frames = getattr(gif, 'n_frames', 1)
+                                    
+                                    # Calculate frame indices for equal distribution across the entire GIF
+                                    if total_frames <= max_frames:
+                                        # If GIF has fewer frames than max, take all frames
+                                        frame_indices = list(range(total_frames))
+                                    else:
+                                        # Distribute frames evenly across the entire GIF length
+                                        # This ensures we cover the beginning, middle, and end of the animation
+                                        if max_frames == 1:
+                                            frame_indices = [0]
+                                        elif max_frames == 2:
+                                            frame_indices = [0, total_frames - 1]
+                                        else:
+                                            # For 3+ frames, distribute evenly including first and last frames
+                                            step = (total_frames - 1) / (max_frames - 1)
+                                            frame_indices = [round(i * step) for i in range(max_frames)]
+                                            # Ensure the last frame is exactly the last frame
+                                            frame_indices[-1] = total_frames - 1
+                                            # Remove duplicates while preserving order
+                                            seen = set()
+                                            frame_indices = [x for x in frame_indices if not (x in seen or seen.add(x))]
+                                    
+                                    logging.info(f"Processing animated GIF {attachment.filename}: {total_frames} total frames, extracting frames at indices {frame_indices}")
+                                    
+                                    try:
+                                        for frame_index in frame_indices:
+                                            try:
+                                                gif.seek(frame_index)
+                                                # Convert frame to RGB (remove transparency)
+                                                frame = gif.convert('RGB')
+                                                
+                                                # Convert frame to base64 for the API
+                                                buffer = io.BytesIO()
+                                                frame.save(buffer, format='JPEG', quality=frame_quality)
+                                                buffer.seek(0)
+                                                frame_b64 = base64.b64encode(buffer.getvalue()).decode()
+                                                frames.append(f"data:image/jpeg;base64,{frame_b64}")
+                                                
+                                            except (EOFError, OSError) as e:
+                                                logging.warning(f"Could not access frame {frame_index} in {attachment.filename}: {e}")
+                                                continue
+                                                
+                                    except Exception as frame_error:
+                                        logging.warning(f"Error extracting frames from {attachment.filename}: {frame_error}")
+                                        # Try fallback method with sequential frame access
+                                        frames = []
+                                        try:
+                                            frame_count = 0
+                                            current_frame = 0
+                                            while frame_count < max_frames and current_frame < total_frames:
+                                                # Convert frame to RGB (remove transparency)
+                                                frame = gif.convert('RGB')
+                                                
+                                                # Convert frame to base64 for the API
+                                                buffer = io.BytesIO()
+                                                frame.save(buffer, format='JPEG', quality=frame_quality)
+                                                buffer.seek(0)
+                                                frame_b64 = base64.b64encode(buffer.getvalue()).decode()
+                                                frames.append(f"data:image/jpeg;base64,{frame_b64}")
+                                                
+                                                frame_count += 1
+                                                current_frame += max(1, total_frames // max_frames)
+                                                gif.seek(current_frame)
+                                        except (EOFError, OSError):
+                                            # End of GIF frames
+                                            pass
+                                    
+                                    if frames:
+                                        # Return as a list of content parts for better LLM compatibility
+                                        # First, add a text description
+                                        frame_info = f"Animated GIF: {attachment.filename}"
+                                        if total_frames > len(frames):
+                                            frame_info += f" (showing {len(frames)} representative frames from {total_frames} total frames)"
+                                        else:
+                                            frame_info += f" ({len(frames)} frames)"
+                                        
+                                        # Create a list of content parts: text description + individual frames
+                                        content_parts = [{"type": "text", "text": frame_info}]
+                                        for i, frame_data in enumerate(frames):
+                                            content_parts.append({
+                                                "type": "image_url",
+                                                "image_url": {"url": frame_data}
+                                            })
+                                        
+                                        # Return the list of content parts - the calling method will handle this properly
+                                        return content_parts
+                                    else:
+                                        # Fallback to treating as static image
+                                        return {"type": "image_url", "image_url": {"url": attachment.url}}
+                                else:
+                                    # Static GIF, treat as regular image
+                                    return {"type": "image_url", "image_url": {"url": attachment.url}}
+                            except Exception as e:
+                                logging.warning(f"Failed to process potential GIF {attachment.filename} from {attachment.url}: {type(e).__name__}: {e}")
+                                # Check if this was an image format issue
+                                if "cannot identify image file" in str(e).lower() or "truncated" in str(e).lower():
+                                    logging.info(f"Image format issue with {attachment.filename}, might not be a valid image file")
+                                # Fallback to treating as static image
+                                return {"type": "image_url", "image_url": {"url": attachment.url}}
+                        else:
+                            # GIF frame extraction disabled, treat as static image
+                            return {"type": "image_url", "image_url": {"url": attachment.url}}
+                    else:
+                        # Regular static image
+                        return {"type": "image_url", "image_url": {"url": attachment.url}}
                 else:
                     # Fallback: OCR for text-only models
                     if images_config.get("ocr_enabled", True) and TESSERACT_AVAILABLE:
@@ -498,6 +682,70 @@ class ContextManager:
         except Exception as e:
             logging.error(f"Error processing attachment {attachment.filename}: {e}")
             return f"[Could not process file: {attachment.filename} - Error: {str(e)[:50]}...]"
+
+    async def _process_embed(self, embed: discord.Embed, model_name: str, media_settings: dict):
+        """
+        Process Discord embeds, with special handling for Tenor GIFs and other media.
+        """
+        try:
+            # Check if this embed contains media we can process
+            embed_url = embed.url
+            embed_image_url = embed.image.url if embed.image else None
+            embed_video_url = embed.video.url if embed.video else None
+            
+            # Enhanced detection for embedded GIFs (especially Tenor)
+            potential_gif_urls = []
+            if embed_image_url:
+                potential_gif_urls.append(embed_image_url)
+            if embed_video_url:
+                potential_gif_urls.append(embed_video_url)
+            if embed_url:
+                potential_gif_urls.append(embed_url)
+            
+            for url in potential_gif_urls:
+                if url and (
+                    'tenor.com' in url.lower() or 
+                    'giphy.com' in url.lower() or 
+                    'gif' in url.lower() or
+                    url.endswith('.gif')
+                ):
+                    logging.info(f"Processing embedded GIF from URL: {url}")
+                    
+                    # Create a fake attachment-like object for processing
+                    class EmbedAttachment:
+                        def __init__(self, url, filename=None):
+                            self.url = url
+                            self.filename = filename or url.split('/')[-1] or 'embedded_gif.gif'
+                            self.size = 0  # Unknown size for embeds
+                    
+                    fake_attachment = EmbedAttachment(url, f"embedded_{embed.type or 'media'}.gif")
+                    
+                    # Process using the same logic as attachments
+                    try:
+                        processed_content = await self._process_attachment(fake_attachment, model_name, media_settings)
+                        if processed_content:
+                            return processed_content
+                    except Exception as e:
+                        logging.warning(f"Failed to process embedded media from {url}: {e}")
+                        continue
+            
+            # If no media was processed, return basic embed information
+            embed_info = []
+            if embed.title:
+                embed_info.append(f"Embed Title: {embed.title}")
+            if embed.description:
+                embed_info.append(f"Embed Description: {embed.description[:200]}...")
+            if embed.url and not any(url in potential_gif_urls for url in [embed.url]):
+                embed_info.append(f"Embed URL: {embed.url}")
+            
+            if embed_info:
+                return "--- Embedded Content ---\n" + "\n".join(embed_info)
+            
+            return None  # No processable content found
+            
+        except Exception as e:
+            logging.warning(f"Error processing embed: {e}")
+            return f"[Could not process embedded content - Error: {str(e)[:50]}...]"
 
     async def update_channel_summary(self, guild_id: str, channel_id: str):
         """

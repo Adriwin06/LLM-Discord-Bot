@@ -574,6 +574,7 @@ class AdminCommands(commands.Cog):
     async def show_context(self, interaction: discord.Interaction, 
                           message_id: str = None,
                           raw_format: bool = False,
+                          show_gif_frames: bool = False,
                           include_bot_identity: bool = True,
                           include_channel_summary: bool = True,
                           include_user_profiles: bool = True,
@@ -586,6 +587,7 @@ class AdminCommands(commands.Cog):
         Parameters:
         - message_id: Optional message ID to build context from (defaults to latest message)
         - raw_format: Show the raw JSON format as sent to the AI, without formatting
+        - show_gif_frames: Display actual GIF frames as images (may send multiple messages)
         - Various include flags to control what context components to show
         """
         await interaction.response.defer(ephemeral=True)
@@ -648,11 +650,36 @@ class AdminCommands(commands.Cog):
                     else:
                         context_text += f"**[{role.upper()}]**\n"
                     
-                    # Add content with some formatting
-                    if len(content) > 500:
-                        context_text += f"{content[:500]}...\n\n"
+                    # Handle content that can be either string or list of content parts
+                    content_text = ""
+                    if isinstance(content, list):
+                        # Handle structured content (e.g., text + images from GIF extraction)
+                        for part in content:
+                            if isinstance(part, dict):
+                                if part.get("type") == "text":
+                                    content_text += part.get("text", "") + "\n"
+                                elif part.get("type") == "image_url":
+                                    image_url = part.get("image_url", {}).get("url", "")
+                                    if image_url.startswith("data:image/"):
+                                        # Base64 image data - show as placeholder
+                                        content_text += f"🖼️ [Image: {image_url[:50]}...] (Base64 encoded)\n"
+                                    else:
+                                        # Regular URL - show the URL
+                                        content_text += f"🖼️ [Image: {image_url}]\n"
+                                else:
+                                    # Other content types
+                                    content_text += f"📎 [Content: {part.get('type', 'unknown')}]\n"
+                            else:
+                                content_text += str(part) + "\n"
                     else:
-                        context_text += f"{content}\n\n"
+                        # Regular string content
+                        content_text = str(content)
+                    
+                    # Add content with some formatting
+                    if len(content_text) > 500:
+                        context_text += f"{content_text[:500]}...\n\n"
+                    else:
+                        context_text += f"{content_text}\n\n"
             
             # If context is too long, create a pagination view
             if len(context_text) > 1900:  # Leave room for embed formatting
@@ -766,6 +793,99 @@ class AdminCommands(commands.Cog):
                 )
                 
                 await interaction.followup.send(embed=embed, ephemeral=True)
+            
+            # If show_gif_frames is enabled, extract and display GIF frames separately
+            if show_gif_frames:
+                gif_frames_found = 0
+                for item in context:
+                    content = item.get("content", "")
+                    role = item.get("role", "unknown")
+                    
+                    if isinstance(content, list):
+                        # Look for image content in structured content
+                        text_parts = []
+                        image_parts = []
+                        
+                        for part in content:
+                            if isinstance(part, dict):
+                                if part.get("type") == "text":
+                                    text_parts.append(part.get("text", ""))
+                                elif part.get("type") == "image_url":
+                                    image_url = part.get("image_url", {}).get("url", "")
+                                    if image_url.startswith("data:image/"):
+                                        image_parts.append(image_url)
+                        
+                        # If we found images in this content item, display them
+                        if image_parts:
+                            gif_frames_found += len(image_parts)
+                            
+                            # Create an embed for this set of frames
+                            frame_embed = discord.Embed(
+                                title=f"🎬 GIF Frames from {role.upper()} Message",
+                                description="\n".join(text_parts) if text_parts else "Extracted frames from animated GIF",
+                                color=discord.Color.green()
+                            )
+                            frame_embed.add_field(
+                                name="Frame Count", 
+                                value=f"{len(image_parts)} frames extracted",
+                                inline=True
+                            )
+                            
+                            await interaction.followup.send(embed=frame_embed, ephemeral=True)
+                            
+                            # Send each frame as a separate message due to Discord limitations
+                            for i, frame_data in enumerate(image_parts[:5]):  # Limit to 5 frames to avoid spam
+                                try:
+                                    # Convert base64 to bytes for Discord file upload
+                                    import base64
+                                    import io
+                                    
+                                    # Extract the base64 data (remove data:image/jpeg;base64, prefix)
+                                    if "," in frame_data:
+                                        base64_data = frame_data.split(",", 1)[1]
+                                        image_bytes = base64.b64decode(base64_data)
+                                        
+                                        # Create a file-like object
+                                        image_file = discord.File(
+                                            io.BytesIO(image_bytes), 
+                                            filename=f"gif_frame_{i+1}.jpg"
+                                        )
+                                        
+                                        frame_embed = discord.Embed(
+                                            title=f"Frame {i+1}/{len(image_parts)}",
+                                            color=discord.Color.blue()
+                                        )
+                                        frame_embed.set_image(url=f"attachment://gif_frame_{i+1}.jpg")
+                                        
+                                        await interaction.followup.send(
+                                            embed=frame_embed, 
+                                            file=image_file, 
+                                            ephemeral=True
+                                        )
+                                        
+                                except Exception as frame_error:
+                                    logging.warning(f"Could not display frame {i+1}: {frame_error}")
+                                    await interaction.followup.send(
+                                        f"❌ Could not display frame {i+1}: {str(frame_error)[:100]}", 
+                                        ephemeral=True
+                                    )
+                            
+                            if len(image_parts) > 5:
+                                await interaction.followup.send(
+                                    f"ℹ️ Showing first 5 frames only. {len(image_parts) - 5} additional frames not displayed to avoid spam.",
+                                    ephemeral=True
+                                )
+                
+                if gif_frames_found == 0:
+                    await interaction.followup.send(
+                        "ℹ️ No GIF frames found in context. Try processing a message with an animated GIF first.",
+                        ephemeral=True
+                    )
+                else:
+                    await interaction.followup.send(
+                        f"✅ Displayed {min(gif_frames_found, 5)} GIF frames from context.",
+                        ephemeral=True
+                    )
             
         except Exception as e:
             logging.error(f"Error in show_context command: {e}")
