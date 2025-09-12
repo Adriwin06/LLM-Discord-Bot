@@ -57,3 +57,7 @@ class Config:
         self.DEFAULT_MEDIA_OFFICE_DOCUMENTS_ENABLED = os.getenv("DEFAULT_MEDIA_OFFICE_DOCUMENTS_ENABLED", "True").lower() == "true"
         self.DEFAULT_MEDIA_TEXT_FILES_ENABLED = os.getenv("DEFAULT_MEDIA_TEXT_FILES_ENABLED", "True").lower() == "true"
         self.DEFAULT_MEDIA_OTHER_FILES_ENABLED = os.getenv("DEFAULT_MEDIA_OTHER_FILES_ENABLED", "True").lower() == "true"
+
+        # GIF Processing Defaults
+        self.DEFAULT_GIF_MAX_FRAMES = int(os.getenv("DEFAULT_GIF_MAX_FRAMES", 5))
+        self.DEFAULT_GIF_FRAME_QUALITY = int(os.getenv("DEFAULT_GIF_FRAME_QUALITY", 85))
