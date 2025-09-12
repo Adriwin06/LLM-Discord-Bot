@@ -127,8 +127,8 @@ class EventHandler(commands.Cog):
         user_id = str(message.author.id)
 
         try:
-            # Use the context manager's data lock to prevent race conditions
-            async with self.bot.context_manager._data_lock:
+            # Use the data store's lock to prevent race conditions
+            async with self.bot.store._lock:
                 # Get fresh data to avoid conflicts
                 fresh_data = await self.bot.store.get_data()
                 
@@ -225,7 +225,7 @@ class EventHandler(commands.Cog):
                 
                 response = await self.bot.llm_provider.create_completion(model=main_model, messages=main_context)
 
-                if not response or not response.choices:
+                if not response or not response.choices or not response.choices[0].message.content:
                     logging.error(f"Main model failed to generate a response for message {message.id}.")
                     return
 
