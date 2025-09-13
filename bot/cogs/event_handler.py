@@ -6,6 +6,7 @@ import json
 import re
 import asyncio
 from datetime import datetime, timezone
+from .utilities import MessageChunker
 
 class EventHandler(commands.Cog):
     def __init__(self, bot):
@@ -235,7 +236,11 @@ class EventHandler(commands.Cog):
                 content = await self._resolve_mentions(content, message.guild)
 
             # Handle message chunking (typing stops automatically when exiting the context)
-            await self._send_chunked_message(message, content, settings)
+            await MessageChunker.send_chunked_message(
+                target=message.channel,
+                content=content,
+                reply_to=message
+            )
             
         except Exception as e:
             logging.error(f"Error in _generate_and_send_reply: {e}")
@@ -261,120 +266,6 @@ class EventHandler(commands.Cog):
             return name
 
         return mention_pattern.sub(replace_mention, content)
-
-    async def _send_chunked_message(self, message: discord.Message, content: str, settings: dict):
-        """
-        Send message content, splitting into multiple messages if needed.
-        Only the first message uses reply, subsequent messages are sent normally.
-        No limit on number of chunks - will send as many as needed.
-        """
-        try:
-            max_len = 1950  # Leave room for chunk indicators
-            
-            # If content fits in a single message, send it as a reply
-            if len(content) <= 2000:
-                await message.reply(content)
-                return
-
-            logging.info(f"Splitting long message ({len(content)} chars) into chunks for message {message.id}")
-            
-            # Safety check for extremely long messages
-            if len(content) > 500000:  # 500KB limit
-                logging.warning(f"Message is extremely long ({len(content)} chars), truncating to prevent performance issues")
-                content = content[:500000] + "\n\n... [Message truncated due to extreme length]"
-            
-            # Split content into chunks
-            chunks = self._split_content_smartly(content, max_len)
-            
-            # Safety limit to prevent Discord rate limiting
-            max_chunks = 50  # Reasonable limit to prevent spam
-            if len(chunks) > max_chunks:
-                logging.warning(f"Too many chunks ({len(chunks)}), limiting to {max_chunks}")
-                chunks = chunks[:max_chunks]
-                chunks[-1] += "\n\n... [Response truncated - too many chunks]"
-            
-            logging.info(f"Split into {len(chunks)} chunks")
-            
-            # Send first chunk as a reply
-            first_chunk = chunks[0]
-            if len(chunks) > 1:
-                chunk_indicator = f" (1/{len(chunks)})"
-                # Ensure the indicator fits within Discord's limit
-                if len(first_chunk) + len(chunk_indicator) <= 2000:
-                    first_chunk += chunk_indicator
-            
-            await message.reply(first_chunk)
-            logging.info("Sent first chunk as reply")
-            
-            # Send remaining chunks as normal messages (not replies)
-            for i, chunk in enumerate(chunks[1:], 2):
-                chunk_indicator = f" ({i}/{len(chunks)})"
-                # Ensure the indicator fits within Discord's limit
-                if len(chunk) + len(chunk_indicator) <= 2000:
-                    chunk += chunk_indicator
-                
-                await message.channel.send(chunk)
-                logging.info(f"Sent chunk {i}/{len(chunks)}")
-                
-        except Exception as e:
-            logging.error(f"Error in _send_chunked_message: {e}")
-            # Fallback: send original content as a single reply
-            try:
-                await message.reply(content[:2000])
-                if len(content) > 2000:
-                    await message.channel.send("... [Response was too long and chunking failed]")
-            except Exception as fallback_error:
-                logging.error(f"Fallback also failed: {fallback_error}")
-
-    def _split_content_smartly(self, content: str, max_len: int) -> list:
-        """
-        Split content into chunks at natural break points.
-        Simple, guaranteed-to-terminate algorithm.
-        """
-        if len(content) <= max_len:
-            return [content]
-        
-        chunks = []
-        remaining = content
-        
-        while remaining:
-            if len(remaining) <= max_len:
-                # Last chunk
-                chunks.append(remaining)
-                break
-            
-            # Take a slice of max_len
-            chunk = remaining[:max_len]
-            
-            # Find the best place to split within this chunk
-            split_pos = max_len
-            
-            # Try to split at paragraph break
-            last_paragraph = chunk.rfind('\n\n')
-            if last_paragraph > max_len // 2:  # Don't split too early
-                split_pos = last_paragraph + 2
-            else:
-                # Try to split at sentence end
-                sentence_ends = [chunk.rfind('. '), chunk.rfind('! '), chunk.rfind('? ')]
-                last_sentence = max(sentence_ends)
-                if last_sentence > max_len // 2:
-                    split_pos = last_sentence + 2
-                else:
-                    # Try to split at word boundary
-                    last_space = chunk.rfind(' ')
-                    if last_space > max_len * 0.7:  # Don't split too early
-                        split_pos = last_space + 1
-                    # Otherwise use max_len (arbitrary split)
-            
-            # Extract the chunk and update remaining content
-            final_chunk = remaining[:split_pos].rstrip()
-            if final_chunk:  # Only add non-empty chunks
-                chunks.append(final_chunk)
-            
-            # Move to next section
-            remaining = remaining[split_pos:].lstrip()
-        
-        return chunks
 
     def _clean_json_response(self, content: str) -> str:
         """

@@ -4,100 +4,7 @@ from discord.ext import commands
 from discord import app_commands
 import logging
 from typing import Literal
-
-class SummaryPaginationView(discord.ui.View):
-    def __init__(self, summary_text: str, channel_name: str, last_update: str, messages_since: int, messages_processed: int, summary_type: str):
-        super().__init__(timeout=300)  # 5 minute timeout
-        self.summary_text = summary_text
-        self.channel_name = channel_name
-        self.last_update = last_update
-        self.messages_since = messages_since
-        self.messages_processed = messages_processed
-        self.summary_type = summary_type
-        self.current_page = 0
-        
-        # Split summary into pages (approximately 1000 chars per page to leave room for formatting)
-        self.pages = []
-        if len(summary_text) <= 1000:
-            self.pages = [summary_text]
-        else:
-            # Split while preserving formatting
-            lines = summary_text.split('\n')
-            current_page = ""
-            
-            for line in lines:
-                # Check if adding this line would exceed the limit
-                if len(current_page) + len(line) + 1 > 1000:  # +1 for newline
-                    if current_page:
-                        self.pages.append(current_page.rstrip())
-                        current_page = line
-                    else:
-                        # Line itself is too long, split it
-                        if len(line) > 1000:
-                            # Split long lines by character count
-                            for i in range(0, len(line), 1000):
-                                chunk = line[i:i+1000]
-                                if i == 0 and current_page:
-                                    current_page += "\n" + chunk
-                                else:
-                                    if current_page:
-                                        self.pages.append(current_page.rstrip())
-                                    current_page = chunk
-                        else:
-                            current_page = line
-                else:
-                    if current_page:
-                        current_page += "\n" + line
-                    else:
-                        current_page = line
-            
-            if current_page:
-                self.pages.append(current_page.rstrip())
-        
-        self.update_buttons()
-
-    def update_buttons(self):
-        self.prev_button.disabled = self.current_page == 0
-        self.next_button.disabled = self.current_page >= len(self.pages) - 1
-        self.page_label.label = f"Page {self.current_page + 1}/{len(self.pages)}"
-
-    @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary, disabled=True)
-    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.current_page = max(0, self.current_page - 1)
-        self.update_buttons()
-        await self.update_embed(interaction)
-
-    @discord.ui.button(label="Page 1/1", style=discord.ButtonStyle.secondary, disabled=True)
-    async def page_label(self, interaction: discord.Interaction, button: discord.ui.Button):
-        pass  # This is just a label
-
-    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary)
-    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.current_page = min(len(self.pages) - 1, self.current_page + 1)
-        self.update_buttons()
-        await self.update_embed(interaction)
-
-    async def update_embed(self, interaction: discord.Interaction):
-        embed = self.create_embed()
-        await interaction.response.edit_message(embed=embed, view=self)
-
-    def create_embed(self):
-        embed = discord.Embed(
-            title=f"Channel Summary: #{self.channel_name}",
-            color=discord.Color.blue()
-        )
-        
-        # Add summary text for current page
-        page_text = self.pages[self.current_page] if self.current_page < len(self.pages) else ""
-        embed.add_field(name=f"Summary (Page {self.current_page + 1})", value=page_text, inline=False)
-        
-        # Add metadata
-        embed.add_field(name="Last Updated", value=self.last_update, inline=True)
-        embed.add_field(name="Messages Since Update", value=str(self.messages_since), inline=True)
-        embed.add_field(name="Messages Processed", value=str(self.messages_processed), inline=True)
-        embed.add_field(name="Summary Type", value=self.summary_type.title(), inline=True)
-        
-        return embed
+from .utilities import AdvancedPaginationView, MessageChunker
 
 class AdminCommands(commands.Cog):
     def __init__(self, bot):
@@ -326,13 +233,18 @@ class AdminCommands(commands.Cog):
             
             # Create pagination view with full summary
             summary_text = summary_data["summary"]
-            view = SummaryPaginationView(
-                summary_text=summary_text,
-                channel_name=target_channel.name,
-                last_update=timestamp,
-                messages_since=summary_data["messages_since_summary"],
-                messages_processed=summary_data["messages_processed"],
-                summary_type=summary_data["summary_type"]
+            metadata = {
+                "Last Updated": timestamp,
+                "Messages Since Update": str(summary_data["messages_since_summary"]),
+                "Messages Processed": str(summary_data["messages_processed"]),
+                "Summary Type": summary_data["summary_type"].title()
+            }
+            
+            view = AdvancedPaginationView(
+                content=summary_text,
+                title=f"Channel Summary: #{target_channel.name}",
+                color=discord.Color.blue(),
+                metadata=metadata
             )
             
             embed = view.create_embed()
@@ -681,39 +593,15 @@ class AdminCommands(commands.Cog):
                     else:
                         context_text += f"{content_text}\n\n"
             
-            # If context is too long, create a pagination view
+            # If context is too long, use MessageChunker for smart splitting
             if len(context_text) > 1900:  # Leave room for embed formatting
-                # Create pagination similar to summary view
-                pages = []
-                lines = context_text.split('\n')
-                current_page = ""
-                
-                for line in lines:
-                    if len(current_page) + len(line) + 1 > 1900:
-                        if current_page:
-                            pages.append(current_page.rstrip())
-                            current_page = line
-                        else:
-                            # Line itself is too long
-                            if len(line) > 1900:
-                                for i in range(0, len(line), 1900):
-                                    chunk = line[i:i+1900]
-                                    pages.append(chunk)
-                            else:
-                                current_page = line
-                    else:
-                        if current_page:
-                            current_page += "\n" + line
-                        else:
-                            current_page = line
-                
-                if current_page:
-                    pages.append(current_page.rstrip())
+                # Use MessageChunker to split the content intelligently
+                chunks = MessageChunker.split_content(context_text, max_length=1900)
                 
                 # Create a simple embed for the first page
                 embed = discord.Embed(
-                    title=f"LLM Context Debug (Page 1/{len(pages)})",
-                    description=pages[0] if pages else "No context generated.",
+                    title=f"LLM Context Debug (Page 1/{len(chunks)})",
+                    description=chunks[0] if chunks else "No context generated.",
                     color=discord.Color.purple()
                 )
                 
@@ -735,16 +623,16 @@ class AdminCommands(commands.Cog):
                 )
                 
                 # Note: For now, just show the first page. A full pagination system would require more code.
-                if len(pages) > 1:
-                    embed.set_footer(text=f"Note: Context is {len(pages)} pages long. Only showing first page.")
+                if len(chunks) > 1:
+                    embed.set_footer(text=f"Note: Context is {len(chunks)} pages long. Only showing first page.")
                 
                 await interaction.followup.send(embed=embed, ephemeral=True)
                 
                 # If there are multiple pages, send additional messages
-                if len(pages) > 1:
-                    for i, page in enumerate(pages[1:], 2):
+                if len(chunks) > 1:
+                    for i, page in enumerate(chunks[1:], 2):
                         embed = discord.Embed(
-                            title=f"LLM Context Debug (Page {i}/{len(pages)})",
+                            title=f"LLM Context Debug (Page {i}/{len(chunks)})",
                             description=page,
                             color=discord.Color.purple()
                         )
@@ -754,7 +642,7 @@ class AdminCommands(commands.Cog):
                         if i >= 5:  # Limit to 5 total messages
                             embed = discord.Embed(
                                 title="Context Truncated",
-                                description=f"Remaining {len(pages) - i} pages not shown to avoid rate limits.",
+                                description=f"Remaining {len(chunks) - i} pages not shown to avoid rate limits.",
                                 color=discord.Color.orange()
                             )
                             await interaction.followup.send(embed=embed, ephemeral=True)

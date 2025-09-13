@@ -10,6 +10,7 @@ from typing import Optional, Dict, Any, List, Tuple, Callable
 import aiofiles
 import os
 import asyncio
+from .utilities import UtilityHelpers
 
 # Interactive View for the Leaderboard
 class LeaderboardView(discord.ui.View):
@@ -64,7 +65,7 @@ class LeaderboardView(discord.ui.View):
                 user = self.interaction.guild.get_member(int(user_id))
                 if user is None:
                     continue  # Skip unknown users
-                name = user.display_name
+                name = UtilityHelpers.safe_username(user)
                 total_xp = data.get("xp", 0.0)
                 level = self.level_calculator(total_xp)
                 
@@ -278,10 +279,8 @@ class LevelUpCommands(commands.Cog):
 
         _, progress, needed, _ = self.calculate_xp_for_next_level(total_xp)
 
-        # Format voice time from seconds to "Xh Ym"
-        hours, remainder = divmod(int(voice_seconds), 3600)
-        minutes, _ = divmod(remainder, 60)
-        voice_time_str = f"{hours}h {minutes}m in voice"
+        # Format voice time using utility helper
+        voice_time_str = f"{UtilityHelpers.format_time_duration(int(voice_seconds))} in voice"
 
         # Calculate server rank and total server XP
         all_users_data = config.get("users", {})
@@ -298,7 +297,7 @@ class LevelUpCommands(commands.Cog):
 
         # Build the embed to match the old bot's style
         embed = discord.Embed(
-            title=f"{target_user.display_name}'s Profile",
+            title=f"{UtilityHelpers.safe_username(target_user)}'s Profile",
             color=0xf1c40f # Yellow color to match
         )
         embed.set_thumbnail(url=target_user.display_avatar.url)
