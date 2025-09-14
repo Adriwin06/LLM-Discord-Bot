@@ -2,10 +2,13 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
+import aiohttp
+import types
 
 class FunCommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        self.session = aiohttp.ClientSession()
         
         # Funny responses when targeting the bot itself
         self.bot_insult_responses = [
@@ -25,6 +28,9 @@ class FunCommands(commands.Cog):
             "Why thank you! I do try my best to be helpful and entertaining. You've got excellent judgment! 🌟",
             "That's so sweet! I'm just doing my job, but it's nice to be appreciated. You're wonderful too! 💖"
         ]
+
+    async def cog_unload(self):
+        await self.session.close()
 
     async def _generate_fun_response(self, interaction: discord.Interaction, user: discord.Member, command_type: str):
         await interaction.response.defer()
@@ -104,6 +110,199 @@ Generate a similar response that's warm and grateful, but don't copy these exact
         embed.set_thumbnail(url="https://en.meming.world/images/en/thumb/e/e0/Mocking_SpongeBob.jpg/300px-Mocking_SpongeBob.jpg")
         
         await interaction.followup.send(embed=embed)
+
+    @app_commands.command(name="mock_avatar", description="Mock a user's profile picture.")
+    async def mock_avatar(self, interaction: discord.Interaction, user: discord.Member):
+        await interaction.response.defer()
+        
+        # Get the user's avatar URL
+        avatar_url = user.display_avatar.url
+        print(f"DEBUG: Avatar URL: {avatar_url}")
+        
+        try:
+            # Check if the model supports vision
+            model = self.bot.config.MAIN_LLM_MODEL
+            print(f"DEBUG: Model: {model}")
+            print(f"DEBUG: Has supports_vision method: {hasattr(self.bot.llm_provider, 'supports_vision')}")
+            
+            if hasattr(self.bot.llm_provider, 'supports_vision'):
+                supports_vision = self.bot.llm_provider.supports_vision(model)
+                print(f"DEBUG: Supports vision: {supports_vision}")
+            
+            if hasattr(self.bot.llm_provider, 'supports_vision') and self.bot.llm_provider.supports_vision(model):
+                print("DEBUG: Entering vision processing path")
+                # Create a mock attachment object to reuse the context manager's processing
+                mock_attachment = types.SimpleNamespace()
+                mock_attachment.url = avatar_url
+                mock_attachment.filename = f"{user.display_name}_avatar.png"
+                
+                # Detect if it's a GIF and set appropriate filename
+                if '.gif' in avatar_url or '?format=gif' in avatar_url:
+                    mock_attachment.filename = f"{user.display_name}_avatar.gif"
+                    print(f"DEBUG: Detected GIF, filename: {mock_attachment.filename}")
+                
+                # Get the attachment size for processing
+                async with self.session.head(avatar_url) as response:
+                    if response.status == 200:
+                        mock_attachment.size = int(response.headers.get('content-length', 0))
+                    else:
+                        mock_attachment.size = 0
+                print(f"DEBUG: Attachment size: {mock_attachment.size}")
+                
+                # Get media settings for this guild/channel
+                settings = await self.bot.context_manager.get_guild_and_channel_settings(
+                    str(interaction.guild.id), str(interaction.channel.id)
+                )
+                media_settings = settings.get("media", {})
+                
+                # Increase size limit for avatar processing since Discord avatars can be quite large
+                if "images" not in media_settings:
+                    media_settings["images"] = {}
+                if "max_size_mb" not in media_settings["images"]:
+                    media_settings["images"]["max_size_mb"] = 25  # Increase to 25MB for avatars
+                print(f"DEBUG: Media settings: {media_settings}")
+                
+                # Process the avatar using the context manager
+                print("DEBUG: About to process attachment")
+                processed_content = await self.bot.context_manager._process_attachment(
+                    mock_attachment, model, media_settings
+                )
+                print(f"DEBUG: Processed content type: {type(processed_content)}")
+                print(f"DEBUG: Processed content: {str(processed_content)[:200]}...")
+                
+                # Build the prompt
+                if isinstance(processed_content, dict) and processed_content.get("type") == "animated_gif":
+                    print("DEBUG: Processing as animated GIF")
+                    # Animated GIF with multiple frames
+                    total_frames = processed_content.get("total_frames", "unknown")
+                    extracted_frames = processed_content.get("extracted_frames", len(processed_content.get("frames", [])))
+                    
+                    prompt_text = f"""Look at {user.display_name}'s animated profile picture and roast/mock it in a funny way. Be creative and witty, but keep it playful and not genuinely mean-spirited. 
+
+This is an animated GIF with {total_frames} total frames, and I'm showing you {extracted_frames} representative frames to give you a good understanding of the animation. You can comment on:
+- Their expressions or poses across the different frames
+- How they change or move between frames
+- The animation style, quality, or smoothness
+- Any funny movements, gestures, or transitions
+- The background or setting
+- Their style choices
+- Any funny details you notice in the sequence
+- Make creative comparisons or jokes about the animation, timing, or loop
+
+Analyze the sequence of frames to understand the full animation and create a witty roast based on what you observe."""
+                    
+                    # Create message content with images
+                    message_content = [{"type": "text", "text": prompt_text}]
+                    for frame_data in processed_content["frames"]:
+                        message_content.append({
+                            "type": "image_url",
+                            "image_url": {"url": frame_data}
+                        })
+                        
+                elif isinstance(processed_content, dict) and processed_content.get("type") == "image_url":
+                    print("DEBUG: Processing as static image")
+                    # Static image
+                    prompt_text = f"""Look at {user.display_name}'s profile picture and roast/mock it in a funny way. Be creative and witty, but keep it playful and not genuinely mean-spirited. Comment on things like:
+                    - Their expression or pose
+                    - The background or setting
+                    - Their style choices
+                    - Any funny details you notice
+                    - Make creative comparisons or jokes"""
+                    
+                    message_content = [
+                        {"type": "text", "text": prompt_text},
+                        processed_content
+                    ]
+                else:
+                    print(f"DEBUG: Falling back to text-only, processed_content type: {type(processed_content)}")
+                    # Fallback to text-only prompt
+                    avatar_mock_prompt = f"""I want you to roast/mock {user.display_name}'s avatar in a funny way. Be creative and witty, but keep it playful and not genuinely mean-spirited. Since I couldn't process the image directly, make a creative joke about {user.display_name}'s avatar. You can reference common avatar styles, poses, or make jokes about how they probably look."""
+                    
+                    # Use the existing context manager to build context
+                    messages, _ = await self.bot.context_manager.build_context(
+                        channel=interaction.channel,
+                        prompt=avatar_mock_prompt,
+                        behavior_override="You are a witty Discord bot that creates playful roasts and mocks. Keep things funny and light-hearted, never genuinely mean or hurtful."
+                    )
+                    
+                    response = await self.bot.llm_provider.create_completion(
+                        model=model,
+                        messages=messages
+                    )
+                    
+                    if response and response.choices:
+                        content = response.choices[0].message.content
+                    else:
+                        content = None
+                
+                # If we have message_content (vision processing worked), use LLM provider directly
+                if 'message_content' in locals() and message_content:
+                    print(f"DEBUG: Using vision processing, message_content length: {len(message_content)}")
+                    # Build basic context
+                    context_messages = []
+                    
+                    # Add system prompt
+                    additional_behavior = "You are a witty Discord bot that creates playful roasts and mocks. Keep things funny and light-hearted, never genuinely mean or hurtful."
+                    behavior_prompt = self.bot.config.BEHAVIOR_PROMPT
+                    system_prompt = f"{additional_behavior}\n\n{self.bot.config.CAPABILITIES_PROMPT}\n\n{behavior_prompt}"
+                    context_messages.append({"role": "system", "content": system_prompt})
+                    
+                    # Add the user's prompt with images
+                    context_messages.append({"role": "user", "content": message_content})
+                    
+                    # Generate response using LLM provider directly
+                    print("DEBUG: Calling LLM with vision content")
+                    response = await self.bot.llm_provider.create_completion(
+                        model=model,
+                        messages=context_messages
+                    )
+                    
+                    if response and response.choices:
+                        content = response.choices[0].message.content
+                        print(f"DEBUG: Got vision response: {content[:100]}...")
+                    else:
+                        content = None
+                        print("DEBUG: No response from LLM")
+            else:
+                print("DEBUG: Model doesn't support vision, using fallback")
+                # Fallback for non-vision models
+                avatar_mock_prompt = f"""I want you to roast/mock {user.display_name}'s avatar in a funny way. Be creative and witty, but keep it playful and not genuinely mean-spirited. Since I cannot show you the image directly, make a generic but creative joke about {user.display_name}'s avatar instead. You can reference common avatar styles, poses, or make jokes about how they probably look."""
+                
+                # Use the existing context manager to build context
+                messages, _ = await self.bot.context_manager.build_context(
+                    channel=interaction.channel,
+                    prompt=avatar_mock_prompt,
+                    behavior_override="You are a witty Discord bot that creates playful roasts and mocks. Keep things funny and light-hearted, never genuinely mean or hurtful."
+                )
+                
+                response = await self.bot.llm_provider.create_completion(
+                    model=model,
+                    messages=messages
+                )
+                
+                if response and response.choices:
+                    content = response.choices[0].message.content
+                else:
+                    content = None
+            
+            if content:
+                # Create an embed for the response
+                embed = discord.Embed(
+                    title=f"{interaction.user.display_name} mocked {user.display_name}'s Profile Picture 🎭",
+                    description=content,
+                    color=discord.Color.red()
+                )
+                embed.set_thumbnail(url=avatar_url)
+                
+                await interaction.followup.send(embed=embed)
+            else:
+                await interaction.followup.send(f"I couldn't come up with a good roast for {user.display_name}'s avatar right now. Maybe it's too perfect to mock! 😅", ephemeral=True)
+                
+        except Exception as e:
+            print(f"DEBUG: Exception occurred: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+            await interaction.followup.send(f"Sorry, I couldn't process {user.display_name}'s avatar right now. Error: {str(e)[:100]}...", ephemeral=True)
 
 async def setup(bot):
     await bot.add_cog(FunCommands(bot))

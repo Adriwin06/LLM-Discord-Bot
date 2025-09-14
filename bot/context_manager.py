@@ -254,8 +254,24 @@ class ContextManager:
             
             for attachment in message.attachments:
                 processed_content = await self._process_attachment(attachment, target_model, media_settings)
-                if isinstance(processed_content, list):
-                    # This is a list of content parts (e.g., from animated GIF processing)
+                if isinstance(processed_content, dict) and processed_content.get("type") == "animated_gif":
+                    # Handle animated GIF: convert to list of content parts for message processing
+                    frame_info = f"Animated GIF: {processed_content['filename']}"
+                    total_frames = processed_content.get("total_frames", "unknown")
+                    extracted_frames = processed_content.get("extracted_frames", 0)
+                    if total_frames > extracted_frames:
+                        frame_info += f" (showing {extracted_frames} representative frames from {total_frames} total frames)"
+                    else:
+                        frame_info += f" ({extracted_frames} frames)"
+                    
+                    content_parts.append({"type": "text", "text": frame_info})
+                    for frame_data in processed_content["frames"]:
+                        content_parts.append({
+                            "type": "image_url", 
+                            "image_url": {"url": frame_data}
+                        })
+                elif isinstance(processed_content, list):
+                    # This is a list of content parts (legacy or other processing)
                     content_parts.extend(processed_content)
                 elif isinstance(processed_content, dict):
                     # This is a single structured content (like image_url)
@@ -443,24 +459,14 @@ class ContextManager:
                                             pass
                                     
                                     if frames:
-                                        # Return as a list of content parts for better LLM compatibility
-                                        # First, add a text description
-                                        frame_info = f"Animated GIF: {attachment.filename}"
-                                        if total_frames > len(frames):
-                                            frame_info += f" (showing {len(frames)} representative frames from {total_frames} total frames)"
-                                        else:
-                                            frame_info += f" ({len(frames)} frames)"
-                                        
-                                        # Create a list of content parts: text description + individual frames
-                                        content_parts = [{"type": "text", "text": frame_info}]
-                                        for i, frame_data in enumerate(frames):
-                                            content_parts.append({
-                                                "type": "image_url",
-                                                "image_url": {"url": frame_data}
-                                            })
-                                        
-                                        # Return the list of content parts - the calling method will handle this properly
-                                        return content_parts
+                                        # Return structured data for animated GIFs that can be used in different contexts
+                                        return {
+                                            "type": "animated_gif",
+                                            "total_frames": total_frames,
+                                            "extracted_frames": len(frames),
+                                            "frames": frames,
+                                            "filename": attachment.filename
+                                        }
                                     else:
                                         # Fallback to treating as static image
                                         return {"type": "image_url", "image_url": {"url": attachment.url}}
