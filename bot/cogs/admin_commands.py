@@ -68,7 +68,18 @@ class AdminCommands(commands.Cog):
         except ValueError:
             final_value = value # Keep as string if conversion fails
 
-        settings[guild_id]["media"][media_type][setting] = final_value
+        setting_path = [part.strip() for part in setting.split(".") if part.strip()]
+        if not setting_path:
+            await interaction.followup.send("Setting name cannot be empty.", ephemeral=True)
+            return
+
+        target = settings[guild_id]["media"][media_type]
+        for path_part in setting_path[:-1]:
+            if not isinstance(target.get(path_part), dict):
+                target[path_part] = {}
+            target = target[path_part]
+
+        target[setting_path[-1]] = final_value
         
         await self.bot.store.save_settings(settings)
         await interaction.followup.send(f"Media config for `{media_type}` updated: set `{setting}` to `{final_value}`.", ephemeral=True)
@@ -88,12 +99,25 @@ class AdminCommands(commands.Cog):
             embed.description = "No custom media settings found. Using bot defaults."
         else:
             for media_type, config in media_settings.items():
-                value_str = "\n".join([f"**{key}:** `{value}`" for key, value in config.items()])
+                value_str = "\n".join([f"**{key}:** `{value}`" for key, value in self._flatten_config(config)])
                 if not value_str:
                     value_str = "No settings configured."
                 embed.add_field(name=media_type.replace("_", " ").title(), value=value_str, inline=False)
 
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+    def _flatten_config(self, config: dict, prefix: str = ""):
+        if not isinstance(config, dict):
+            return []
+
+        rows = []
+        for key, value in config.items():
+            full_key = f"{prefix}.{key}" if prefix else str(key)
+            if isinstance(value, dict):
+                rows.extend(self._flatten_config(value, full_key))
+            else:
+                rows.append((full_key, value))
+        return rows
 
     @app_commands.command(name="channel_override", description="Override global settings for a specific channel.")
     @app_commands.checks.has_permissions(administrator=True)

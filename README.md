@@ -13,7 +13,7 @@ This is a sophisticated, LLM-powered Discord bot built with Python, `discord.py`
 - **Advanced Media Handling**:
     - Processes images, audio, video, PDFs, and Office documents.
     - Conditionally uses vision, audio, and document-processing capabilities based on the configured LLM.
-    - Transcribes audio, performs OCR on images, and extracts text from documents as a fallback for text-only models.
+    - Transcribes audio locally with `faster-whisper`, extracts representative video frames/audio, performs OCR on images, and extracts text from documents as a fallback for text-only models.
 - **Intelligent Interactions**:
     - **AI-Driven Replies & Reactions**: Decides when to reply, when to react with an emoji, or when to stay silent.
     - **Mention Resolver**: Allows the LLM to naturally ping users and roles using a safe, permission-aware syntax (`<mention user="Name">`).
@@ -76,6 +76,7 @@ Now, open the `.env` file in a text editor and fill in the required values:
 -   `MAIN_LLM_MODEL` & `DECISION_LLM_MODEL`: The model strings for your chosen LLM provider (e.g., `gpt-4o`, `gemini/gemini-1.5-pro-latest`).
 -   **API Keys**: Add the API keys for the LLM providers you intend to use (e.g., `OPENAI_API_KEY`, `GEMINI_API_KEY`).
 -   `WEB_SEARCH_CONTEXT_SIZE`: Controls the amount of web search context (options: `low`, `medium`, `high`). Only applies to models that support web search like `openai/gpt-4o-search-preview`, `gemini/gemini-2.0-flash`, etc.
+-   `LOCAL_STT_MODEL`, `LOCAL_STT_DEVICE`, and `LOCAL_STT_COMPUTE_TYPE`: Configure local speech-to-text for audio and video attachments. Defaults are CPU-friendly (`base`, `cpu`, `int8`); use `cuda`/`float16` if you have a compatible GPU. `faster-whisper` may download the selected model on first use unless `LOCAL_STT_MODEL` points at a local model path.
 -   Customize other settings like the behavior prompt, rate limits, and backup interval as needed.
 
 ### 5. Run the Bot

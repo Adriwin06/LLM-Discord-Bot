@@ -67,3 +67,16 @@ class Config:
         # GIF Processing Defaults
         self.DEFAULT_GIF_MAX_FRAMES = int(os.getenv("DEFAULT_GIF_MAX_FRAMES", 5))
         self.DEFAULT_GIF_FRAME_QUALITY = int(os.getenv("DEFAULT_GIF_FRAME_QUALITY", 85))
+
+        # Local Speech-to-Text Defaults
+        self.LOCAL_STT_ENGINE = os.getenv("LOCAL_STT_ENGINE", "faster-whisper")
+        self.LOCAL_STT_MODEL = os.getenv("LOCAL_STT_MODEL", "base")
+        self.LOCAL_STT_DEVICE = os.getenv("LOCAL_STT_DEVICE", "cpu")
+        self.LOCAL_STT_COMPUTE_TYPE = os.getenv("LOCAL_STT_COMPUTE_TYPE", "int8")
+        self.LOCAL_STT_BEAM_SIZE = int(os.getenv("LOCAL_STT_BEAM_SIZE", 5))
+        self.LOCAL_STT_VAD_FILTER = os.getenv("LOCAL_STT_VAD_FILTER", "True").lower() == "true"
+        self.LOCAL_STT_LANGUAGE = os.getenv("LOCAL_STT_LANGUAGE") or None
+
+        # Video Processing Defaults
+        self.DEFAULT_VIDEO_MAX_FRAMES = int(os.getenv("DEFAULT_VIDEO_MAX_FRAMES", 8))
+        self.DEFAULT_VIDEO_FRAME_QUALITY = int(os.getenv("DEFAULT_VIDEO_FRAME_QUALITY", 85))

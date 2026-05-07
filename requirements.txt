@@ -10,7 +10,7 @@ pypdf2
 python-docx
 openpyxl
 Pillow
-openai-whisper
+faster-whisper
 moviepy
 
 # Advanced Media Processing (Optional)

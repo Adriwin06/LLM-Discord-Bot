@@ -4,7 +4,13 @@ import logging
 from .store import Store
 from .llm_provider import LiteLLMProvider
 from .config import Config
+import asyncio
+import base64
+import copy
+import importlib.util
 import mimetypes
+import os
+import tempfile
 import aiohttp
 import PyPDF2
 import docx
@@ -15,18 +21,28 @@ from datetime import datetime, timezone
 
 # Optional imports for media processing
 try:
-    import whisper
-    WHISPER_AVAILABLE = True
+    from faster_whisper import WhisperModel
+    FASTER_WHISPER_AVAILABLE = True
 except ImportError:
-    WHISPER_AVAILABLE = False
-    logging.warning("whisper not available. Audio transcription features will be limited.")
+    WhisperModel = None
+    FASTER_WHISPER_AVAILABLE = False
+    logging.warning("faster-whisper not available. Local audio transcription will use fallback engines if available.")
+
+openai_whisper = None
+OPENAI_WHISPER_AVAILABLE = importlib.util.find_spec("whisper") is not None
 
 try:
-    import moviepy
+    from moviepy import AudioFileClip, VideoFileClip
     MOVIEPY_AVAILABLE = True
 except ImportError:
-    MOVIEPY_AVAILABLE = False
-    logging.warning("moviepy not available. Video processing features will be limited.")
+    try:
+        from moviepy.editor import AudioFileClip, VideoFileClip
+        MOVIEPY_AVAILABLE = True
+    except ImportError:
+        AudioFileClip = None
+        VideoFileClip = None
+        MOVIEPY_AVAILABLE = False
+        logging.warning("moviepy not available. Audio/video duration and frame extraction will be limited.")
 
 # Optional imports for advanced document processing
 try:
@@ -50,6 +66,20 @@ except ImportError:
     PDFPLUMBER_AVAILABLE = False
     logging.warning("pdfplumber not available. Advanced PDF processing will be limited.")
 
+AUDIO_EXTENSIONS = {
+    "aac", "aiff", "alac", "amr", "flac", "m4a", "mp3", "oga", "ogg",
+    "opus", "wav", "weba", "wma",
+}
+VIDEO_EXTENSIONS = {
+    "avi", "flv", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "ogv",
+    "webm", "wmv",
+}
+TEXT_EXTENSIONS = {
+    "txt", "md", "json", "csv", "py", "js", "html", "css", "xml",
+    "yaml", "yml", "toml", "ini", "log", "sql",
+}
+OFFICE_EXTENSIONS = {"docx", "xlsx", "pptx"}
+
 class ContextManager:
     """
     Manages conversation context for the Discord bot.
@@ -66,8 +96,11 @@ class ContextManager:
         self.llm_provider = llm_provider
         self.config = Config()
         self.bot = bot
-        # Consider loading the whisper model once if it's going to be used
-        # self.whisper_model = whisper.load_model("base")
+        self._stt_lock = asyncio.Lock()
+        self._faster_whisper_model = None
+        self._faster_whisper_model_key = None
+        self._openai_whisper_model = None
+        self._openai_whisper_model_name = None
 
     async def get_guild_and_channel_settings(self, guild_id, channel_id):
         guild_settings = await self.store.get_guild_settings(guild_id)
@@ -75,20 +108,94 @@ class ContextManager:
         
         final_settings = guild_settings.copy()
         final_settings.update(channel_overrides)
-        
-        # Apply default media settings from config if not present in guild settings
-        if "media" not in final_settings:
-            final_settings["media"] = {
-                "images": {"enabled": self.config.DEFAULT_MEDIA_IMAGES_ENABLED},
-                "audio": {"enabled": self.config.DEFAULT_MEDIA_AUDIO_ENABLED},
-                "video": {"enabled": self.config.DEFAULT_MEDIA_VIDEO_ENABLED},
-                "pdf": {"enabled": self.config.DEFAULT_MEDIA_PDF_ENABLED},
-                "office_documents": {"enabled": self.config.DEFAULT_MEDIA_OFFICE_DOCUMENTS_ENABLED},
-                "text_files": {"enabled": self.config.DEFAULT_MEDIA_TEXT_FILES_ENABLED},
-                "other_files": {"enabled": self.config.DEFAULT_MEDIA_OTHER_FILES_ENABLED}
-            }
+
+        media_settings = self._default_media_settings()
+        media_settings = self._deep_merge_dict(media_settings, guild_settings.get("media", {}))
+        media_settings = self._deep_merge_dict(media_settings, channel_overrides.get("media", {}))
+        final_settings["media"] = media_settings
         
         return final_settings
+
+    def _default_media_settings(self) -> dict:
+        return {
+            "images": {
+                "enabled": self.config.DEFAULT_MEDIA_IMAGES_ENABLED,
+                "max_size_mb": 10,
+                "ocr_enabled": True,
+                "description_fallback": True,
+                "gif": {
+                    "extract_frames": True,
+                    "max_frames": self.config.DEFAULT_GIF_MAX_FRAMES,
+                    "frame_quality": self.config.DEFAULT_GIF_FRAME_QUALITY,
+                },
+            },
+            "audio": {
+                "enabled": self.config.DEFAULT_MEDIA_AUDIO_ENABLED,
+                "max_size_mb": 25,
+                "max_duration_seconds": 300,
+                "transcribe": True,
+                "include_timestamps": False,
+                "max_transcript_chars": 12000,
+                "stt_engine": self.config.LOCAL_STT_ENGINE,
+                "stt_model": self.config.LOCAL_STT_MODEL,
+                "stt_device": self.config.LOCAL_STT_DEVICE,
+                "stt_compute_type": self.config.LOCAL_STT_COMPUTE_TYPE,
+                "stt_beam_size": self.config.LOCAL_STT_BEAM_SIZE,
+                "stt_vad_filter": self.config.LOCAL_STT_VAD_FILTER,
+                "stt_language": self.config.LOCAL_STT_LANGUAGE,
+            },
+            "video": {
+                "enabled": self.config.DEFAULT_MEDIA_VIDEO_ENABLED,
+                "max_size_mb": 50,
+                "max_duration_seconds": 120,
+                "extract_audio": True,
+                "extract_frames": True,
+                "frame_interval_seconds": 10,
+                "max_frames": self.config.DEFAULT_VIDEO_MAX_FRAMES,
+                "frame_quality": self.config.DEFAULT_VIDEO_FRAME_QUALITY,
+                "ocr_frames_for_text_models": True,
+                "max_transcript_chars": 12000,
+                "stt_engine": self.config.LOCAL_STT_ENGINE,
+                "stt_model": self.config.LOCAL_STT_MODEL,
+                "stt_device": self.config.LOCAL_STT_DEVICE,
+                "stt_compute_type": self.config.LOCAL_STT_COMPUTE_TYPE,
+                "stt_beam_size": self.config.LOCAL_STT_BEAM_SIZE,
+                "stt_vad_filter": self.config.LOCAL_STT_VAD_FILTER,
+                "stt_language": self.config.LOCAL_STT_LANGUAGE,
+            },
+            "pdf": {
+                "enabled": self.config.DEFAULT_MEDIA_PDF_ENABLED,
+                "max_size_mb": 10,
+                "preserve_formatting": True,
+            },
+            "office_documents": {
+                "enabled": self.config.DEFAULT_MEDIA_OFFICE_DOCUMENTS_ENABLED,
+                "max_size_mb": 10,
+                "preserve_structure": True,
+            },
+            "text_files": {
+                "enabled": self.config.DEFAULT_MEDIA_TEXT_FILES_ENABLED,
+                "max_size_mb": 5,
+                "supported_extensions": sorted(TEXT_EXTENSIONS),
+            },
+            "other_files": {
+                "enabled": self.config.DEFAULT_MEDIA_OTHER_FILES_ENABLED,
+                "max_size_mb": 20,
+                "include_metadata_only": True,
+            },
+        }
+
+    def _deep_merge_dict(self, base: dict, override: dict) -> dict:
+        result = copy.deepcopy(base) if isinstance(base, dict) else {}
+        if not isinstance(override, dict):
+            return result
+
+        for key, value in override.items():
+            if isinstance(value, dict) and isinstance(result.get(key), dict):
+                result[key] = self._deep_merge_dict(result[key], value)
+            else:
+                result[key] = copy.deepcopy(value)
+        return result
 
     async def build_context(self, message: discord.Message = None, channel: discord.TextChannel = None, model_name: str = None, 
                            prompt: str = None, behavior_override: str = None, capabilities_override: str = None,
@@ -395,6 +502,25 @@ class ContextManager:
             parsed = default
         return max(minimum, min(parsed, maximum))
 
+    def _safe_float(self, value, *, default: float, minimum: float, maximum: float) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            parsed = default
+        return max(minimum, min(parsed, maximum))
+
+    def _safe_bool(self, value, *, default: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        value = str(value).strip().lower()
+        if value in {"true", "1", "yes", "y", "on"}:
+            return True
+        if value in {"false", "0", "no", "n", "off"}:
+            return False
+        return default
+
     def _truncate_context_text(self, text: str, max_chars: int) -> str:
         text = str(text or "").strip()
         if len(text) <= max_chars:
@@ -497,22 +623,451 @@ class ContextManager:
         else:
             return "[empty message]"
 
+    def _is_audio_file(self, mime_type: str, file_ext: str) -> bool:
+        return bool((mime_type and mime_type.startswith("audio/")) or file_ext in AUDIO_EXTENSIONS)
+
+    def _is_video_file(self, mime_type: str, file_ext: str) -> bool:
+        return bool((mime_type and mime_type.startswith("video/")) or file_ext in VIDEO_EXTENSIONS)
+
+    async def _write_temp_file(self, file_bytes: bytes, file_ext: str) -> str:
+        suffix = f".{file_ext.lstrip('.')}" if file_ext else ""
+        return await asyncio.to_thread(self._write_temp_file_sync, file_bytes, suffix)
+
+    def _write_temp_file_sync(self, file_bytes: bytes, suffix: str) -> str:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+            temp_file.write(file_bytes)
+            return temp_file.name
+
+    def _remove_temp_file(self, path: str):
+        if not path:
+            return
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            logging.warning(f"Could not remove temporary media file {path}: {e}")
+
+    async def _get_media_duration(self, file_path: str, media_kind: str):
+        if not MOVIEPY_AVAILABLE:
+            return None
+        return await asyncio.to_thread(self._get_media_duration_sync, file_path, media_kind)
+
+    def _get_media_duration_sync(self, file_path: str, media_kind: str):
+        clip = None
+        try:
+            clip_class = VideoFileClip if media_kind == "video" else AudioFileClip
+            clip = clip_class(file_path)
+            duration = getattr(clip, "duration", None)
+            return float(duration) if duration is not None else None
+        except Exception as e:
+            logging.warning(f"Could not read {media_kind} duration from {file_path}: {e}")
+            return None
+        finally:
+            if clip is not None:
+                try:
+                    clip.close()
+                except Exception:
+                    pass
+
+    async def _transcribe_media_file(self, file_path: str, media_config: dict) -> dict:
+        async with self._stt_lock:
+            return await asyncio.to_thread(self._transcribe_media_file_sync, file_path, media_config)
+
+    def _transcribe_media_file_sync(self, file_path: str, media_config: dict) -> dict:
+        engine = str(media_config.get("stt_engine") or self.config.LOCAL_STT_ENGINE).strip().lower().replace("_", "-")
+
+        if engine in {"faster", "faster-whisper"}:
+            if FASTER_WHISPER_AVAILABLE:
+                return self._transcribe_with_faster_whisper(file_path, media_config)
+            if OPENAI_WHISPER_AVAILABLE:
+                logging.warning("faster-whisper is unavailable; falling back to openai-whisper local transcription.")
+                return self._transcribe_with_openai_whisper(file_path, media_config)
+            raise RuntimeError("No local speech-to-text engine is installed. Install faster-whisper.")
+
+        if engine in {"openai-whisper", "whisper"}:
+            if OPENAI_WHISPER_AVAILABLE:
+                return self._transcribe_with_openai_whisper(file_path, media_config)
+            if FASTER_WHISPER_AVAILABLE:
+                logging.warning("openai-whisper is unavailable; falling back to faster-whisper local transcription.")
+                return self._transcribe_with_faster_whisper(file_path, media_config)
+            raise RuntimeError("No local speech-to-text engine is installed. Install faster-whisper.")
+
+        raise RuntimeError(f"Unsupported local speech-to-text engine: {engine}")
+
+    def _transcribe_with_faster_whisper(self, file_path: str, media_config: dict) -> dict:
+        model_name = str(media_config.get("stt_model") or self.config.LOCAL_STT_MODEL)
+        device = str(media_config.get("stt_device") or self.config.LOCAL_STT_DEVICE)
+        compute_type = str(media_config.get("stt_compute_type") or self.config.LOCAL_STT_COMPUTE_TYPE)
+        beam_size = self._safe_int(
+            media_config.get("stt_beam_size", self.config.LOCAL_STT_BEAM_SIZE),
+            default=self.config.LOCAL_STT_BEAM_SIZE,
+            minimum=1,
+            maximum=10,
+        )
+        vad_filter = self._safe_bool(
+            media_config.get("stt_vad_filter", self.config.LOCAL_STT_VAD_FILTER),
+            default=self.config.LOCAL_STT_VAD_FILTER,
+        )
+        language = media_config.get("stt_language", self.config.LOCAL_STT_LANGUAGE)
+        language = str(language).strip() if language else None
+
+        model = self._get_faster_whisper_model(model_name, device, compute_type)
+        kwargs = {
+            "beam_size": beam_size,
+            "vad_filter": vad_filter,
+        }
+        if language:
+            kwargs["language"] = language
+
+        segments, info = model.transcribe(file_path, **kwargs)
+        segment_list = [
+            {"start": segment.start, "end": segment.end, "text": segment.text.strip()}
+            for segment in segments
+        ]
+        text = " ".join(segment["text"] for segment in segment_list if segment["text"]).strip()
+        return {
+            "engine": "faster-whisper",
+            "model": model_name,
+            "language": getattr(info, "language", None),
+            "language_probability": getattr(info, "language_probability", None),
+            "segments": segment_list,
+            "text": text,
+        }
+
+    def _get_faster_whisper_model(self, model_name: str, device: str, compute_type: str):
+        key = (model_name, device, compute_type)
+        if self._faster_whisper_model is None or self._faster_whisper_model_key != key:
+            logging.info(f"Loading faster-whisper model '{model_name}' on {device} with compute_type={compute_type}.")
+            self._faster_whisper_model = WhisperModel(model_name, device=device, compute_type=compute_type)
+            self._faster_whisper_model_key = key
+        return self._faster_whisper_model
+
+    def _transcribe_with_openai_whisper(self, file_path: str, media_config: dict) -> dict:
+        model_name = str(media_config.get("stt_model") or self.config.LOCAL_STT_MODEL)
+        beam_size = self._safe_int(
+            media_config.get("stt_beam_size", self.config.LOCAL_STT_BEAM_SIZE),
+            default=self.config.LOCAL_STT_BEAM_SIZE,
+            minimum=1,
+            maximum=10,
+        )
+        language = media_config.get("stt_language", self.config.LOCAL_STT_LANGUAGE)
+        language = str(language).strip() if language else None
+
+        model = self._get_openai_whisper_model(model_name)
+        kwargs = {"fp16": False, "beam_size": beam_size}
+        if language:
+            kwargs["language"] = language
+        result = model.transcribe(file_path, **kwargs)
+        segment_list = [
+            {
+                "start": segment.get("start", 0),
+                "end": segment.get("end", 0),
+                "text": str(segment.get("text", "")).strip(),
+            }
+            for segment in result.get("segments", [])
+        ]
+        text = str(result.get("text", "")).strip()
+        if not text:
+            text = " ".join(segment["text"] for segment in segment_list if segment["text"]).strip()
+        return {
+            "engine": "openai-whisper-local",
+            "model": model_name,
+            "language": result.get("language"),
+            "language_probability": None,
+            "segments": segment_list,
+            "text": text,
+        }
+
+    def _get_openai_whisper_model(self, model_name: str):
+        global openai_whisper
+        if openai_whisper is None:
+            import whisper as openai_whisper_module
+            openai_whisper = openai_whisper_module
+
+        if self._openai_whisper_model is None or self._openai_whisper_model_name != model_name:
+            logging.info(f"Loading openai-whisper fallback model '{model_name}'.")
+            self._openai_whisper_model = openai_whisper.load_model(model_name)
+            self._openai_whisper_model_name = model_name
+        return self._openai_whisper_model
+
+    def _format_transcript_block(self, title: str, filename: str, transcript: dict, duration, media_config: dict) -> str:
+        include_timestamps = self._safe_bool(media_config.get("include_timestamps"), default=False)
+        max_chars = self._safe_int(
+            media_config.get("max_transcript_chars", 12000),
+            default=12000,
+            minimum=500,
+            maximum=50000,
+        )
+
+        metadata = []
+        if duration is not None:
+            metadata.append(f"Duration: {self._format_seconds(duration)}")
+        if transcript.get("engine"):
+            metadata.append(f"Engine: {transcript['engine']}")
+        if transcript.get("model"):
+            metadata.append(f"STT Model: {transcript['model']}")
+        if transcript.get("language"):
+            language = transcript["language"]
+            probability = transcript.get("language_probability")
+            if isinstance(probability, (int, float)):
+                metadata.append(f"Detected Language: {language} ({probability:.2f})")
+            else:
+                metadata.append(f"Detected Language: {language}")
+
+        if include_timestamps and transcript.get("segments"):
+            body = "\n".join(
+                f"[{self._format_seconds(segment['start'])} -> {self._format_seconds(segment['end'])}] {segment['text']}"
+                for segment in transcript["segments"]
+                if segment.get("text")
+            )
+        else:
+            body = transcript.get("text", "").strip()
+
+        if not body:
+            body = "[No speech detected.]"
+
+        body = self._truncate_context_text(body, max_chars)
+        header = f"--- {title}: {filename} ---"
+        if metadata:
+            return f"{header}\n" + "\n".join(metadata) + f"\n\n{body}"
+        return f"{header}\n{body}"
+
+    def _format_seconds(self, seconds) -> str:
+        try:
+            seconds = max(0.0, float(seconds))
+        except (TypeError, ValueError):
+            return "unknown"
+
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = seconds % 60
+        if hours:
+            return f"{hours:02d}:{minutes:02d}:{secs:06.3f}"
+        return f"{minutes:02d}:{secs:06.3f}"
+
+    async def _extract_video_frames(self, file_path: str, video_config: dict) -> dict:
+        if not MOVIEPY_AVAILABLE:
+            raise RuntimeError("moviepy is not installed")
+        return await asyncio.to_thread(self._extract_video_frames_sync, file_path, video_config)
+
+    def _extract_video_frames_sync(self, file_path: str, video_config: dict) -> dict:
+        clip = None
+        try:
+            clip = VideoFileClip(file_path)
+            duration = float(getattr(clip, "duration", 0) or 0)
+            max_frames = self._safe_int(video_config.get("max_frames"), default=self.config.DEFAULT_VIDEO_MAX_FRAMES, minimum=1, maximum=30)
+            frame_interval = self._safe_float(video_config.get("frame_interval_seconds"), default=10.0, minimum=0.1, maximum=3600.0)
+            frame_quality = self._safe_int(video_config.get("frame_quality"), default=self.config.DEFAULT_VIDEO_FRAME_QUALITY, minimum=1, maximum=100)
+            frame_times = self._sample_video_times(duration, max_frames, frame_interval)
+
+            frames = []
+            for frame_time in frame_times:
+                try:
+                    frame_array = clip.get_frame(frame_time)
+                    frame = Image.fromarray(frame_array).convert("RGB")
+                    buffer = io.BytesIO()
+                    frame.save(buffer, format="JPEG", quality=frame_quality)
+                    frame_bytes = buffer.getvalue()
+                    frame_b64 = base64.b64encode(frame_bytes).decode()
+                    frames.append({
+                        "timestamp": frame_time,
+                        "data_url": f"data:image/jpeg;base64,{frame_b64}",
+                        "jpeg_bytes": frame_bytes,
+                    })
+                except Exception as e:
+                    logging.warning(f"Could not extract video frame at {frame_time:.2f}s from {file_path}: {e}")
+
+            return {"duration": duration, "frames": frames}
+        finally:
+            if clip is not None:
+                try:
+                    clip.close()
+                except Exception:
+                    pass
+
+    def _sample_video_times(self, duration: float, max_frames: int, frame_interval: float) -> list:
+        if duration <= 0:
+            return [0.0]
+
+        safe_end = max(0.0, duration - 0.1)
+        interval_times = []
+        current = 0.0
+        while current <= safe_end:
+            interval_times.append(round(current, 3))
+            current += frame_interval
+
+        if interval_times and len(interval_times) <= max_frames:
+            return interval_times
+
+        if max_frames == 1:
+            return [round(min(safe_end, duration / 2), 3)]
+
+        step = safe_end / (max_frames - 1)
+        return [round(min(safe_end, i * step), 3) for i in range(max_frames)]
+
+    async def _ocr_video_frames(self, frames: list) -> str:
+        if not TESSERACT_AVAILABLE:
+            return ""
+        return await asyncio.to_thread(self._ocr_video_frames_sync, frames)
+
+    def _ocr_video_frames_sync(self, frames: list) -> str:
+        lines = []
+        for frame in frames:
+            try:
+                with Image.open(io.BytesIO(frame["jpeg_bytes"])) as img:
+                    text = pytesseract.image_to_string(img).strip()
+                if text:
+                    lines.append(f"[{self._format_seconds(frame['timestamp'])}] {text}")
+            except Exception as e:
+                logging.warning(f"Could not OCR video frame at {frame.get('timestamp', 0)}s: {e}")
+        return "\n".join(lines)
+
+    async def _process_audio_attachment(
+        self,
+        attachment: discord.Attachment,
+        file_bytes: bytes,
+        file_ext: str,
+        file_size_mb: float,
+        model_name: str,
+        audio_config: dict,
+    ):
+        if not self._safe_bool(audio_config.get("enabled"), default=True):
+            return f"[Audio processing disabled: {attachment.filename}]"
+
+        max_size = self._safe_float(audio_config.get("max_size_mb"), default=25.0, minimum=0.1, maximum=500.0)
+        if file_size_mb > max_size:
+            return f"[Audio too large for processing: {attachment.filename} - {file_size_mb:.1f}MB]"
+
+        if self.llm_provider.supports_audio(model_name) and self._safe_bool(audio_config.get("send_direct_if_supported"), default=False):
+            return {"type": "audio_url", "audio_url": {"url": attachment.url}}
+
+        if not self._safe_bool(audio_config.get("transcribe"), default=True):
+            return f"--- Audio Metadata: {attachment.filename} ---\nFile Size: {file_size_mb:.2f} MB\nTranscription disabled."
+
+        temp_path = await self._write_temp_file(file_bytes, file_ext)
+        try:
+            duration = await self._get_media_duration(temp_path, "audio")
+            max_duration = self._safe_float(audio_config.get("max_duration_seconds"), default=300.0, minimum=0.0, maximum=86400.0)
+            if duration is not None and max_duration > 0 and duration > max_duration:
+                return (
+                    f"[Audio too long for processing: {attachment.filename} - "
+                    f"{self._format_seconds(duration)} > {self._format_seconds(max_duration)}]"
+                )
+
+            transcript = await self._transcribe_media_file(temp_path, audio_config)
+            return self._format_transcript_block("Audio Transcript", attachment.filename, transcript, duration, audio_config)
+        except Exception as e:
+            return f"[Audio transcription failed: {attachment.filename} - {str(e)[:80]}]"
+        finally:
+            self._remove_temp_file(temp_path)
+
+    async def _process_video_attachment(
+        self,
+        attachment: discord.Attachment,
+        file_bytes: bytes,
+        file_ext: str,
+        file_size_mb: float,
+        model_name: str,
+        video_config: dict,
+    ):
+        if not self._safe_bool(video_config.get("enabled"), default=True):
+            return f"[Video processing disabled: {attachment.filename}]"
+
+        max_size = self._safe_float(video_config.get("max_size_mb"), default=50.0, minimum=0.1, maximum=1000.0)
+        if file_size_mb > max_size:
+            return f"[Video too large for processing: {attachment.filename} - {file_size_mb:.1f}MB]"
+
+        temp_path = await self._write_temp_file(file_bytes, file_ext)
+        try:
+            duration = await self._get_media_duration(temp_path, "video")
+            max_duration = self._safe_float(video_config.get("max_duration_seconds"), default=120.0, minimum=0.0, maximum=86400.0)
+            if duration is not None and max_duration > 0 and duration > max_duration:
+                return (
+                    f"[Video too long for processing: {attachment.filename} - "
+                    f"{self._format_seconds(duration)} > {self._format_seconds(max_duration)}]"
+                )
+
+            content_parts = []
+            extract_audio = self._safe_bool(video_config.get("extract_audio"), default=True)
+            extract_frames = self._safe_bool(video_config.get("extract_frames"), default=True)
+
+            if extract_audio:
+                try:
+                    transcript = await self._transcribe_media_file(temp_path, video_config)
+                    content_parts.append({
+                        "type": "text",
+                        "text": self._format_transcript_block("Video Audio Transcript", attachment.filename, transcript, duration, video_config),
+                    })
+                except Exception as e:
+                    content_parts.append({
+                        "type": "text",
+                        "text": f"[Video audio transcription failed: {attachment.filename} - {str(e)[:80]}]",
+                    })
+
+            if extract_frames:
+                try:
+                    frame_result = await self._extract_video_frames(temp_path, video_config)
+                    frames = frame_result.get("frames", [])
+                    timestamps = ", ".join(self._format_seconds(frame["timestamp"]) for frame in frames)
+                    frame_summary = (
+                        f"--- Video Frame Samples: {attachment.filename} ---\n"
+                        f"Duration: {self._format_seconds(duration if duration is not None else frame_result.get('duration'))}\n"
+                        f"Extracted {len(frames)} representative frame(s)"
+                    )
+                    if timestamps:
+                        frame_summary += f" at: {timestamps}"
+
+                    if frames and self.llm_provider.supports_vision(model_name):
+                        content_parts.append({"type": "text", "text": frame_summary})
+                        for frame in frames:
+                            content_parts.append({"type": "image_url", "image_url": {"url": frame["data_url"]}})
+                    elif frames:
+                        ocr_text = ""
+                        if self._safe_bool(video_config.get("ocr_frames_for_text_models"), default=True):
+                            ocr_text = await self._ocr_video_frames(frames)
+
+                        if ocr_text:
+                            content_parts.append({
+                                "type": "text",
+                                "text": f"--- Video Frame OCR: {attachment.filename} ---\n{ocr_text}",
+                            })
+                        else:
+                            content_parts.append({
+                                "type": "text",
+                                "text": frame_summary + "\n[Frames were extracted locally but not attached because the target model does not support vision.]",
+                            })
+                    else:
+                        content_parts.append({"type": "text", "text": f"[No video frames extracted: {attachment.filename}]"})
+                except Exception as e:
+                    content_parts.append({"type": "text", "text": f"[Video frame extraction failed: {attachment.filename} - {str(e)[:80]}]"})
+
+            if not content_parts:
+                duration_text = self._format_seconds(duration) if duration is not None else "unknown"
+                return f"--- Video Metadata: {attachment.filename} ---\nDuration: {duration_text}\nFile Size: {file_size_mb:.2f} MB"
+
+            return content_parts
+        finally:
+            self._remove_temp_file(temp_path)
+
     async def _process_attachment(self, attachment: discord.Attachment, model_name: str, media_settings: dict):
         mime_type = mimetypes.guess_type(attachment.filename)[0]
         file_ext = attachment.filename.lower().split('.')[-1] if '.' in attachment.filename else ''
         
         try:
             # Check file size limits first
-            file_size_mb = attachment.size / (1024 * 1024)
+            file_size_mb = getattr(attachment, "size", 0) / (1024 * 1024)
+            attachment_url = getattr(attachment, "url", "")
+            actual_content_type = ""
             
             # Enhanced detection for GIFs, especially Tenor GIFs
             is_likely_gif = (
                 mime_type == "image/gif" or 
                 file_ext == "gif" or 
-                'gif' in attachment.url.lower() or
-                'tenor.com' in attachment.url.lower() or
-                'giphy.com' in attachment.url.lower() or
-                '?format=gif' in attachment.url.lower()
+                'gif' in attachment_url.lower() or
+                'tenor.com' in attachment_url.lower() or
+                'giphy.com' in attachment_url.lower() or
+                '?format=gif' in attachment_url.lower()
             )
             
             # Configure headers for better compatibility with GIF services
@@ -524,16 +1079,17 @@ class ContextManager:
             }
             
             async with aiohttp.ClientSession() as session:
-                async with session.get(attachment.url, headers=headers, allow_redirects=True, timeout=30) as resp:
+                async with session.get(attachment_url, headers=headers, allow_redirects=True, timeout=30) as resp:
                     if resp.status != 200:
-                        logging.warning(f"HTTP {resp.status} when fetching {attachment.url}")
+                        logging.warning(f"HTTP {resp.status} when fetching {attachment_url}")
                         return f"[Could not fetch attachment: {attachment.filename} (HTTP {resp.status})]"
                     
                     # Check actual content type from response headers
                     actual_content_type = resp.headers.get('content-type', '').lower()
+                    actual_mime_type = actual_content_type.split(';', 1)[0].strip()
                     content_length = resp.headers.get('content-length')
                     
-                    logging.debug(f"Fetched {attachment.url}: Content-Type={actual_content_type}, Content-Length={content_length}")
+                    logging.debug(f"Fetched {attachment_url}: Content-Type={actual_content_type}, Content-Length={content_length}")
                     
                     file_bytes = await resp.read()
                     
@@ -542,11 +1098,11 @@ class ContextManager:
                         file_size_mb = len(file_bytes) / (1024 * 1024)
                     
                     # Update MIME type based on actual response if it's more specific
-                    if actual_content_type.startswith('image/'):
-                        mime_type = actual_content_type
+                    if actual_mime_type and actual_mime_type != "application/octet-stream":
+                        mime_type = actual_mime_type
                     
                     # Enhanced GIF detection with actual content type
-                    if not is_likely_gif and actual_content_type == 'image/gif':
+                    if not is_likely_gif and actual_mime_type == 'image/gif':
                         is_likely_gif = True
 
             # Image processing (including GIFs)
@@ -700,55 +1256,28 @@ class ContextManager:
                         return f"[Image omitted - OCR disabled or unavailable: {attachment.filename}]"
 
             # Audio processing
-            elif mime_type and mime_type.startswith("audio/"):
+            elif self._is_audio_file(mime_type, file_ext):
                 audio_config = media_settings.get("audio", {})
-                if not audio_config.get("enabled", True):
-                    return f"[Audio processing disabled: {attachment.filename}]"
-                
-                # TODO: Check actual audio duration when implementing full audio processing
-                # max_duration = audio_config.get("max_duration_seconds", 300)
-                
-                if self.llm_provider.supports_audio(model_name):
-                    # Send directly as audio data for audio-capable models
-                    return {"type": "audio_url", "audio_url": {"url": attachment.url}}
-                else:
-                    # Fallback: Transcription for text-only models
-                    if WHISPER_AVAILABLE:
-                        try:
-                            # TODO: Implement actual Whisper transcription
-                            include_timestamps = audio_config.get("include_timestamps", False)
-                            return f"[Audio transcription placeholder: {attachment.filename} - Whisper would transcribe here with timestamps={include_timestamps}]"
-                        except Exception as e:
-                            return f"[Audio transcription failed: {attachment.filename} - {str(e)[:50]}...]"
-                    else:
-                        return f"[Audio transcription unavailable - whisper not installed: {attachment.filename}]"
+                return await self._process_audio_attachment(
+                    attachment,
+                    file_bytes,
+                    file_ext,
+                    file_size_mb,
+                    model_name,
+                    audio_config,
+                )
 
             # Video processing
-            elif mime_type and mime_type.startswith("video/"):
+            elif self._is_video_file(mime_type, file_ext):
                 video_config = media_settings.get("video", {})
-                if not video_config.get("enabled", True):
-                    return f"[Video processing disabled: {attachment.filename}]"
-                
-                # TODO: Check actual video duration when implementing full video processing
-                # max_duration = video_config.get("max_duration_seconds", 120)
-                
-                if self.llm_provider.supports_vision(model_name):  # Assuming video support correlates with vision
-                    # Send directly as video data for video-capable models
-                    return {"type": "video_url", "video_url": {"url": attachment.url}}
-                else:
-                    # Fallback: Extract audio and frames for text-only models
-                    if MOVIEPY_AVAILABLE:
-                        try:
-                            extract_audio = video_config.get("extract_audio", True)
-                            extract_frames = video_config.get("extract_frames", True)
-                            frame_interval = video_config.get("frame_interval_seconds", 10)
-                            
-                            # TODO: Implement actual video processing
-                            return f"[Video processing placeholder: {attachment.filename} - Would extract audio (transcribe={extract_audio}) and frames every {frame_interval}s (extract={extract_frames})]"
-                        except Exception as e:
-                            return f"[Video processing failed: {attachment.filename} - {str(e)[:50]}...]"
-                    else:
-                        return f"[Video processing unavailable - moviepy not installed: {attachment.filename}]"
+                return await self._process_video_attachment(
+                    attachment,
+                    file_bytes,
+                    file_ext,
+                    file_size_mb,
+                    model_name,
+                    video_config,
+                )
 
             # PDF processing
             elif mime_type == "application/pdf":
@@ -791,7 +1320,7 @@ class ContextManager:
             # Office Documents (DOCX, XLSX, PPTX)
             elif mime_type in ["application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", 
-                               "application/vnd.openxmlformats-officedocument.presentationml.presentation"]:
+                               "application/vnd.openxmlformats-officedocument.presentationml.presentation"] or file_ext in OFFICE_EXTENSIONS:
                 office_config = media_settings.get("office_documents", {})
                 if not office_config.get("enabled", True):
                     return f"[Office document processing disabled: {attachment.filename}]"
@@ -844,7 +1373,7 @@ class ContextManager:
                     return f"[Document processing failed: {attachment.filename} - {str(e)[:50]}...]"
 
             # Text files
-            elif mime_type and mime_type.startswith("text/") or file_ext in ["txt", "md", "json", "csv", "py", "js", "html", "css", "xml", "yaml", "yml"]:
+            elif (mime_type and mime_type.startswith("text/")) or file_ext in TEXT_EXTENSIONS:
                 text_config = media_settings.get("text_files", {})
                 if not text_config.get("enabled", True):
                     return f"[Text file processing disabled: {attachment.filename}]"
@@ -853,7 +1382,7 @@ class ContextManager:
                 if file_size_mb > max_size:
                     return f"[Text file too large for processing: {attachment.filename} - {file_size_mb:.1f}MB]"
                 
-                supported_extensions = text_config.get("supported_extensions", ["txt", "md", "json", "csv", "py", "js", "html", "css"])
+                supported_extensions = text_config.get("supported_extensions", sorted(TEXT_EXTENSIONS))
                 if file_ext not in supported_extensions:
                     return f"[Text file extension not supported: {attachment.filename}]"
                 
