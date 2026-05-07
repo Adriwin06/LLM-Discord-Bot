@@ -4,7 +4,7 @@ from discord.ext import commands
 from discord import app_commands
 import aiohttp
 import types
-from .utilities import AdvancedPaginationView
+from .utilities import MessageChunker
 
 class FunCommands(commands.Cog):
     def __init__(self, bot):
@@ -30,6 +30,13 @@ class FunCommands(commands.Cog):
             "That's so sweet! I'm just doing my job, but it's nice to be appreciated. You're wonderful too! 💖"
         ]
 
+        self.bot_reverse_trash_responses = [
+            "YOU SITTING THERE IN THE FIRST ROW WITH YOUR LEGS CROSSED AND YOUR VEST ON!! You look SO focused like you're REALLY paying attention to what I'm saying and it's making me feel GREAT!!!",
+            "AND YOU SITTING THERE IN YOUR SUIT AND YOUR FASHIONABLE TIE, and you even look at me the way you are, I WILL SMILE FROM EAR TO EAR FOR THE REST OF THE EVENING!!!",
+            "JOHN CENA, IS THAT IT with your BLUE EYES and your PERFECT HAIR and your PERFECT THREE PIECE SUIT?! You look AMAZING, John Cena, do you understand me?! YOU ARE AMAZING!!!",
+            "YOU LOOK AMAZING!!! And you BETTER come right back after this commercial break!!!"
+        ]
+
     async def cog_unload(self):
         await self.session.close()
 
@@ -46,7 +53,7 @@ Here are some example responses for inspiration:
 {examples}
 
 Generate a similar response that's creative and shows personality, but don't copy these exactly."""
-            else:  # compliment
+            elif command_type == "compliment":
                 examples = "\n".join([f"- {response}" for response in self.bot_compliment_responses])
                 prompt = f"""Someone just complimented me (the bot)! Generate a sweet, appreciative response that thanks them while also being a bit playful.
 
@@ -54,6 +61,20 @@ Here are some example responses for inspiration:
 {examples}
 
 Generate a similar response that's warm and grateful, but don't copy these exactly."""
+            else:  # reverse_trash_talk
+                examples = "\n".join([f"- {response}" for response in self.bot_reverse_trash_responses])
+                prompt = f"""Someone wants me (the bot) to do reverse trash talk on myself. Reverse trash talk means you "trash talk" but say only positive things in a playful, competitive tone. Generate a witty response that sounds like a roast but is actually flattering.
+
+Style rules (must follow):
+- VERY AGGRESSIVE delivery: lots of CAPITALS, exclamation marks, and "?!?!!" style punctuation.
+- Use Discord formatting for emphasis (some bold **like this** and italics *like this*).
+- Sound like a roast, but every statement is actually positive.
+- Keep it punchy (2-5 sentences), no emojis.
+
+Here are some example responses for inspiration (taken from a show with John Cena, which is a master of this art):
+{examples}
+
+Generate a similar response that's playful and uplifting, but don't copy these exactly."""
             
             messages = [
                 {"role": "system", "content": "You are a witty Discord bot with personality. You're self-aware that you're an AI but you have humor and charm about it."},
@@ -63,7 +84,8 @@ Generate a similar response that's warm and grateful, but don't copy these exact
             # Regular user targeting - use context manager with custom prompt
             prompt_template = {
                 "insult": f"Generate a creative, personalized, and funny insult for a Discord user named {user.display_name}. Use any available profile information to make it more specific and tailored to them.",
-                "compliment": f"Generate a creative, personalized, and heartfelt compliment for a Discord user named {user.display_name}. Use any available profile information to make it more specific and meaningful."
+                "compliment": f"Generate a creative, personalized, and heartfelt compliment for a Discord user named {user.display_name}. Use any available profile information to make it more specific and meaningful.",
+                "reverse_trash_talk": f"Generate reverse trash talk for a Discord user named {user.display_name}. Reverse trash talk means you trash talk but only say positive things in a competitive, playful tone. Make it sound like a roast while actually flattering them.\n\nStyle rules (must follow):\n- VERY AGGRESSIVE delivery: lots of CAPITALS, exclamation marks, and \"?!?!!\" style punctuation.\n- Use Discord formatting for emphasis (some bold **like this** and italics *like this*).\n- Sound like a roast, but every statement is actually positive.\n- Keep it punchy (2-5 sentences), no emojis.\n\nUse any available profile information to make it more specific and tailored to them."
             }
 
             # Build context with the specific task prompt
@@ -76,18 +98,16 @@ Generate a similar response that's warm and grateful, but don't copy these exact
         model = self.bot.config.MAIN_LLM_MODEL
         response = await self.bot.llm_provider.create_completion(model=model, messages=messages)
         
+        response_label = command_type.replace("_", " ")
         if response and response.choices:
             content = response.choices[0].message.content
-            await AdvancedPaginationView.send_paginated_text(
-                interaction=interaction,
+            await MessageChunker.send_chunked_message(
+                target=interaction,
                 content=content,
-                title=f"{command_type.title()} for {user.display_name}",
-                color=discord.Color.purple(),
-                ephemeral=False,
-                use_embed_for_single=False
+                ephemeral=False
             )
         else:
-            await interaction.followup.send(f"I couldn't think of a good {command_type} right now. Sorry!", ephemeral=True)
+            await interaction.followup.send(f"I couldn't think of a good {response_label} right now. Sorry!", ephemeral=True)
 
     @app_commands.command(name="insult", description="Generate a personalized insult for a user.")
     async def insult(self, interaction: discord.Interaction, user: discord.Member):
@@ -96,6 +116,10 @@ Generate a similar response that's warm and grateful, but don't copy these exact
     @app_commands.command(name="compliment", description="Generate a personalized compliment for a user.")
     async def compliment(self, interaction: discord.Interaction, user: discord.Member):
         await self._generate_fun_response(interaction, user, "compliment")
+
+    @app_commands.command(name="reverse_trash_talk", description="Reverse trash talk a user (sounds like a roast, but is actually nice).")
+    async def reverse_trash_talk(self, interaction: discord.Interaction, user: discord.Member):
+        await self._generate_fun_response(interaction, user, "reverse_trash_talk")
 
     @app_commands.command(name="mock", description="Mock a user's last message in sPoNgEbOb TeXt format.")
     async def mock(self, interaction: discord.Interaction, user: discord.Member):
@@ -294,13 +318,11 @@ Analyze the sequence of frames to understand the full animation and create a wit
                     content = None
             
             if content:
-                await AdvancedPaginationView.send_paginated_text(
-                    interaction=interaction,
-                    content=content,
-                    title=f"{interaction.user.display_name} mocked {user.display_name}'s Profile Picture 🎭",
-                    color=discord.Color.red(),
-                    ephemeral=False,
-                    thumbnail_url=avatar_url
+                header = f"🎭 {interaction.user.display_name} mocked {user.display_name}'s Profile Picture"
+                await MessageChunker.send_chunked_message(
+                    target=interaction,
+                    content=f"{header}\n\n{content}",
+                    ephemeral=False
                 )
             else:
                 await interaction.followup.send(

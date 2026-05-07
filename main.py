@@ -1,24 +1,34 @@
 # c:/Users/adri1/Documents/GitHub/LLM-Discord-Bot/main.py
+import logging
+
+# Configure logging as early as possible
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    force=True
+)
+logging.getLogger("discord").setLevel(logging.INFO)
+logging.getLogger("discord.http").setLevel(logging.WARNING)
+logging.info("Logging initialized.")
+
 import discord
 from discord.ext import commands, tasks
 import os
 import asyncio
 import sys
-import logging
 
 # Import core bot components
 from bot.config import Config
-from bot.store import Store
-from bot.llm_provider import LiteLLMProvider
-from bot.context_manager import ContextManager
-from bot.discord_tools import DiscordToolManager
-
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class LLMDiscordBot(commands.Bot):
     def __init__(self):
+        logging.info("Loading core bot components...")
+        from bot.store import Store
+        from bot.llm_provider import LiteLLMProvider
+        from bot.context_manager import ContextManager
+        from bot.discord_tools import DiscordToolManager
+        logging.info("Core bot components loaded.")
+
         intents = discord.Intents.default()
         intents.messages = True
         intents.message_content = True
