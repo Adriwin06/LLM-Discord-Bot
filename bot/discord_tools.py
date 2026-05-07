@@ -26,6 +26,88 @@ class DiscordToolManager:
             {
                 "type": "function",
                 "function": {
+                    "name": "list_channels",
+                    "description": (
+                        "List Discord channels visible to the bot in the current server, including channel IDs. "
+                        "Use this before fetching/searching messages when the target channel is unclear."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "messageable_only": {
+                                "type": "boolean",
+                                "description": "Only include channels that expose message history. Defaults to true.",
+                            },
+                            "include_threads": {
+                                "type": "boolean",
+                                "description": "Also include currently visible active threads. Defaults to false.",
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Maximum channels to return. Defaults to 100, max 200.",
+                            },
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "resolve_channel",
+                    "description": (
+                        "Resolve a Discord channel name, mention, or ID to visible channel metadata. "
+                        "Use this to get channel IDs for message tools."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Channel name, #mention, mention string, or numeric channel ID.",
+                            },
+                            "include_threads": {
+                                "type": "boolean",
+                                "description": "Also search currently visible active threads. Defaults to true.",
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Maximum matching channels to return. Defaults to 5, max 10.",
+                            },
+                        },
+                        "required": ["query"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_channel_summary",
+                    "description": (
+                        "Fetch the stored summary for a visible Discord channel. "
+                        "Use this when a channel recap or older channel-level context is needed."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "channel_id": {
+                                "type": "string",
+                                "description": "Discord channel ID to summarize.",
+                            },
+                            "max_chars": {
+                                "type": "integer",
+                                "description": "Maximum summary characters to return. Defaults to 3000, max 8000.",
+                            },
+                        },
+                        "required": ["channel_id"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "search_messages",
                     "description": (
                         "Search recent Discord message history visible to the bot. "
@@ -169,6 +251,12 @@ class DiscordToolManager:
     async def execute_tool_call(self, tool_call: Any, origin_message: discord.Message) -> Dict[str, Any]:
         name, arguments = self.parse_tool_call(tool_call)
         try:
+            if name == "list_channels":
+                return await self.list_channels(origin_message, **arguments)
+            if name == "resolve_channel":
+                return await self.resolve_channel(origin_message, **arguments)
+            if name == "get_channel_summary":
+                return await self.get_channel_summary(origin_message, **arguments)
             if name == "search_messages":
                 return await self.search_messages(origin_message, **arguments)
             if name == "fetch_message":
@@ -185,6 +273,141 @@ class DiscordToolManager:
             logging.exception(f"Discord tool {name} failed")
             return {"ok": False, "tool": name, "error": str(e)}
 
+    async def list_channels(
+        self,
+        origin_message: discord.Message,
+        messageable_only: bool = True,
+        include_threads: bool = False,
+        limit: int = 100,
+    ) -> Dict[str, Any]:
+        guild = origin_message.guild
+        if not guild:
+            return {"ok": False, "tool": "list_channels", "error": "Channel listing is only available in a server."}
+
+        messageable_only = self._coerce_bool(messageable_only, default=True)
+        include_threads = self._coerce_bool(include_threads, default=False)
+        limit = self._clamp_int(limit, default=100, minimum=1, maximum=200)
+        channels = self._visible_channels(
+            guild,
+            messageable_only=messageable_only,
+            include_threads=include_threads,
+        )
+        formatted = [self._format_channel(channel) for channel in channels[:limit]]
+
+        return {
+            "ok": True,
+            "tool": "list_channels",
+            "guild_id": str(guild.id),
+            "guild_name": getattr(guild, "name", str(guild.id)),
+            "messageable_only": messageable_only,
+            "include_threads": include_threads,
+            "returned": len(formatted),
+            "total_visible": len(channels),
+            "results": formatted,
+        }
+
+    async def resolve_channel(
+        self,
+        origin_message: discord.Message,
+        query: str,
+        include_threads: bool = True,
+        limit: int = 5,
+    ) -> Dict[str, Any]:
+        guild = origin_message.guild
+        if not guild:
+            return {"ok": False, "tool": "resolve_channel", "error": "Channel resolution is only available in a server."}
+
+        query = str(query or "").strip()
+        if not query:
+            return {"ok": False, "tool": "resolve_channel", "error": "Query is required."}
+
+        include_threads = self._coerce_bool(include_threads, default=True)
+        limit = self._clamp_int(limit, default=5, minimum=1, maximum=10)
+        direct_id = self._parse_optional_int(query)
+        matches = []
+        matched_by = "name"
+
+        if direct_id is not None:
+            matched_by = "id"
+            channel = self._resolve_channel(guild, query)
+            if channel and self._can_view_channel(channel):
+                matches = [channel]
+        else:
+            query_norm = self._normalize_channel_query(query)
+            if not query_norm:
+                return {"ok": False, "tool": "resolve_channel", "error": "Query is required."}
+
+            visible_channels = self._visible_channels(guild, messageable_only=False, include_threads=include_threads)
+            exact_matches = []
+            prefix_matches = []
+            contains_matches = []
+
+            for channel in visible_channels:
+                name_norm = self._normalize_channel_query(getattr(channel, "name", ""))
+                if not name_norm:
+                    continue
+                if name_norm == query_norm:
+                    exact_matches.append(channel)
+                elif name_norm.startswith(query_norm):
+                    prefix_matches.append(channel)
+                elif query_norm in name_norm:
+                    contains_matches.append(channel)
+
+            matches = self._dedupe_channels([*exact_matches, *prefix_matches, *contains_matches])
+
+        formatted = [self._format_channel(channel) for channel in matches[:limit]]
+        return {
+            "ok": True,
+            "tool": "resolve_channel",
+            "query": query,
+            "matched_by": matched_by,
+            "include_threads": include_threads,
+            "returned": len(formatted),
+            "results": formatted,
+        }
+
+    async def get_channel_summary(
+        self,
+        origin_message: discord.Message,
+        channel_id: str,
+        max_chars: int = 3000,
+    ) -> Dict[str, Any]:
+        guild = origin_message.guild
+        if not guild:
+            return {"ok": False, "tool": "get_channel_summary", "error": "Channel summaries are only available in a server."}
+
+        channel = self._resolve_channel(guild, channel_id)
+        if not channel:
+            return {"ok": False, "tool": "get_channel_summary", "error": "Channel was not found in the current server."}
+        if not self._can_read_history(channel):
+            return {"ok": False, "tool": "get_channel_summary", "error": "The bot cannot read that channel's summary."}
+
+        context_manager = getattr(self.bot, "context_manager", None)
+        if not context_manager:
+            return {"ok": False, "tool": "get_channel_summary", "error": "Context manager is not available."}
+
+        max_chars = self._clamp_int(max_chars, default=3000, minimum=500, maximum=8000)
+        summary_data = await context_manager.get_channel_summary(str(guild.id), str(channel.id))
+        summary = str(summary_data.get("summary") or "").strip()
+        summary_available = bool(summary and summary != "No summary available yet.")
+        truncated = len(summary) > max_chars
+        if truncated:
+            summary = summary[: max_chars - 3].rstrip() + "..."
+
+        return {
+            "ok": True,
+            "tool": "get_channel_summary",
+            "guild_id": str(guild.id),
+            "channel": self._format_channel(channel),
+            "summary_available": summary_available,
+            "summary": summary,
+            "truncated": truncated,
+            "last_summary_time": summary_data.get("last_summary_time"),
+            "messages_since_summary": summary_data.get("messages_since_summary"),
+            "messages_processed": summary_data.get("messages_processed"),
+            "summary_type": summary_data.get("summary_type"),
+        }
+
     async def search_messages(
         self,
         origin_message: discord.Message,
@@ -199,6 +422,7 @@ class DiscordToolManager:
     ) -> Dict[str, Any]:
         limit = self._clamp_int(limit, default=10, minimum=1, maximum=25)
         history_limit = self._clamp_int(history_limit, default=200, minimum=1, maximum=1000)
+        include_all_readable_channels = self._coerce_bool(include_all_readable_channels, default=False)
         query_norm = (query or "").casefold().strip()
         author_id_int = self._parse_optional_int(author_id)
         after = self._parse_optional_datetime(after_iso)
@@ -246,6 +470,8 @@ class DiscordToolManager:
             return {"ok": False, "tool": "fetch_message", "error": "Channel was not found in the current server."}
         if not self._can_read_history(channel):
             return {"ok": False, "tool": "fetch_message", "error": "The bot cannot read message history in that channel."}
+        if not self._supports_fetch_message(channel):
+            return {"ok": False, "tool": "fetch_message", "error": "That channel does not support fetching messages by ID."}
 
         try:
             msg = await channel.fetch_message(int(message_id))
@@ -270,6 +496,8 @@ class DiscordToolManager:
             return {"ok": False, "tool": "get_recent_messages", "error": "Channel was not found in the current server."}
         if not self._can_read_history(channel):
             return {"ok": False, "tool": "get_recent_messages", "error": "The bot cannot read message history in that channel."}
+        if not self._supports_history(channel):
+            return {"ok": False, "tool": "get_recent_messages", "error": "That channel does not expose message history."}
 
         messages = []
         async for msg in channel.history(limit=limit, oldest_first=False):
@@ -487,10 +715,14 @@ class DiscordToolManager:
         include_all_readable_channels: bool,
     ) -> List[Any]:
         if include_all_readable_channels:
-            return [channel for channel in origin_message.guild.text_channels if self._can_read_history(channel)]
+            return [
+                channel
+                for channel in self._visible_channels(origin_message.guild, messageable_only=True, include_threads=False)
+                if self._can_read_history(channel)
+            ]
 
         channel = self._resolve_channel(origin_message.guild, channel_id) if channel_id else origin_message.channel
-        if channel and self._can_read_history(channel):
+        if channel and self._can_read_history(channel) and self._supports_history(channel):
             return [channel]
         return []
 
@@ -500,19 +732,109 @@ class DiscordToolManager:
             return None
 
         channel = guild.get_channel(channel_id_int)
+        if not channel and hasattr(guild, "get_thread"):
+            channel = guild.get_thread(channel_id_int)
         if not channel:
             channel = self.bot.get_channel(channel_id_int)
         if channel and getattr(channel, "guild", None) and channel.guild.id == guild.id:
             return channel
         return None
 
+    def _visible_channels(
+        self,
+        guild: discord.Guild,
+        *,
+        messageable_only: bool,
+        include_threads: bool,
+    ) -> List[Any]:
+        channels = list(getattr(guild, "channels", []))
+        if include_threads:
+            channels.extend(getattr(guild, "threads", []))
+
+        visible = []
+        for channel in self._dedupe_channels(channels):
+            if getattr(getattr(channel, "guild", None), "id", None) != guild.id:
+                continue
+            if not self._can_view_channel(channel):
+                continue
+            if messageable_only and not self._supports_history(channel):
+                continue
+            visible.append(channel)
+
+        return sorted(visible, key=self._channel_sort_key)
+
+    def _dedupe_channels(self, channels: Iterable[Any]) -> List[Any]:
+        deduped = []
+        seen = set()
+        for channel in channels:
+            channel_id = getattr(channel, "id", None)
+            if channel_id is None or channel_id in seen:
+                continue
+            seen.add(channel_id)
+            deduped.append(channel)
+        return deduped
+
+    def _can_view_channel(self, channel: Any) -> bool:
+        permissions = self._channel_permissions(channel)
+        return bool(permissions and getattr(permissions, "view_channel", False))
+
     def _can_read_history(self, channel: Any) -> bool:
+        permissions = self._channel_permissions(channel)
+        return bool(
+            permissions
+            and getattr(permissions, "view_channel", False)
+            and getattr(permissions, "read_message_history", False)
+        )
+
+    def _channel_permissions(self, channel: Any) -> Optional[Any]:
         guild = getattr(channel, "guild", None)
-        me = getattr(guild, "me", None)
+        me = self._guild_member(guild)
         if not guild or not me or not hasattr(channel, "permissions_for"):
-            return False
-        permissions = channel.permissions_for(me)
-        return bool(permissions.view_channel and permissions.read_message_history)
+            return None
+        try:
+            return channel.permissions_for(me)
+        except Exception:
+            return None
+
+    def _guild_member(self, guild: Optional[discord.Guild]) -> Optional[Any]:
+        if not guild:
+            return None
+        me = getattr(guild, "me", None)
+        if me:
+            return me
+        bot_user = getattr(self.bot, "user", None)
+        if bot_user and hasattr(guild, "get_member"):
+            return guild.get_member(bot_user.id)
+        return None
+
+    def _supports_history(self, channel: Any) -> bool:
+        return callable(getattr(channel, "history", None))
+
+    def _supports_fetch_message(self, channel: Any) -> bool:
+        return callable(getattr(channel, "fetch_message", None))
+
+    def _format_channel(self, channel: Any) -> Dict[str, Any]:
+        parent = getattr(channel, "parent", None)
+        category = getattr(channel, "category", None)
+        channel_id = getattr(channel, "id", "")
+        parent_id = getattr(parent, "id", None)
+        category_id = getattr(category, "id", None)
+        can_read_history = self._can_read_history(channel)
+
+        return {
+            "channel_id": str(channel_id),
+            "name": getattr(channel, "name", str(channel_id)),
+            "mention": getattr(channel, "mention", f"<#{channel_id}>"),
+            "type": str(getattr(channel, "type", channel.__class__.__name__)),
+            "category_id": str(category_id) if category_id is not None else None,
+            "category_name": getattr(category, "name", None) if category else None,
+            "parent_channel_id": str(parent_id) if parent_id is not None else None,
+            "parent_channel_name": getattr(parent, "name", None) if parent else None,
+            "can_view": self._can_view_channel(channel),
+            "can_read_history": can_read_history,
+            "can_get_recent_messages": can_read_history and self._supports_history(channel),
+            "can_fetch_message": can_read_history and self._supports_fetch_message(channel),
+        }
 
     def _format_message(self, message: discord.Message, max_content: int = 700) -> Dict[str, Any]:
         content = message.content or ""
@@ -536,10 +858,43 @@ class DiscordToolManager:
     def _parse_optional_int(self, value: Any) -> Optional[int]:
         if value in (None, ""):
             return None
+        if isinstance(value, str):
+            value = value.strip()
+            mention_match = re.fullmatch(r"<(?:#|@!?|@&)?(\d+)>", value)
+            if mention_match:
+                value = mention_match.group(1)
         try:
             return int(value)
         except (TypeError, ValueError):
             return None
+
+    def _normalize_channel_query(self, value: str) -> str:
+        value = (value or "").strip().casefold()
+        if value.startswith("#"):
+            value = value[1:]
+        return re.sub(r"[\s_]+", "-", value)
+
+    def _coerce_bool(self, value: Any, *, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().casefold()
+            if normalized in {"true", "1", "yes", "y", "on"}:
+                return True
+            if normalized in {"false", "0", "no", "n", "off"}:
+                return False
+            return default
+        return bool(value)
+
+    def _channel_sort_key(self, channel: Any) -> Tuple[int, int, str, int]:
+        category = getattr(channel, "category", None)
+        category_position = getattr(category, "position", -1) or -1
+        position = getattr(channel, "position", 0) or 0
+        name = getattr(channel, "name", "")
+        channel_id = self._parse_optional_int(getattr(channel, "id", 0)) or 0
+        return (category_position, position, str(name).casefold(), int(channel_id))
 
     def _parse_optional_datetime(self, value: Any) -> Optional[datetime]:
         if not value:

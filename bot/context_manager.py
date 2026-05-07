@@ -159,9 +159,29 @@ class ContextManager:
 
         # 2. Channel Summary
         if include_channel_summary:
+            mentioned_channel_ids = self._message_channel_mention_ids(message)
             channel_data = data.get("channels", {}).get(channel_id, {})
-            if "summary" in channel_data:
-                messages.append({"role": "system", "content": f"Channel Summary:\n{channel_data['summary']}"})
+            current_summary = (channel_data.get("summary") or "").strip()
+            if current_summary:
+                messages.append({
+                    "role": "system",
+                    "content": self._format_channel_summary_context(
+                        channel_name=getattr(channel, "name", channel_id),
+                        channel_id=channel_id,
+                        summary=current_summary,
+                        channel_data=channel_data,
+                        preloaded_explicit=channel_id in mentioned_channel_ids,
+                        current_channel=True,
+                    ),
+                })
+            messages.extend(
+                self._mentioned_channel_summary_messages(
+                    message=message,
+                    data=data,
+                    current_channel_id=channel_id,
+                    settings=settings,
+                )
+            )
 
         # 3. User Profiles
         if include_user_profiles:
@@ -246,6 +266,140 @@ class ContextManager:
                 messages.append({"role": "user", "content": current_message_content})
 
         return messages, settings
+
+    def _message_channel_mention_ids(self, message: discord.Message) -> set:
+        return {
+            str(getattr(channel, "id", ""))
+            for channel in (getattr(message, "channel_mentions", []) or [])
+            if getattr(channel, "id", None)
+        }
+
+    def _mentioned_channel_summary_messages(
+        self,
+        *,
+        message: discord.Message,
+        data: dict,
+        current_channel_id: str,
+        settings: dict,
+    ) -> list:
+        """Return stored summaries for channels explicitly mentioned in the current Discord message."""
+        mentioned_channels = getattr(message, "channel_mentions", []) or []
+        if not mentioned_channels:
+            return []
+
+        context_settings = settings.get("context", {}) if isinstance(settings, dict) else {}
+        if not isinstance(context_settings, dict):
+            context_settings = {}
+        max_channels = self._safe_int(context_settings.get("mentioned_channel_summary_limit"), default=5, minimum=1, maximum=10)
+        max_chars = self._safe_int(context_settings.get("mentioned_channel_summary_max_chars"), default=2500, minimum=500, maximum=8000)
+        summaries = []
+        seen_channel_ids = {str(current_channel_id)}
+        channel_data_by_id = data.get("channels", {})
+
+        for mentioned_channel in mentioned_channels:
+            if len(summaries) >= max_channels:
+                break
+
+            mentioned_channel_id = str(getattr(mentioned_channel, "id", ""))
+            if not mentioned_channel_id or mentioned_channel_id in seen_channel_ids:
+                continue
+            seen_channel_ids.add(mentioned_channel_id)
+
+            if not self._can_include_mentioned_channel_summary(mentioned_channel, message.guild):
+                continue
+
+            channel_data = channel_data_by_id.get(mentioned_channel_id, {})
+            summary = (channel_data.get("summary") or "").strip()
+            if not summary:
+                continue
+
+            channel_name = getattr(mentioned_channel, "name", mentioned_channel_id)
+            summary = self._truncate_context_text(summary, max_chars)
+            summaries.append({
+                "role": "system",
+                "content": self._format_channel_summary_context(
+                    channel_name=channel_name,
+                    channel_id=mentioned_channel_id,
+                    summary=summary,
+                    channel_data=channel_data,
+                    preloaded_explicit=True,
+                    current_channel=False,
+                ),
+            })
+
+        return summaries
+
+    def _format_channel_summary_context(
+        self,
+        *,
+        channel_name: str,
+        channel_id: str,
+        summary: str,
+        channel_data: dict,
+        preloaded_explicit: bool,
+        current_channel: bool,
+    ) -> str:
+        if preloaded_explicit:
+            label = "Preloaded Explicit Channel Summary"
+        elif current_channel:
+            label = "Current Channel Summary"
+        else:
+            label = "Channel Summary"
+
+        metadata_parts = []
+        if channel_data.get("last_summary_time"):
+            metadata_parts.append(f"last_summary_time={channel_data['last_summary_time']}")
+        if channel_data.get("messages_since_summary") is not None:
+            metadata_parts.append(f"messages_since_summary={channel_data['messages_since_summary']}")
+        if channel_data.get("summary_type"):
+            metadata_parts.append(f"summary_type={channel_data['summary_type']}")
+
+        metadata = f"\nSummary metadata: {', '.join(metadata_parts)}" if metadata_parts else ""
+        instruction = ""
+        if preloaded_explicit:
+            instruction = (
+                "\nThis summary was preloaded because the current message explicitly mentions this channel. "
+                "Use it directly for broad recaps; do not call get_channel_summary for this channel unless the user asks for a fresh tool check."
+            )
+
+        return f"{label} for #{channel_name} (Channel ID: {channel_id}):\n{summary}{metadata}{instruction}"
+
+    def _can_include_mentioned_channel_summary(self, channel: discord.abc.GuildChannel, current_guild: discord.Guild) -> bool:
+        if not channel or not current_guild:
+            return False
+
+        guild = getattr(channel, "guild", None)
+        if not guild or guild.id != current_guild.id:
+            return False
+
+        me = getattr(guild, "me", None)
+        if not me and self.bot and self.bot.user and hasattr(guild, "get_member"):
+            me = guild.get_member(self.bot.user.id)
+        if not me or not hasattr(channel, "permissions_for"):
+            return False
+
+        try:
+            permissions = channel.permissions_for(me)
+        except Exception:
+            return False
+
+        return bool(
+            getattr(permissions, "view_channel", False)
+            and getattr(permissions, "read_message_history", False)
+        )
+
+    def _safe_int(self, value, *, default: int, minimum: int, maximum: int) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = default
+        return max(minimum, min(parsed, maximum))
+
+    def _truncate_context_text(self, text: str, max_chars: int) -> str:
+        text = str(text or "").strip()
+        if len(text) <= max_chars:
+            return text
+        return text[: max_chars - 3].rstrip() + "..."
 
     def _format_message_context_line(self, message: discord.Message) -> str:
         """

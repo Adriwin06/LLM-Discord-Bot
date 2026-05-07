@@ -346,7 +346,19 @@ class EventHandler(commands.Cog):
             "content": "Final Discord replies must be plain message text only. Do not return JSON, do not include `content` or `reactions` fields, and do not list available tools."
         })
         tools = tool_manager.tool_definitions()
+        if self._has_preloaded_explicit_channel_summary(tool_messages):
+            tools = self._without_tool_names(tools, {"get_channel_summary"})
+            tool_messages.append({
+                "role": "system",
+                "content": (
+                    "Stored summaries for explicitly mentioned Discord channels are already preloaded in context. "
+                    "Use those summaries directly for broad channel questions instead of fetching them again."
+                )
+            })
+        available_tool_names = self._tool_names(tools)
         max_rounds = max(0, int(getattr(self.bot.config, "TOOL_MAX_ROUNDS", 0)))
+        executed_tool_results = {}
+        forced_stop_reason = None
 
         response = await self.bot.llm_provider.create_completion(
             model=model,
@@ -369,12 +381,40 @@ class EventHandler(commands.Cog):
             tool_round += 1
             logging.info(f"Model requested {len(tool_calls)} Discord tool call(s) in round {tool_round}.")
             tool_messages.append(tool_manager.assistant_message_for_history(assistant_message, tool_calls))
+            repeated_tool_call = False
+            unavailable_tool_call = False
 
             for tool_call in tool_calls:
-                tool_name, _ = tool_manager.parse_tool_call(tool_call)
-                result = await tool_manager.execute_tool_call(tool_call, origin_message)
-                logging.info(f"Executed Discord tool '{tool_name}' for message {origin_message.id}.")
+                tool_name, arguments = tool_manager.parse_tool_call(tool_call)
+                if tool_name not in available_tool_names:
+                    unavailable_tool_call = True
+                    result = {
+                        "ok": False,
+                        "tool": tool_name,
+                        "error": "This tool is not available for this reply because the relevant context is already preloaded. Use the provided context and write the final Discord reply now.",
+                    }
+                    logging.info(f"Rejected unavailable Discord tool '{tool_name}' for message {origin_message.id}.")
+                else:
+                    tool_signature = self._tool_call_signature(tool_name, arguments)
+                    if tool_signature in executed_tool_results:
+                        repeated_tool_call = True
+                        result = dict(executed_tool_results[tool_signature])
+                        result["duplicate_call"] = True
+                        result["instruction"] = "This exact tool call was already executed. Use the existing result and write the final Discord reply now."
+                        logging.info(f"Skipped duplicate Discord tool '{tool_name}' for message {origin_message.id}.")
+                    else:
+                        result = await tool_manager.execute_tool_call(tool_call, origin_message)
+                        executed_tool_results[tool_signature] = result
+                        logging.info(f"Executed Discord tool '{tool_name}' for message {origin_message.id}.")
                 tool_messages.append(tool_manager.tool_result_message(tool_call, result))
+
+            if unavailable_tool_call:
+                forced_stop_reason = "Unavailable tool call rejected because the relevant context is already preloaded. Use the existing context to write one final Discord reply now."
+                break
+
+            if repeated_tool_call:
+                forced_stop_reason = "Repeated identical tool call detected. Use the tool results already provided to write one final Discord reply now."
+                break
 
             response = await self.bot.llm_provider.create_completion(
                 model=model,
@@ -384,13 +424,10 @@ class EventHandler(commands.Cog):
             )
             if not response:
                 logging.warning("Completion after Discord tool call failed; forcing a final response without tools.")
+                forced_stop_reason = "Tool loop stopped because a completion failed. Use the tool results already provided to write one final Discord reply now."
                 break
 
-        stop_reason = (
-            "Tool loop stopped because a completion failed. Use the tool results already provided to write one final Discord reply now."
-            if max_rounds == 0
-            else "Tool call limit reached. Use the tool results already provided to write one final Discord reply now."
-        )
+        stop_reason = forced_stop_reason or "Tool call limit reached. Use the tool results already provided to write one final Discord reply now."
         tool_messages.append({
             "role": "system",
             "content": stop_reason
@@ -410,6 +447,38 @@ class EventHandler(commands.Cog):
             return bool(tool_settings.get("enabled"))
 
         return True
+
+    def _has_preloaded_explicit_channel_summary(self, messages: list) -> bool:
+        for message in messages:
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, str) and "Preloaded Explicit Channel Summary" in content:
+                return True
+        return False
+
+    def _without_tool_names(self, tools: list, names: set) -> list:
+        filtered = []
+        for tool in tools:
+            function = tool.get("function", {}) if isinstance(tool, dict) else {}
+            if function.get("name") in names:
+                continue
+            filtered.append(tool)
+        return filtered
+
+    def _tool_names(self, tools: list) -> set:
+        names = set()
+        for tool in tools:
+            function = tool.get("function", {}) if isinstance(tool, dict) else {}
+            name = function.get("name")
+            if name:
+                names.add(name)
+        return names
+
+    def _tool_call_signature(self, tool_name: str, arguments: dict) -> str:
+        try:
+            serialized_arguments = json.dumps(arguments or {}, sort_keys=True, ensure_ascii=False, default=str)
+        except TypeError:
+            serialized_arguments = str(arguments)
+        return f"{tool_name}:{serialized_arguments}"
 
     def _response_message(self, response):
         if not response or not getattr(response, "choices", None):
