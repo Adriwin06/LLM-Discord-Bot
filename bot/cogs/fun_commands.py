@@ -8,6 +8,9 @@ import re
 from .utilities import MessageChunker
 
 class FunCommands(commands.Cog):
+    fun_group = app_commands.Group(name="fun", description="Fun LLM-generated commands.")
+    mock_group = app_commands.Group(name="mock", description="Mocking commands.")
+
     def __init__(self, bot):
         self.bot = bot
         self.session = aiohttp.ClientSession()
@@ -132,19 +135,19 @@ Generate a similar response that's playful and uplifting, but don't copy these e
             return content
         return f"{user.mention} {content}"
 
-    @app_commands.command(name="insult", description="Generate a personalized insult for a user.")
+    @fun_group.command(name="insult", description="Generate a personalized insult for a user.")
     async def insult(self, interaction: discord.Interaction, user: discord.Member):
         await self._generate_fun_response(interaction, user, "insult")
 
-    @app_commands.command(name="compliment", description="Generate a personalized compliment for a user.")
+    @fun_group.command(name="compliment", description="Generate a personalized compliment for a user.")
     async def compliment(self, interaction: discord.Interaction, user: discord.Member):
         await self._generate_fun_response(interaction, user, "compliment")
 
-    @app_commands.command(name="reverse_trash_talk", description="Reverse trash talk a user (sounds like a roast, but is actually nice).")
+    @fun_group.command(name="reverse", description="Reverse trash talk a user (sounds like a roast, but is actually nice).")
     async def reverse_trash_talk(self, interaction: discord.Interaction, user: discord.Member):
         await self._generate_fun_response(interaction, user, "reverse_trash_talk")
 
-    @app_commands.command(name="mock", description="Mock a user's last message in sPoNgEbOb TeXt format.")
+    @mock_group.command(name="message", description="Mock a user's last message in sPoNgEbOb TeXt format.")
     async def mock(self, interaction: discord.Interaction, user: discord.Member):
         await interaction.response.defer()
         
@@ -166,7 +169,7 @@ Generate a similar response that's playful and uplifting, but don't copy these e
         
         await interaction.followup.send(embed=embed)
 
-    @app_commands.command(name="mock_avatar", description="Mock a user's profile picture.")
+    @mock_group.command(name="avatar", description="Mock a user's profile picture.")
     async def mock_avatar(self, interaction: discord.Interaction, user: discord.Member):
         if await self.bot.context_manager.is_channel_llm_blacklisted(interaction.guild.id, interaction.channel.id):
             await interaction.response.send_message("LLM output is blacklisted in this channel.", ephemeral=True)

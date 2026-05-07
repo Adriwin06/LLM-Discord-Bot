@@ -261,6 +261,8 @@ class LevelUpCommands(commands.Cog):
     
     # Create a group for level commands
     level_group = app_commands.Group(name="level", description="Leveling system commands")
+    level_prestige_group = app_commands.Group(name="prestige", description="Manage prestige settings", parent=level_group)
+    level_voice_group = app_commands.Group(name="voice", description="Manage voice XP settings", parent=level_group)
     
     # --- MAJOR REFACTOR: level_profile ---
     @level_group.command(name="profile", description="View your or someone else's level profile")
@@ -665,7 +667,7 @@ class LevelUpCommands(commands.Cog):
             await self.save_levels_data()
             await interaction.response.send_message(f"✅ Set level {level} role to: {role.mention}")
     
-    @level_group.command(name="prestige", description="Manage prestige system (Admin only)")
+    @level_prestige_group.command(name="settings", description="Manage prestige system (Admin only)")
     @app_commands.describe(
         prestige_level="The prestige level to configure",
         role="The role to assign at this prestige level",
@@ -777,7 +779,7 @@ class LevelUpCommands(commands.Cog):
             emoji_text = f" and emoji {emoji}" if emoji else ""
             await interaction.response.send_message(f"✅ Set prestige level {prestige_level}{role_text}{emoji_text}")
     
-    @level_group.command(name="prestigelevel", description="Set the level required for prestige (Admin only)")
+    @level_prestige_group.command(name="requirement", description="Set the level required for prestige (Admin only)")
     @app_commands.describe(level="The level required to achieve prestige (default: 10)")
     @app_commands.checks.has_permissions(administrator=True)
     async def level_prestigelevel(self, interaction: discord.Interaction, level: int):
@@ -792,7 +794,7 @@ class LevelUpCommands(commands.Cog):
         
         await interaction.response.send_message(f"✅ Set prestige requirement to level {level}")
     
-    @level_group.command(name="voicexp", description="Configure voice XP settings (Admin only)")
+    @level_voice_group.command(name="xp", description="Configure voice XP settings (Admin only)")
     @app_commands.describe(
         enabled="Enable or disable voice XP",
         xp_per_minute="Voice XP gained per minute (default: 1.0)"

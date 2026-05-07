@@ -651,10 +651,12 @@ class Utilities(commands.Cog):
     This cog provides reusable utilities that can be imported by other cogs.
     """
     
+    test_group = app_commands.Group(name="test", description="Admin-only test commands.")
+
     def __init__(self, bot):
         self.bot = bot
     
-    @app_commands.command(name="test_pagination", description="Test the pagination system (Admin only)")
+    @test_group.command(name="pagination", description="Test the pagination system (Admin only)")
     @app_commands.checks.has_permissions(administrator=True)
     async def test_pagination(self, interaction: discord.Interaction):
         """Test command to demonstrate pagination functionality."""
@@ -678,7 +680,7 @@ class Utilities(commands.Cog):
         embed = view.create_embed()
         await interaction.followup.send(embed=embed, view=view, ephemeral=True)
     
-    @app_commands.command(name="test_chunking", description="Test the message chunking system (Admin only)")
+    @test_group.command(name="chunking", description="Test the message chunking system (Admin only)")
     @app_commands.checks.has_permissions(administrator=True)
     async def test_chunking(self, interaction: discord.Interaction):
         """Test command to demonstrate message chunking functionality."""

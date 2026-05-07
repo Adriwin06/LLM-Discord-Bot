@@ -98,20 +98,20 @@ If everything is set up correctly, you will see a confirmation message in your c
 
 All administrative tasks are handled via slash commands. You must have administrative permissions on the server to use these.
 
--   `/set_llm`: Configure the primary LLM model, behavior prompt, and summary triggers for the entire server.
--   `/channel_override`: Set channel-specific models, prompts, and settings that override the server-wide configuration.
--   `/reset_context`: Clear the bot's conversational context for a channel or the entire server.
+-   `/llm settings`: Configure the primary LLM model, behavior prompt, and summary triggers for the entire server.
+-   `/channel override`: Set channel-specific models, prompts, and settings that override the server-wide configuration.
+-   `/context reset`: Clear the bot's conversational context for a channel or the entire server.
 -   `/note`: Manage user profiles.
     -   `/note add`: Add a manual note to a user's profile.
     -   `/note view`: See a user's AI-generated summary and manual note.
-    -   `/note refresh-ai`: Force the bot to regenerate a user's AI summary based on their recent messages.
+    -   `/note refresh ai`: Force the bot to regenerate a user's AI summary based on their recent messages.
 -   `/backup`: Manually trigger a backup of the bot's data.
 
 ### Fun Commands
 
--   `/insult @user`: The bot will generate a personalized insult for the mentioned user.
--   `/compliment @user`: The bot will generate a personalized compliment for the mentioned user.
--   `/mock @user`: The bot will mock the user's last message in "sPoNgEbOb TeXt" format.
+-   `/fun insult @user`: The bot will generate a personalized insult for the mentioned user.
+-   `/fun compliment @user`: The bot will generate a personalized compliment for the mentioned user.
+-   `/mock message @user`: The bot will mock the user's last message in "sPoNgEbOb TeXt" format.
 
 ## Project Structure
 

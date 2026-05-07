@@ -10,6 +10,7 @@ class ProfileCommands(commands.Cog):
         self.bot = bot
 
     note_group = app_commands.Group(name="note", description="Commands for managing user profiles.")
+    note_refresh_group = app_commands.Group(name="refresh", description="Refresh user profile data.", parent=note_group)
 
     @note_group.command(name="add", description="Adds a permanent manual note to a user.")
     @app_commands.checks.has_permissions(manage_messages=True)
@@ -107,7 +108,7 @@ class ProfileCommands(commands.Cog):
 
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @note_group.command(name="refresh-ai", description="Forces an update of the AI-generated summary for a user.")
+    @note_refresh_group.command(name="ai", description="Forces an update of the AI-generated summary for a user.")
     @app_commands.checks.has_permissions(manage_messages=True)
     async def refresh_ai_note(self, interaction: discord.Interaction, user: discord.Member):
         await interaction.response.defer(ephemeral=True)

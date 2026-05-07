@@ -10,7 +10,15 @@ class AdminCommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @app_commands.command(name="set_llm", description="Configure core LLM parameters for the server.")
+    llm_group = app_commands.Group(name="llm", description="Manage LLM settings.")
+    media_group = app_commands.Group(name="media", description="Manage media processing.")
+    media_config_group = app_commands.Group(name="config", description="Configure media processing settings.", parent=media_group)
+    channel_group = app_commands.Group(name="channel", description="Manage channel-specific settings.")
+    context_group = app_commands.Group(name="context", description="Manage and inspect LLM context.")
+    model_group = app_commands.Group(name="model", description="Inspect model capabilities.")
+    user_group = app_commands.Group(name="user", description="Manage user profile settings and statistics.")
+
+    @llm_group.command(name="settings", description="Configure core LLM parameters for the server.")
     @app_commands.checks.has_permissions(administrator=True)
     async def set_llm(self, interaction: discord.Interaction, model: str, behavior_prompt: str, summarize_every_messages: int = 100, initial_summarize_messages: int = 1000, summarize_every_hours: int = 24):
         await interaction.response.defer(ephemeral=True)
@@ -30,8 +38,6 @@ class AdminCommands(commands.Cog):
         
         await self.bot.store.save_settings(settings)
         await interaction.followup.send("✅ Server LLM settings updated successfully.", ephemeral=True)
-
-    media_config_group = app_commands.Group(name="media_config", description="Configure media processing settings for the server.")
 
     @media_config_group.command(name="set", description="Set a specific media processing setting.")
     @app_commands.checks.has_permissions(administrator=True)
@@ -119,7 +125,7 @@ class AdminCommands(commands.Cog):
                 rows.append((full_key, value))
         return rows
 
-    @app_commands.command(name="channel_override", description="Override global settings for a specific channel.")
+    @channel_group.command(name="override", description="Override global settings for a specific channel.")
     @app_commands.checks.has_permissions(administrator=True)
     async def channel_override(self, interaction: discord.Interaction, channel: discord.TextChannel, model: str = None, behavior_prompt: str = None, summarize_every_messages: int = None):
         await interaction.response.defer(ephemeral=True)
@@ -157,7 +163,7 @@ class AdminCommands(commands.Cog):
             logging.error(f"Error in channel_override command: {str(e)}")
             await interaction.followup.send("❌ An unexpected error occurred while updating channel override.", ephemeral=True)
 
-    @app_commands.command(name="llm_blacklist", description="Block or unblock LLM-generated bot output in a channel.")
+    @llm_group.command(name="blacklist", description="Block or unblock LLM-generated bot output in a channel.")
     @app_commands.describe(
         channel="Channel to configure. Defaults to the current channel.",
         blacklisted="True blocks LLM output; false unblocks it. Leave empty to view status."
@@ -209,7 +215,7 @@ class AdminCommands(commands.Cog):
             ephemeral=True
         )
 
-    @app_commands.command(name="reset_context", description="Reset the bot's context for a channel or the entire server.")
+    @context_group.command(name="reset", description="Reset the bot's context for a channel or the entire server.")
     @app_commands.checks.has_permissions(administrator=True)
     async def reset_context(self, interaction: discord.Interaction, target: str = "channel"):
         await interaction.response.defer(ephemeral=True)
@@ -249,7 +255,7 @@ class AdminCommands(commands.Cog):
         await self.bot.store.backup_data()
         await interaction.followup.send("Backup completed successfully.", ephemeral=True)
 
-    @app_commands.command(name="model_info", description="Check capabilities of a specific model.")
+    @model_group.command(name="info", description="Check capabilities of a specific model.")
     @app_commands.checks.has_permissions(administrator=True)
     async def model_info(self, interaction: discord.Interaction, model: str):
         await interaction.response.defer(ephemeral=True)
@@ -439,7 +445,7 @@ class AdminCommands(commands.Cog):
             logging.error(f"Error in summary_settings command: {str(e)}")
             await interaction.followup.send("❌ An unexpected error occurred while managing summary settings.", ephemeral=True)
 
-    @app_commands.command(name="user_profile", description="Manage user profile settings and statistics.")
+    @user_group.command(name="profile", description="Manage user profile settings and statistics.")
     @app_commands.checks.has_permissions(administrator=True)
     async def user_profile(self, interaction: discord.Interaction, 
                           action: Literal["stats", "update", "settings"],
@@ -557,7 +563,7 @@ class AdminCommands(commands.Cog):
             logging.error(f"Error in user_profile command: {e}")
             await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
 
-    @app_commands.command(name="show_context", description="Show the complete context that would be sent to the LLM.")
+    @context_group.command(name="show", description="Show the complete context that would be sent to the LLM.")
     @app_commands.checks.has_permissions(administrator=True)
     async def show_context(self, interaction: discord.Interaction, 
                           message_id: str = None,
