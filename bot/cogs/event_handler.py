@@ -346,13 +346,13 @@ class EventHandler(commands.Cog):
             "content": "Final Discord replies must be plain message text only. Do not return JSON, do not include `content` or `reactions` fields, and do not list available tools."
         })
         tools = tool_manager.tool_definitions()
-        if self._has_preloaded_explicit_channel_summary(tool_messages):
-            tools = self._without_tool_names(tools, {"get_channel_summary"})
+        preloaded_summary_channel_ids = self._preloaded_explicit_channel_summary_ids(tool_messages)
+        if preloaded_summary_channel_ids:
             tool_messages.append({
                 "role": "system",
                 "content": (
                     "Stored summaries for explicitly mentioned Discord channels are already preloaded in context. "
-                    "Use those summaries directly for broad channel questions instead of fetching them again."
+                    "Do not call get_channel_summary for those exact channel IDs."
                 )
             })
         available_tool_names = self._tool_names(tools)
@@ -383,6 +383,7 @@ class EventHandler(commands.Cog):
             tool_messages.append(tool_manager.assistant_message_for_history(assistant_message, tool_calls))
             repeated_tool_call = False
             unavailable_tool_call = False
+            redundant_summary_call = False
 
             for tool_call in tool_calls:
                 tool_name, arguments = tool_manager.parse_tool_call(tool_call)
@@ -396,7 +397,18 @@ class EventHandler(commands.Cog):
                     logging.info(f"Rejected unavailable Discord tool '{tool_name}' for message {origin_message.id}.")
                 else:
                     tool_signature = self._tool_call_signature(tool_name, arguments)
-                    if tool_signature in executed_tool_results:
+                    requested_channel_id = self._tool_channel_id_argument(arguments)
+                    if tool_name == "get_channel_summary" and requested_channel_id in preloaded_summary_channel_ids:
+                        redundant_summary_call = True
+                        result = {
+                            "ok": True,
+                            "tool": tool_name,
+                            "channel_id": requested_channel_id,
+                            "already_preloaded": True,
+                            "instruction": "The summary for this exact channel is already present in the conversation context. Use the preloaded summary and write the final Discord reply now.",
+                        }
+                        logging.info(f"Skipped redundant Discord tool '{tool_name}' for preloaded channel {requested_channel_id}.")
+                    elif tool_signature in executed_tool_results:
                         repeated_tool_call = True
                         result = dict(executed_tool_results[tool_signature])
                         result["duplicate_call"] = True
@@ -410,6 +422,10 @@ class EventHandler(commands.Cog):
 
             if unavailable_tool_call:
                 forced_stop_reason = "Unavailable tool call rejected because the relevant context is already preloaded. Use the existing context to write one final Discord reply now."
+                break
+
+            if redundant_summary_call:
+                forced_stop_reason = "Redundant summary tool call skipped because the exact channel summary is already preloaded. Use the preloaded summary to write one final Discord reply now."
                 break
 
             if repeated_tool_call:
@@ -448,21 +464,14 @@ class EventHandler(commands.Cog):
 
         return True
 
-    def _has_preloaded_explicit_channel_summary(self, messages: list) -> bool:
+    def _preloaded_explicit_channel_summary_ids(self, messages: list) -> set:
+        channel_ids = set()
         for message in messages:
             content = message.get("content") if isinstance(message, dict) else None
-            if isinstance(content, str) and "Preloaded Explicit Channel Summary" in content:
-                return True
-        return False
-
-    def _without_tool_names(self, tools: list, names: set) -> list:
-        filtered = []
-        for tool in tools:
-            function = tool.get("function", {}) if isinstance(tool, dict) else {}
-            if function.get("name") in names:
+            if not isinstance(content, str) or "Preloaded Explicit Channel Summary" not in content:
                 continue
-            filtered.append(tool)
-        return filtered
+            channel_ids.update(re.findall(r"Preloaded Explicit Channel Summary.*?\(Channel ID:\s*(\d+)\)", content, flags=re.DOTALL))
+        return channel_ids
 
     def _tool_names(self, tools: list) -> set:
         names = set()
@@ -472,6 +481,17 @@ class EventHandler(commands.Cog):
             if name:
                 names.add(name)
         return names
+
+    def _tool_channel_id_argument(self, arguments: dict) -> str:
+        channel_id = (arguments or {}).get("channel_id")
+        if channel_id is None:
+            return ""
+
+        channel_id = str(channel_id).strip()
+        mention_match = re.fullmatch(r"<#(\d+)>", channel_id)
+        if mention_match:
+            return mention_match.group(1)
+        return channel_id
 
     def _tool_call_signature(self, tool_name: str, arguments: dict) -> str:
         try:
