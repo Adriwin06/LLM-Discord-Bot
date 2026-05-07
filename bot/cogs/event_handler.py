@@ -50,6 +50,8 @@ class EventHandler(commands.Cog):
         self._pending_reply_chains = {}
         self._typing_state = {}
         self._last_reply_by_channel = {}
+        self._recent_human_activity_by_channel = {}
+        self._last_bot_involvement_by_channel = {}
 
     def cog_unload(self):
         for task in self._pending_reply_tasks.values():
@@ -112,6 +114,8 @@ class EventHandler(commands.Cog):
             
             # Update counters and trigger summaries/profiles
             await self._update_counters_and_triggers(message, settings)
+
+        self._track_human_channel_activity(message)
 
         if self.bot.context_manager.is_llm_blacklisted_settings(settings, message.channel.id):
             logging.info(
@@ -202,6 +206,34 @@ class EventHandler(commands.Cog):
             logging.info("Skipping reply decision for command message. message_id=%s", message.id)
             return
 
+        key = self._reply_chain_key(message)
+        force_reply = self._is_direct_interaction(message, settings)
+        chain = self._pending_reply_chains.get(key)
+        pending_forced_chain = bool(chain and chain.get("force_reply"))
+
+        if force_reply:
+            self._mark_bot_involved(message)
+
+        if not self._decision_llm_enabled(settings) and not (force_reply or pending_forced_chain):
+            logging.info(
+                "Skipping decision model because it is disabled and the message is not a direct interaction. message_id=%s",
+                message.id,
+            )
+            return
+
+        if self._should_skip_uninvolved_conversation(
+            message,
+            settings,
+            force_reply=force_reply,
+            pending_forced_chain=pending_forced_chain,
+        ):
+            logging.info(
+                "Skipping decision model for active conversation the bot is not part of. message_id=%s channel_id=%s",
+                message.id,
+                message.channel.id,
+            )
+            return
+
         debounce_seconds = self._reply_chain_debounce_seconds(settings)
         logging.info(
             "Queueing reply decision. message_id=%s debounce_seconds=%.2f",
@@ -212,9 +244,6 @@ class EventHandler(commands.Cog):
             await self._process_reply_decision(message, settings, chain_messages=[message])
             return
 
-        key = self._reply_chain_key(message)
-        force_reply = self._is_direct_interaction(message, settings)
-        chain = self._pending_reply_chains.get(key)
         if chain:
             chain["messages"].append(message)
             chain["latest_message"] = message
@@ -302,6 +331,14 @@ class EventHandler(commands.Cog):
             logging.info("Skipping LLM action in blacklisted channel. message_id=%s", message.id)
             return
 
+        if self._should_skip_uninvolved_conversation(message, settings, force_reply=force_reply):
+            logging.info(
+                "Skipping queued decision for active conversation the bot is not part of. message_id=%s channel_id=%s",
+                message.id,
+                message.channel.id,
+            )
+            return
+
         logging.info(
             "Processing reply decision. message_id=%s force_reply=%s chain_count=%s long_typing=%s",
             message.id,
@@ -333,6 +370,7 @@ class EventHandler(commands.Cog):
         elif action == "react" and decision.get("reaction"):
             try:
                 await message.add_reaction(decision["reaction"])
+                self._mark_bot_involved(message)
             except discord.HTTPException:
                 logging.warning(f"Failed to add reaction '{decision['reaction']}'. It might be an invalid or custom emoji not available.")
         elif action == "gif":
@@ -340,6 +378,79 @@ class EventHandler(commands.Cog):
 
     def _reply_chain_key(self, message: discord.Message) -> tuple:
         return (str(message.guild.id), str(message.channel.id), str(message.author.id))
+
+    def _channel_key(self, message: discord.Message) -> tuple:
+        return (str(message.guild.id), str(message.channel.id))
+
+    def _decision_llm_enabled(self, settings: dict) -> bool:
+        value = settings.get(
+            "decision_llm_enabled",
+            getattr(self.bot.config, "DECISION_LLM_ENABLED", True),
+        )
+        return self._coerce_bool(value, default=True)
+
+    def _track_human_channel_activity(self, message: discord.Message):
+        key = self._channel_key(message)
+        now = self._utc_now()
+        activity = self._recent_human_activity_by_channel.setdefault(key, [])
+        activity.append({
+            "message_id": int(message.id),
+            "author_id": str(message.author.id),
+            "created_at": now,
+        })
+
+        max_age = max(self._uninvolved_conversation_window_seconds(), self._bot_conversation_idle_seconds())
+        self._recent_human_activity_by_channel[key] = [
+            entry
+            for entry in activity[-50:]
+            if (now - entry["created_at"]).total_seconds() <= max_age
+        ]
+
+    def _mark_bot_involved(self, message: discord.Message):
+        self._last_bot_involvement_by_channel[self._channel_key(message)] = self._utc_now()
+
+    def _bot_recently_involved(self, message: discord.Message) -> bool:
+        last_involved_at = self._last_bot_involvement_by_channel.get(self._channel_key(message))
+        if not isinstance(last_involved_at, datetime):
+            return False
+        return (self._utc_now() - last_involved_at).total_seconds() <= self._bot_conversation_idle_seconds()
+
+    def _should_skip_uninvolved_conversation(
+        self,
+        message: discord.Message,
+        settings: dict,
+        *,
+        force_reply: bool = False,
+        pending_forced_chain: bool = False,
+    ) -> bool:
+        if not self._decision_llm_enabled(settings):
+            return False
+        if force_reply or pending_forced_chain:
+            return False
+
+        resolved_reference = message.reference.resolved if message.reference else None
+        reference_author = getattr(resolved_reference, "author", None)
+        if reference_author and reference_author != self.bot.user and not getattr(reference_author, "bot", False):
+            return True
+
+        if self._bot_recently_involved(message):
+            return False
+
+        now = self._utc_now()
+        window_seconds = self._uninvolved_conversation_window_seconds()
+        recent_activity = [
+            entry
+            for entry in self._recent_human_activity_by_channel.get(self._channel_key(message), [])
+            if (now - entry["created_at"]).total_seconds() <= window_seconds
+        ]
+        authors = {entry["author_id"] for entry in recent_activity}
+        return len(recent_activity) >= 4 and len(authors) >= 2
+
+    def _uninvolved_conversation_window_seconds(self) -> float:
+        return 45.0
+
+    def _bot_conversation_idle_seconds(self) -> float:
+        return 120.0
 
     def _reply_chain_debounce_seconds(self, settings: dict) -> float:
         enabled = settings.get(
@@ -532,6 +643,7 @@ class EventHandler(commands.Cog):
             "created_at": self._utc_now().isoformat(),
             "content_chars": len(content or ""),
         }
+        self._mark_bot_involved(origin_message)
 
     async def _decide_message_action(
         self,
@@ -551,6 +663,10 @@ class EventHandler(commands.Cog):
         if force_reply or self._is_direct_interaction(message, settings):
             logging.info(f"Bypassing decision model for message {message.id} due to direct interaction.")
             return {"action": "reply"}
+
+        if not self._decision_llm_enabled(settings):
+            logging.info("Decision model disabled for non-direct message. message_id=%s", message.id)
+            return {"action": "none"}
 
         # Use decision LLM with context built specifically for that model
         decision_model = settings.get("decision_llm_model", self.bot.config.DECISION_LLM_MODEL)
@@ -879,6 +995,7 @@ class EventHandler(commands.Cog):
 
         try:
             await message.reply(content, mention_author=False)
+            self._mark_bot_involved(message)
         except discord.HTTPException as e:
             logging.warning(f"Failed to send GIF '{gif_key}' for message {message.id}: {e}")
 

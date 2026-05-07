@@ -14,6 +14,7 @@ class Config:
         # LLM Configuration
         self.MAIN_LLM_MODEL = os.getenv("MAIN_LLM_MODEL", "gemini/gemini-2.5-flash")
         self.DECISION_LLM_MODEL = os.getenv("DECISION_LLM_MODEL", "gemini/gemini-2.5-flash-lite")
+        self.DECISION_LLM_ENABLED = os.getenv("DECISION_LLM_ENABLED", "True").lower() == "true"
 
         # Prompt Configuration
         behavior_prompt_path = os.path.join(os.path.dirname(__file__), "../prompts/BEHAVIOR_PROMPT.md")

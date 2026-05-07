@@ -199,6 +199,46 @@ class DiscordToolManager:
             {
                 "type": "function",
                 "function": {
+                    "name": "get_user_profile",
+                    "description": (
+                        "Fetch a Discord user's profile details visible to the bot, including names, IDs, avatars, "
+                        "status/activities, roles, and stored profile notes. Provide user_id or query; defaults to the message author."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "user_id": {
+                                "type": "string",
+                                "description": "Discord user ID or mention to fetch.",
+                            },
+                            "query": {
+                                "type": "string",
+                                "description": "Username, display name, or mention to resolve within the server.",
+                            },
+                            "include_activities": {
+                                "type": "boolean",
+                                "description": "Include presence activities/status when available. Defaults to true.",
+                            },
+                            "include_roles": {
+                                "type": "boolean",
+                                "description": "Include guild role details. Defaults to true.",
+                            },
+                            "include_profile_notes": {
+                                "type": "boolean",
+                                "description": "Include stored manual notes and AI summaries. Defaults to true.",
+                            },
+                            "max_roles": {
+                                "type": "integer",
+                                "description": "Maximum roles to return (excluding @everyone). Defaults to 50, max 200.",
+                            },
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "web_search",
                     "description": (
                         "Search the public web and return result titles, snippets, and URLs. "
@@ -263,6 +303,8 @@ class DiscordToolManager:
                 return await self.fetch_message(origin_message, **arguments)
             if name == "get_recent_messages":
                 return await self.get_recent_messages(origin_message, **arguments)
+            if name == "get_user_profile":
+                return await self.get_user_profile(origin_message, **arguments)
             if name == "web_search":
                 return await self.web_search(**arguments)
             if name == "fetch_web_page":
@@ -512,6 +554,150 @@ class DiscordToolManager:
             "returned": len(messages),
             "results": messages,
         }
+
+    async def get_user_profile(
+        self,
+        origin_message: discord.Message,
+        user_id: Optional[str] = None,
+        query: Optional[str] = None,
+        include_activities: bool = True,
+        include_roles: bool = True,
+        include_profile_notes: bool = True,
+        max_roles: int = 50,
+    ) -> Dict[str, Any]:
+        include_activities = self._coerce_bool(include_activities, default=True)
+        include_roles = self._coerce_bool(include_roles, default=True)
+        include_profile_notes = self._coerce_bool(include_profile_notes, default=True)
+        max_roles = self._clamp_int(max_roles, default=50, minimum=0, maximum=200)
+
+        guild = origin_message.guild
+        resolved_user_id = self._parse_optional_int(user_id)
+        query = str(query or "").strip()
+        matched_by = None
+        member = None
+
+        if resolved_user_id is not None:
+            matched_by = "user_id"
+
+        if resolved_user_id is None and query:
+            resolved_user_id = self._parse_optional_int(query)
+            if resolved_user_id is not None:
+                matched_by = "query_id"
+
+        if resolved_user_id is None and not query:
+            author = getattr(origin_message, "author", None)
+            if author is not None:
+                resolved_user_id = getattr(author, "id", None)
+                member = author if isinstance(author, discord.Member) else None
+                matched_by = "message_author"
+
+        if resolved_user_id is None and query:
+            if not guild:
+                return {
+                    "ok": False,
+                    "tool": "get_user_profile",
+                    "error": "User resolution by name requires a server context.",
+                }
+            matches = self._find_members_by_query(guild, query, limit=5)
+            if len(matches) == 1:
+                member = matches[0]
+                resolved_user_id = member.id
+                matched_by = "query"
+            elif matches:
+                return {
+                    "ok": False,
+                    "tool": "get_user_profile",
+                    "error": "Multiple users match the query. Use a user_id or a more specific name.",
+                    "query": query,
+                    "matches": [self._format_member_match(match) for match in matches],
+                }
+            else:
+                return {
+                    "ok": False,
+                    "tool": "get_user_profile",
+                    "error": "No users matched the query.",
+                    "query": query,
+                }
+
+        if resolved_user_id is None:
+            return {
+                "ok": False,
+                "tool": "get_user_profile",
+                "error": "A user_id or query is required to fetch a profile.",
+            }
+
+        if guild and member is None:
+            member = guild.get_member(resolved_user_id)
+            if member is None and hasattr(guild, "fetch_member"):
+                try:
+                    member = await guild.fetch_member(resolved_user_id)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    member = None
+
+        user = member or self.bot.get_user(resolved_user_id)
+        if user is None:
+            try:
+                user = await self.bot.fetch_user(resolved_user_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                user = None
+
+        if user is None and member is None:
+            return {
+                "ok": False,
+                "tool": "get_user_profile",
+                "error": "User was not found.",
+                "user_id": str(resolved_user_id),
+            }
+
+        user_info = self._format_user_profile(user, member)
+        links = self._format_user_links(user, member)
+        activities = []
+        custom_status = None
+        presence_intent = bool(getattr(getattr(self.bot, "intents", None), "presences", False))
+
+        if include_activities and member is not None:
+            raw_activities = list(getattr(member, "activities", []) or [])
+            activities = [self._format_activity(activity) for activity in raw_activities if activity]
+            custom_status = self._extract_custom_status(raw_activities)
+
+        stored_profile = None
+        if include_profile_notes and guild and hasattr(self.bot, "store"):
+            try:
+                data = await self.bot.store.get_data()
+                user_data = data.get(str(guild.id), {}).get("users", {}).get(str(resolved_user_id), {})
+                if user_data:
+                    stored_profile = self._drop_empty({
+                        "manual_note": user_data.get("manual_note"),
+                        "ai_summary": user_data.get("ai_summary"),
+                        "last_profile_update_time": user_data.get("last_profile_update_time"),
+                        "messages_since_profile_update": user_data.get("messages_since_profile_update"),
+                    })
+            except Exception:
+                stored_profile = None
+
+        member_info = None
+        if member is not None:
+            member_info = self._format_member_profile(member, include_roles=include_roles, max_roles=max_roles)
+
+        return self._drop_empty({
+            "ok": True,
+            "tool": "get_user_profile",
+            "matched_by": matched_by,
+            "query": query or None,
+            "user_id": str(resolved_user_id),
+            "user": user_info,
+            "member": member_info,
+            "links": links,
+            "activities": activities,
+            "custom_status": custom_status,
+            "stored_profile": stored_profile,
+            "availability": {
+                "presence_intent_enabled": presence_intent,
+                "activities_available": bool(activities),
+                "bio_available": False,
+                "connections_available": False,
+            },
+        })
 
     async def web_search(self, query: str, limit: int = 5) -> Dict[str, Any]:
         if not getattr(self.bot.config, "WEB_SEARCH_ENABLED", True):
@@ -854,6 +1040,255 @@ class DiscordToolManager:
             "attachments": [attachment.filename for attachment in message.attachments],
             "reply_to_message_id": str(message.reference.message_id) if message.reference and message.reference.message_id else None,
         }
+
+    def _format_user_profile(self, user: Any, member: Optional[discord.Member]) -> Dict[str, Any]:
+        display_name = None
+        if member is not None:
+            display_name = getattr(member, "display_name", None)
+        if not display_name:
+            display_name = getattr(user, "display_name", None) or getattr(user, "name", None)
+
+        return self._drop_empty({
+            "user_id": str(getattr(user, "id", "")),
+            "username": getattr(user, "name", None),
+            "global_name": getattr(user, "global_name", None),
+            "display_name": display_name,
+            "discriminator": getattr(user, "discriminator", None),
+            "mention": getattr(user, "mention", None),
+            "is_bot": bool(getattr(user, "bot", False)),
+            "is_system": bool(getattr(user, "system", False)),
+            "created_at": self._isoformat(getattr(user, "created_at", None)),
+            "accent_color": self._format_color(getattr(user, "accent_color", None)),
+        })
+
+    def _format_user_links(self, user: Any, member: Optional[discord.Member]) -> Dict[str, Any]:
+        return self._drop_empty({
+            "profile_url": f"https://discord.com/users/{getattr(user, 'id', '')}",
+            "avatar_url": self._asset_url(getattr(user, "avatar", None)),
+            "display_avatar_url": self._asset_url(getattr(user, "display_avatar", None)),
+            "banner_url": self._asset_url(getattr(user, "banner", None)),
+            "guild_avatar_url": self._asset_url(getattr(member, "guild_avatar", None)) if member else None,
+        })
+
+    def _format_member_profile(self, member: discord.Member, *, include_roles: bool, max_roles: int) -> Dict[str, Any]:
+        guild = getattr(member, "guild", None)
+        roles = []
+        roles_truncated = False
+        if include_roles and hasattr(member, "roles"):
+            all_roles = [role for role in member.roles if not self._is_default_role(role, guild)]
+            all_roles.sort(key=lambda role: role.position, reverse=True)
+            if max_roles and len(all_roles) > max_roles:
+                roles_truncated = True
+                all_roles = all_roles[:max_roles]
+            roles = [self._format_role(role) for role in all_roles]
+
+        permissions = []
+        guild_permissions = getattr(member, "guild_permissions", None)
+        if guild_permissions is not None:
+            try:
+                permissions = [name for name, value in guild_permissions if value]
+            except Exception:
+                permissions = []
+
+        status = getattr(member, "status", None)
+        if status is not None and hasattr(status, "name"):
+            status = status.name
+
+        return self._drop_empty({
+            "guild_id": str(getattr(guild, "id", "")) if guild else None,
+            "guild_name": getattr(guild, "name", None) if guild else None,
+            "nickname": getattr(member, "nick", None),
+            "display_name": getattr(member, "display_name", None),
+            "joined_at": self._isoformat(getattr(member, "joined_at", None)),
+            "premium_since": self._isoformat(getattr(member, "premium_since", None)),
+            "timed_out_until": self._isoformat(
+                getattr(member, "communication_disabled_until", None)
+                or getattr(member, "timed_out_until", None)
+            ),
+            "pending": bool(getattr(member, "pending", False)) if hasattr(member, "pending") else None,
+            "is_owner": bool(guild and getattr(guild, "owner_id", None) == getattr(member, "id", None)),
+            "status": status,
+            "permissions": permissions,
+            "top_role": self._format_role(getattr(member, "top_role", None)) if getattr(member, "top_role", None) else None,
+            "roles": roles,
+            "roles_truncated": roles_truncated,
+        })
+
+    def _format_role(self, role: Optional[discord.Role]) -> Optional[Dict[str, Any]]:
+        if role is None:
+            return None
+        return self._drop_empty({
+            "role_id": str(getattr(role, "id", "")),
+            "name": getattr(role, "name", None),
+            "color": self._format_color(getattr(role, "color", None)),
+            "position": getattr(role, "position", None),
+            "mentionable": bool(getattr(role, "mentionable", False)),
+            "hoist": bool(getattr(role, "hoist", False)),
+            "managed": bool(getattr(role, "managed", False)),
+        })
+
+    def _format_activity(self, activity: Any) -> Dict[str, Any]:
+        activity_type = getattr(activity, "type", None)
+        if activity_type is not None and hasattr(activity_type, "name"):
+            activity_type = activity_type.name.lower()
+
+        emoji = getattr(activity, "emoji", None)
+        formatted = {
+            "type": activity_type,
+            "name": getattr(activity, "name", None),
+            "details": getattr(activity, "details", None),
+            "state": getattr(activity, "state", None),
+            "url": getattr(activity, "url", None),
+            "application_id": str(getattr(activity, "application_id", None)) if getattr(activity, "application_id", None) else None,
+            "created_at": self._isoformat(getattr(activity, "created_at", None)),
+            "emoji": str(emoji) if emoji else None,
+        }
+
+        start_time = getattr(activity, "start", None)
+        end_time = getattr(activity, "end", None)
+        if start_time or end_time:
+            formatted["timestamps"] = self._drop_empty({
+                "start": self._isoformat(start_time),
+                "end": self._isoformat(end_time),
+            })
+
+        if hasattr(activity, "track_id"):
+            formatted["track"] = self._drop_empty({
+                "track_id": getattr(activity, "track_id", None),
+                "title": getattr(activity, "title", None),
+                "artist": getattr(activity, "artist", None),
+                "album": getattr(activity, "album", None),
+                "duration_seconds": self._duration_seconds(getattr(activity, "duration", None)),
+            })
+
+        return self._drop_empty(formatted)
+
+    def _extract_custom_status(self, activities: Iterable[Any]) -> Optional[Dict[str, Any]]:
+        for activity in activities or []:
+            activity_type = getattr(activity, "type", None)
+            if activity_type is not None and hasattr(activity_type, "name"):
+                if activity_type.name.lower() != "custom":
+                    continue
+            elif str(activity_type).lower() != "custom":
+                continue
+
+            emoji = getattr(activity, "emoji", None)
+            return self._drop_empty({
+                "state": getattr(activity, "state", None),
+                "name": getattr(activity, "name", None),
+                "emoji": str(emoji) if emoji else None,
+            })
+        return None
+
+    def _format_member_match(self, member: discord.Member) -> Dict[str, Any]:
+        return self._drop_empty({
+            "user_id": str(getattr(member, "id", "")),
+            "display_name": getattr(member, "display_name", None),
+            "username": getattr(member, "name", None),
+            "global_name": getattr(member, "global_name", None),
+            "mention": getattr(member, "mention", None),
+        })
+
+    def _find_members_by_query(self, guild: discord.Guild, query: str, limit: int = 5) -> List[discord.Member]:
+        query_norm = self._normalize_user_query(query)
+        if not query_norm:
+            return []
+
+        exact_matches = []
+        prefix_matches = []
+        contains_matches = []
+        for member in getattr(guild, "members", []) or []:
+            names = self._member_search_names(member)
+            if not names:
+                continue
+
+            if query_norm in names:
+                exact_matches.append(member)
+            elif any(name.startswith(query_norm) for name in names):
+                prefix_matches.append(member)
+            elif any(query_norm in name for name in names):
+                contains_matches.append(member)
+
+        deduped = []
+        seen = set()
+        for member in [*exact_matches, *prefix_matches, *contains_matches]:
+            member_id = getattr(member, "id", None)
+            if member_id is None or member_id in seen:
+                continue
+            seen.add(member_id)
+            deduped.append(member)
+            if len(deduped) >= limit:
+                break
+
+        return deduped
+
+    def _member_search_names(self, member: discord.Member) -> List[str]:
+        names = [
+            getattr(member, "display_name", None),
+            getattr(member, "name", None),
+            getattr(member, "global_name", None),
+            getattr(member, "nick", None),
+        ]
+        return [self._normalize_user_query(value) for value in names if value]
+
+    def _normalize_user_query(self, value: str) -> str:
+        return re.sub(r"\s+", " ", str(value or "").strip().casefold())
+
+    def _is_default_role(self, role: Optional[discord.Role], guild: Optional[discord.Guild]) -> bool:
+        if role is None or guild is None:
+            return False
+        default_role = getattr(guild, "default_role", None)
+        return bool(default_role and getattr(role, "id", None) == getattr(default_role, "id", None))
+
+    def _asset_url(self, asset: Any) -> Optional[str]:
+        if not asset:
+            return None
+        return getattr(asset, "url", None) or str(asset)
+
+    def _format_color(self, color: Any) -> Optional[Dict[str, Any]]:
+        if color is None:
+            return None
+        value = getattr(color, "value", None)
+        if value is None:
+            try:
+                value = int(color)
+            except (TypeError, ValueError):
+                value = None
+        if value is None:
+            return None
+        return {
+            "value": int(value),
+            "hex": f"#{int(value):06x}",
+        }
+
+    def _duration_seconds(self, duration: Any) -> Optional[int]:
+        if duration is None:
+            return None
+        try:
+            return int(duration.total_seconds())
+        except Exception:
+            try:
+                return int(duration)
+            except (TypeError, ValueError):
+                return None
+
+    def _isoformat(self, value: Any) -> Optional[str]:
+        if not value:
+            return None
+        try:
+            if hasattr(value, "tzinfo") and value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            return value.astimezone(timezone.utc).isoformat()
+        except Exception:
+            return None
+
+    def _drop_empty(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        cleaned = {}
+        for key, value in (data or {}).items():
+            if value is None or value == "" or value == [] or value == {}:
+                continue
+            cleaned[key] = value
+        return cleaned
 
     def _parse_optional_int(self, value: Any) -> Optional[int]:
         if value in (None, ""):

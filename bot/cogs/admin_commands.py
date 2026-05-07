@@ -125,6 +125,19 @@ class AdminCommands(commands.Cog):
                 rows.append((full_key, value))
         return rows
 
+    def _coerce_bool(self, value, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "y", "on"}:
+                return True
+            if normalized in {"false", "0", "no", "n", "off"}:
+                return False
+        if value is None:
+            return default
+        return bool(value)
+
     @channel_group.command(name="override", description="Override global settings for a specific channel.")
     @app_commands.checks.has_permissions(administrator=True)
     async def channel_override(self, interaction: discord.Interaction, channel: discord.TextChannel, model: str = None, behavior_prompt: str = None, summarize_every_messages: int = None):
@@ -213,6 +226,79 @@ class AdminCommands(commands.Cog):
         await interaction.followup.send(
             f"{target_channel.mention} is now {action} for LLM-generated output.",
             ephemeral=True
+        )
+
+    @llm_group.command(name="decision", description="View or toggle the ambient decision model.")
+    @app_commands.describe(
+        enabled="True enables ambient decisions; false only replies to direct mentions/replies. Leave empty to view status.",
+        channel="Optional channel override. Leave empty to update the server default."
+    )
+    @app_commands.checks.has_permissions(administrator=True)
+    async def llm_decision(
+        self,
+        interaction: discord.Interaction,
+        enabled: Optional[bool] = None,
+        channel: Optional[discord.TextChannel] = None
+    ):
+        await interaction.response.defer(ephemeral=True)
+
+        guild_id = str(interaction.guild.id)
+
+        if enabled is None:
+            target_channel = channel or interaction.channel
+            if not isinstance(target_channel, (discord.TextChannel, discord.Thread)):
+                await interaction.followup.send("This command can only inspect text channels or threads.", ephemeral=True)
+                return
+
+            current_settings = await self.bot.context_manager.get_guild_and_channel_settings(guild_id, str(target_channel.id))
+            default_enabled = getattr(self.bot.config, "DECISION_LLM_ENABLED", True)
+            effective_enabled = self._coerce_bool(
+                current_settings.get("decision_llm_enabled"),
+                default=default_enabled,
+            )
+
+            guild_settings = await self.bot.store.get_guild_settings(guild_id)
+            server_value = guild_settings.get("decision_llm_enabled", default_enabled)
+            channel_value = (
+                guild_settings
+                .get("channel_overrides", {})
+                .get(str(target_channel.id), {})
+                .get("decision_llm_enabled")
+            )
+
+            channel_line = "unset" if channel_value is None else str(self._coerce_bool(channel_value, default=default_enabled))
+            await interaction.followup.send(
+                "\n".join([
+                    f"Decision model effective for {target_channel.mention}: {effective_enabled}",
+                    f"Server default: {self._coerce_bool(server_value, default=default_enabled)}",
+                    f"Channel override: {channel_line}",
+                ]),
+                ephemeral=True,
+            )
+            return
+
+        settings = await self.bot.store.get_settings()
+        guild_settings = settings.setdefault(guild_id, {})
+
+        if channel:
+            channel_overrides = guild_settings.setdefault("channel_overrides", {})
+            channel_settings = channel_overrides.setdefault(str(channel.id), {})
+            channel_settings["decision_llm_enabled"] = bool(enabled)
+            scope_text = channel.mention
+        else:
+            guild_settings["decision_llm_enabled"] = bool(enabled)
+            scope_text = "this server"
+
+        await self.bot.store.save_settings(settings)
+
+        mode_text = (
+            "enabled. The bot may use the decision model for ambient replies/reactions."
+            if enabled
+            else "disabled. The bot will only answer direct mentions/replies."
+        )
+        await interaction.followup.send(
+            f"Decision model is now {mode_text} Scope: {scope_text}",
+            ephemeral=True,
         )
 
     @context_group.command(name="reset", description="Reset the bot's context for a channel or the entire server.")

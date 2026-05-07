@@ -74,6 +74,7 @@ Now, open the `.env` file in a text editor and fill in the required values:
 
 -   `DISCORD_TOKEN`: Your Discord bot's token. You can get this from the [Discord Developer Portal](https://discord.com/developers/applications).
 -   `MAIN_LLM_MODEL` & `DECISION_LLM_MODEL`: The model strings for your chosen LLM provider (e.g., `gpt-4o`, `gemini/gemini-1.5-pro-latest`).
+-   `DECISION_LLM_ENABLED`: Set to `False` to disable ambient reply/reaction decisions; the bot will only answer direct mentions/replies.
 -   **API Keys**: Add the API keys for the LLM providers you intend to use (e.g., `OPENAI_API_KEY`, `GEMINI_API_KEY`).
 -   `REPLY_CHAIN_DEBOUNCE_SECONDS`: How long the bot waits for same-user message fragments before deciding whether to reply. Defaults to `2.0`.
 -   `REPLY_CHAIN_WAIT_FOR_TYPING`, `REPLY_CHAIN_TYPING_MAX_WAIT_SECONDS`, and `REPLY_CHAIN_LONG_TYPING_SECONDS`: Let the bot wait while the user is still typing, with a max wait and optional long-typing joke/GIF decision.
@@ -99,6 +100,7 @@ If everything is set up correctly, you will see a confirmation message in your c
 All administrative tasks are handled via slash commands. You must have administrative permissions on the server to use these.
 
 -   `/llm settings`: Configure the primary LLM model, behavior prompt, and summary triggers for the entire server.
+-   `/llm decision`: View or toggle the decision model. Disabling it makes the bot answer only direct mentions/replies.
 -   `/channel override`: Set channel-specific models, prompts, and settings that override the server-wide configuration.
 -   `/context reset`: Clear the bot's conversational context for a channel or the entire server.
 -   `/note`: Manage user profiles.
