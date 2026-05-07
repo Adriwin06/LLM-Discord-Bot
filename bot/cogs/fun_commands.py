@@ -3,6 +3,7 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import aiohttp
+import logging
 import types
 import re
 from .utilities import MessageChunker
@@ -183,8 +184,28 @@ Generate a similar response that's playful and uplifting, but don't copy these e
 
         await interaction.response.defer()
         
-        # Get the user's avatar URL
-        avatar_url = user.display_avatar.url
+        # Get the user's avatar URL. Animated Discord avatars need to be requested
+        # as GIFs explicitly; the default URL can point at a static rendition.
+        avatar_asset = user.display_avatar
+        avatar_is_animated = False
+        if hasattr(avatar_asset, "is_animated"):
+            avatar_is_animated = avatar_asset.is_animated()
+
+        avatar_ext = "gif" if avatar_is_animated else "png"
+        try:
+            if avatar_is_animated:
+                avatar_asset = avatar_asset.replace(format="gif", size=1024)
+            else:
+                avatar_asset = avatar_asset.replace(static_format="png", size=1024)
+        except Exception as asset_error:
+            logging.warning(
+                "Could not normalize avatar asset URL for user_id=%s animated=%s: %s",
+                getattr(user, "id", "unknown"),
+                avatar_is_animated,
+                asset_error,
+            )
+
+        avatar_url = avatar_asset.url
         print(f"DEBUG: Avatar URL: {avatar_url}")
         
         try:
@@ -202,19 +223,25 @@ Generate a similar response that's playful and uplifting, but don't copy these e
                 # Create a mock attachment object to reuse the context manager's processing
                 mock_attachment = types.SimpleNamespace()
                 mock_attachment.url = avatar_url
-                mock_attachment.filename = f"{user.display_name}_avatar.png"
+                mock_attachment.filename = f"{user.display_name}_avatar.{avatar_ext}"
+                mock_attachment.content_type = "image/gif" if avatar_is_animated else f"image/{avatar_ext}"
                 
                 # Detect if it's a GIF and set appropriate filename
-                if '.gif' in avatar_url or '?format=gif' in avatar_url:
+                if avatar_is_animated or '.gif' in avatar_url.lower() or '?format=gif' in avatar_url.lower():
                     mock_attachment.filename = f"{user.display_name}_avatar.gif"
+                    mock_attachment.content_type = "image/gif"
                     print(f"DEBUG: Detected GIF, filename: {mock_attachment.filename}")
                 
                 # Get the attachment size for processing
-                async with self.session.head(avatar_url) as response:
-                    if response.status == 200:
-                        mock_attachment.size = int(response.headers.get('content-length', 0))
-                    else:
-                        mock_attachment.size = 0
+                try:
+                    async with self.session.head(avatar_url, allow_redirects=True) as response:
+                        if response.status == 200:
+                            mock_attachment.size = int(response.headers.get('content-length', 0))
+                        else:
+                            mock_attachment.size = 0
+                except aiohttp.ClientError as head_error:
+                    logging.warning("Could not read avatar size for %s: %s", avatar_url, head_error)
+                    mock_attachment.size = 0
                 print(f"DEBUG: Attachment size: {mock_attachment.size}")
                 
                 # Get media settings for this guild/channel
@@ -223,11 +250,12 @@ Generate a similar response that's playful and uplifting, but don't copy these e
                 )
                 media_settings = settings.get("media", {})
                 
-                # Increase size limit for avatar processing since Discord avatars can be quite large
+                # Increase size limit for avatar processing since animated Discord
+                # avatars can be much larger than normal image attachments.
                 if "images" not in media_settings:
                     media_settings["images"] = {}
-                if "max_size_mb" not in media_settings["images"]:
-                    media_settings["images"]["max_size_mb"] = 25  # Increase to 25MB for avatars
+                current_avatar_limit = media_settings["images"].get("max_size_mb", 0) or 0
+                media_settings["images"]["max_size_mb"] = max(current_avatar_limit, 100)
                 print(f"DEBUG: Media settings: {media_settings}")
                 
                 # Process the avatar using the context manager
