@@ -629,6 +629,15 @@ class ContextManager:
     def _is_video_file(self, mime_type: str, file_ext: str) -> bool:
         return bool((mime_type and mime_type.startswith("video/")) or file_ext in VIDEO_EXTENSIONS)
 
+    def _image_content_part(self, url: str, file_bytes: bytes = None, mime_type: str = None, model_name: str = None) -> dict:
+        image_url = url
+        if file_bytes and self.llm_provider.prefers_inline_image_data(model_name):
+            image_mime = mime_type if mime_type and mime_type.startswith("image/") else "image/jpeg"
+            encoded_image = base64.b64encode(file_bytes).decode()
+            image_url = f"data:{image_mime};base64,{encoded_image}"
+
+        return {"type": "image_url", "image_url": {"url": image_url}}
+
     async def _write_temp_file(self, file_bytes: bytes, file_ext: str) -> str:
         suffix = f".{file_ext.lstrip('.')}" if file_ext else ""
         return await asyncio.to_thread(self._write_temp_file_sync, file_bytes, suffix)
@@ -1128,7 +1137,7 @@ class ContextManager:
                                 # Validate that we have image data before trying to process it
                                 if len(file_bytes) == 0:
                                     logging.warning(f"No data received for {attachment.filename}")
-                                    return {"type": "image_url", "image_url": {"url": attachment.url}}
+                                    return self._image_content_part(attachment.url, model_name=model_name)
                                 
                                 gif = Image.open(io.BytesIO(file_bytes))
                                 
@@ -1220,23 +1229,23 @@ class ContextManager:
                                         }
                                     else:
                                         # Fallback to treating as static image
-                                        return {"type": "image_url", "image_url": {"url": attachment.url}}
+                                        return self._image_content_part(attachment.url, file_bytes, mime_type, model_name)
                                 else:
                                     # Static GIF, treat as regular image
-                                    return {"type": "image_url", "image_url": {"url": attachment.url}}
+                                    return self._image_content_part(attachment.url, file_bytes, mime_type, model_name)
                             except Exception as e:
                                 logging.warning(f"Failed to process potential GIF {attachment.filename} from {attachment.url}: {type(e).__name__}: {e}")
                                 # Check if this was an image format issue
                                 if "cannot identify image file" in str(e).lower() or "truncated" in str(e).lower():
                                     logging.info(f"Image format issue with {attachment.filename}, might not be a valid image file")
                                 # Fallback to treating as static image
-                                return {"type": "image_url", "image_url": {"url": attachment.url}}
+                                return self._image_content_part(attachment.url, model_name=model_name)
                         else:
                             # GIF frame extraction disabled, treat as static image
-                            return {"type": "image_url", "image_url": {"url": attachment.url}}
+                            return self._image_content_part(attachment.url, file_bytes, mime_type, model_name)
                     else:
                         # Regular static image
-                        return {"type": "image_url", "image_url": {"url": attachment.url}}
+                        return self._image_content_part(attachment.url, file_bytes, mime_type, model_name)
                 else:
                     # Fallback: OCR for text-only models
                     if images_config.get("ocr_enabled", True) and TESSERACT_AVAILABLE:

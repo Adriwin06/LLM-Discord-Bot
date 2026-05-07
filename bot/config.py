@@ -34,6 +34,13 @@ class Config:
         self.MAIN_LLM_RATE_LIMIT_SECONDS = float(os.getenv("MAIN_LLM_RATE_LIMIT_SECONDS", 2))
         self.DECISION_LLM_RATE_LIMIT_ENABLED = os.getenv("DECISION_LLM_RATE_LIMIT_ENABLED", "False").lower() == "true"
         self.DECISION_LLM_RATE_LIMIT_SECONDS = float(os.getenv("DECISION_LLM_RATE_LIMIT_SECONDS", 0.5))
+        self.REPLY_CHAIN_DEBOUNCE_ENABLED = os.getenv("REPLY_CHAIN_DEBOUNCE_ENABLED", "True").lower() == "true"
+        self.REPLY_CHAIN_DEBOUNCE_SECONDS = float(os.getenv("REPLY_CHAIN_DEBOUNCE_SECONDS", 2.0))
+        self.REPLY_CHAIN_WAIT_FOR_TYPING = os.getenv("REPLY_CHAIN_WAIT_FOR_TYPING", "True").lower() == "true"
+        self.REPLY_CHAIN_TYPING_MAX_WAIT_SECONDS = float(os.getenv("REPLY_CHAIN_TYPING_MAX_WAIT_SECONDS", 12.0))
+        self.REPLY_CHAIN_LONG_TYPING_SECONDS = float(os.getenv("REPLY_CHAIN_LONG_TYPING_SECONDS", 10.0))
+        self.TYPING_ACTIVE_SECONDS = float(os.getenv("TYPING_ACTIVE_SECONDS", 8.0))
+        self.GIFS_ENABLED = os.getenv("GIFS_ENABLED", "True").lower() == "true"
 
         # Web Search Configuration
         self.WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "True").lower() == "true"

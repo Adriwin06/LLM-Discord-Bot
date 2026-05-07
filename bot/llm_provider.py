@@ -2,7 +2,10 @@
 import litellm
 from litellm import acompletion
 import asyncio
+import json
 import logging
+import os
+import urllib.request
 from .config import Config
 
 class LiteLLMProvider:
@@ -25,6 +28,7 @@ class LiteLLMProvider:
         self.main_llm_last_call = 0
         self.decision_llm_last_call = 0
         self.last_error = None
+        self._capability_cache = {}
 
     async def _rate_limit(self, limiter_type: str):
         """
@@ -162,20 +166,78 @@ class LiteLLMProvider:
         return f"{error_type} from {model}: {message}"
 
     def supports_vision(self, model: str) -> bool:
-        # Check if LiteLLM has built-in support detection
-        try:
-            # LiteLLM may not have this function, so we'll implement our own logic
-            vision_models = [
-                "gpt-4-vision", "gpt-4o", "gpt-4o-mini", 
-                "gemini-pro-vision", "gemini-1.5-pro", "gemini-1.5-flash", 
-                "gemini-2.5-flash", "claude-3-opus", "claude-3-sonnet", "claude-3-haiku"
-            ]
-            return any(vm in model.lower() for vm in vision_models)
-        except Exception:
-            # Fallback: assume new Gemini models support vision
-            if "gemini" in model.lower():
-                return True
+        if not model:
             return False
+
+        cache_key = ("vision", model.lower())
+        if cache_key in self._capability_cache:
+            return self._capability_cache[cache_key]
+
+        try:
+            if litellm.supports_vision(model=model):
+                self._capability_cache[cache_key] = True
+                return True
+        except Exception as e:
+            logging.debug(f"LiteLLM vision detection failed for model {model}: {e}")
+
+        supports = self._ollama_model_has_capability(model, "vision")
+        if supports is None:
+            return False
+
+        self._capability_cache[cache_key] = supports
+        return supports
+
+    def prefers_inline_image_data(self, model: str) -> bool:
+        """Return True when the provider works best with base64 image data."""
+        return self._ollama_model_name(model) is not None
+
+    def _ollama_model_name(self, model: str):
+        if not model:
+            return None
+
+        model_s = model.strip()
+        model_l = model_s.lower()
+        for prefix in ("ollama_chat/", "ollama/"):
+            if model_l.startswith(prefix):
+                return model_s[len(prefix):]
+        return None
+
+    def _ollama_model_has_capability(self, model: str, capability: str) -> bool | None:
+        ollama_model = self._ollama_model_name(model)
+        if not ollama_model:
+            return False
+
+        cache_key = ("ollama", ollama_model.lower(), capability.lower())
+        if cache_key in self._capability_cache:
+            return self._capability_cache[cache_key]
+
+        api_base = (
+            os.getenv("OLLAMA_API_BASE")
+            or os.getenv("OLLAMA_HOST")
+            or "http://127.0.0.1:11434"
+        ).rstrip("/")
+        if not api_base.startswith(("http://", "https://")):
+            api_base = f"http://{api_base}"
+        if api_base.endswith("/v1"):
+            api_base = api_base[:-3]
+
+        try:
+            payload = json.dumps({"model": ollama_model}).encode("utf-8")
+            request = urllib.request.Request(
+                f"{api_base}/api/show",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=2) as response:
+                model_info = json.load(response)
+            capabilities = model_info.get("capabilities") or []
+            supports = capability.lower() in {str(item).lower() for item in capabilities}
+            self._capability_cache[cache_key] = supports
+            return supports
+        except Exception as e:
+            logging.debug(f"Could not inspect Ollama model capabilities for {ollama_model}: {e}")
+            return None
 
     def supports_audio(self, model: str) -> bool:
         # LiteLLM doesn't have a direct audio support check, so we can maintain a list

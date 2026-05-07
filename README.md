@@ -75,6 +75,9 @@ Now, open the `.env` file in a text editor and fill in the required values:
 -   `DISCORD_TOKEN`: Your Discord bot's token. You can get this from the [Discord Developer Portal](https://discord.com/developers/applications).
 -   `MAIN_LLM_MODEL` & `DECISION_LLM_MODEL`: The model strings for your chosen LLM provider (e.g., `gpt-4o`, `gemini/gemini-1.5-pro-latest`).
 -   **API Keys**: Add the API keys for the LLM providers you intend to use (e.g., `OPENAI_API_KEY`, `GEMINI_API_KEY`).
+-   `REPLY_CHAIN_DEBOUNCE_SECONDS`: How long the bot waits for same-user message fragments before deciding whether to reply. Defaults to `2.0`.
+-   `REPLY_CHAIN_WAIT_FOR_TYPING`, `REPLY_CHAIN_TYPING_MAX_WAIT_SECONDS`, and `REPLY_CHAIN_LONG_TYPING_SECONDS`: Let the bot wait while the user is still typing, with a max wait and optional long-typing joke/GIF decision.
+-   `GIFS_ENABLED`: Lets the decision model choose from a small curated GIF set when a GIF is funnier or more logical than text.
 -   `WEB_SEARCH_CONTEXT_SIZE`: Controls the amount of web search context (options: `low`, `medium`, `high`). Only applies to models that support web search like `openai/gpt-4o-search-preview`, `gemini/gemini-2.0-flash`, etc.
 -   `LOCAL_STT_MODEL`, `LOCAL_STT_DEVICE`, and `LOCAL_STT_COMPUTE_TYPE`: Configure local speech-to-text for audio and video attachments. Defaults are CPU-friendly (`base`, `cpu`, `int8`); use `cuda`/`float16` if you have a compatible GPU. `faster-whisper` may download the selected model on first use unless `LOCAL_STT_MODEL` points at a local model path.
 -   Customize other settings like the behavior prompt, rate limits, and backup interval as needed.

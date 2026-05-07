@@ -10,6 +10,33 @@ from datetime import datetime, timezone
 from .utilities import MessageChunker
 
 class EventHandler(commands.Cog):
+    GIF_LIBRARY = {
+        "typing": {
+            "url": "https://media.giphy.com/media/13GIgrGdslD9oQ/giphy.gif",
+            "description": "someone intensely typing at a computer",
+        },
+        "waiting": {
+            "url": "https://media.giphy.com/media/l0HlBO7eyXzSZkJri/giphy.gif",
+            "description": "waiting patiently",
+        },
+        "popcorn": {
+            "url": "https://media.giphy.com/media/tyqcJoNjNv0Fq/giphy.gif",
+            "description": "watching drama with popcorn",
+        },
+        "laugh": {
+            "url": "https://media.giphy.com/media/10JhviFuU2gWD6/giphy.gif",
+            "description": "laughing hard",
+        },
+        "thumbs_up": {
+            "url": "https://media.giphy.com/media/111ebonMs90YLu/giphy.gif",
+            "description": "quick approval",
+        },
+        "mind_blown": {
+            "url": "https://media.giphy.com/media/26ufdipQqU2lhNA4g/giphy.gif",
+            "description": "mind blown",
+        },
+    }
+
     def __init__(self, bot):
         self.bot = bot
         # Lock to prevent multiple messages from triggering summaries/profiles simultaneously
@@ -18,6 +45,32 @@ class EventHandler(commands.Cog):
         self._seen_message_limit = 1000
         self._summary_tasks = set()
         self._profile_tasks = set()
+        self._pending_reply_tasks = {}
+        self._pending_reply_chains = {}
+        self._typing_state = {}
+
+    def cog_unload(self):
+        for task in self._pending_reply_tasks.values():
+            task.cancel()
+
+    @commands.Cog.listener()
+    async def on_typing(self, channel, user, when):
+        if getattr(user, "bot", False):
+            return
+
+        guild = getattr(channel, "guild", None)
+        if not guild:
+            return
+
+        key = (str(guild.id), str(channel.id), str(user.id))
+        now = self._utc_now()
+        existing = self._typing_state.get(key)
+        first_typing_at = existing.get("first_typing_at") if existing and self._is_typing_state_active(existing) else now
+        self._typing_state[key] = {
+            "first_typing_at": first_typing_at,
+            "last_typing_at": now,
+        }
+        self._prune_typing_state()
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -39,16 +92,7 @@ class EventHandler(commands.Cog):
             # Update counters and trigger summaries/profiles
             await self._update_counters_and_triggers(message, settings)
 
-            # Decision making
-            should_reply, reaction = await self._should_reply_or_react(message, settings)
-
-            if should_reply:
-                await self._generate_and_send_reply(message, settings)
-            elif reaction:
-                try:
-                    await message.add_reaction(reaction)
-                except discord.HTTPException:
-                    logging.warning(f"Failed to add reaction '{reaction}'. It might be an invalid or custom emoji not available.")
+        await self._queue_reply_decision(message, settings)
 
     def _claim_message(self, message_id: int) -> bool:
         """Return False if this Discord message was already handled recently."""
@@ -60,21 +104,266 @@ class EventHandler(commands.Cog):
             self._seen_message_ids.popitem(last=False)
         return True
 
-    async def _should_reply_or_react(self, message: discord.Message, settings: dict):
-        # Bypass commands - don't trigger LLM for messages starting with "!"
+    async def _queue_reply_decision(self, message: discord.Message, settings: dict):
         if message.content.startswith("!"):
-            return False, None
-        
-        # Bypass conditions
+            return
+
+        debounce_seconds = self._reply_chain_debounce_seconds(settings)
+        if debounce_seconds <= 0:
+            await self._process_reply_decision(message, settings, chain_messages=[message])
+            return
+
+        key = self._reply_chain_key(message)
+        force_reply = self._is_direct_interaction(message, settings)
+        chain = self._pending_reply_chains.get(key)
+        if chain:
+            chain["messages"].append(message)
+            chain["latest_message"] = message
+            chain["settings"] = settings
+            chain["force_reply"] = bool(chain.get("force_reply")) or force_reply
+        else:
+            self._pending_reply_chains[key] = {
+                "started_at": self._utc_now(),
+                "messages": [message],
+                "latest_message": message,
+                "settings": settings,
+                "force_reply": force_reply,
+                "long_typing": False,
+            }
+
+        existing_task = self._pending_reply_tasks.get(key)
+        if existing_task and not existing_task.done():
+            existing_task.cancel()
+
+        task = asyncio.create_task(self._run_debounced_reply_decision(key, message.id, debounce_seconds))
+        self._pending_reply_tasks[key] = task
+
+    async def _run_debounced_reply_decision(self, key: tuple, latest_message_id: int, debounce_seconds: float):
+        try:
+            await asyncio.sleep(debounce_seconds)
+        except asyncio.CancelledError:
+            return
+
+        chain = self._pending_reply_chains.get(key)
+        if not chain or getattr(chain.get("latest_message"), "id", None) != latest_message_id:
+            return
+
+        try:
+            await self._wait_for_typing_to_pause(key, chain, debounce_seconds)
+        except asyncio.CancelledError:
+            return
+
+        chain = self._pending_reply_chains.get(key)
+        if not chain or getattr(chain.get("latest_message"), "id", None) != latest_message_id:
+            return
+
+        current_task = asyncio.current_task()
+        if self._pending_reply_tasks.get(key) is current_task:
+            self._pending_reply_tasks.pop(key, None)
+        self._pending_reply_chains.pop(key, None)
+
+        latest_message = chain["latest_message"]
+        try:
+            await self._process_reply_decision(
+                latest_message,
+                chain["settings"],
+                force_reply=bool(chain.get("force_reply")),
+                chain_messages=chain.get("messages") or [latest_message],
+                long_typing=bool(chain.get("long_typing")),
+            )
+        except Exception as e:
+            logging.error(f"Debounced reply decision failed for message {latest_message.id}: {e}")
+
+    async def _process_reply_decision(
+        self,
+        message: discord.Message,
+        settings: dict,
+        *,
+        force_reply: bool = False,
+        chain_messages: list = None,
+        long_typing: bool = False,
+    ):
+        chain_messages = chain_messages or [message]
+        decision = await self._decide_message_action(
+            message,
+            settings,
+            force_reply=force_reply,
+            chain_messages=chain_messages,
+            long_typing=long_typing,
+        )
+
+        if self._has_pending_newer_chain(message):
+            logging.info(f"Skipping reply/reaction for message {message.id}; a newer same-user message chain is pending.")
+            return
+
+        action = str(decision.get("action", "none")).lower()
+        if action == "reply":
+            await self._generate_and_send_reply(
+                message,
+                settings,
+                chain_messages=chain_messages,
+                long_typing=long_typing,
+            )
+        elif action == "react" and decision.get("reaction"):
+            try:
+                await message.add_reaction(decision["reaction"])
+            except discord.HTTPException:
+                logging.warning(f"Failed to add reaction '{decision['reaction']}'. It might be an invalid or custom emoji not available.")
+        elif action == "gif":
+            await self._send_gif_decision(message, settings, decision)
+
+    def _reply_chain_key(self, message: discord.Message) -> tuple:
+        return (str(message.guild.id), str(message.channel.id), str(message.author.id))
+
+    def _reply_chain_debounce_seconds(self, settings: dict) -> float:
+        enabled = settings.get(
+            "reply_chain_debounce_enabled",
+            getattr(self.bot.config, "REPLY_CHAIN_DEBOUNCE_ENABLED", True),
+        )
+        if not self._coerce_bool(enabled, default=True):
+            return 0.0
+
+        value = settings.get(
+            "reply_chain_debounce_seconds",
+            getattr(self.bot.config, "REPLY_CHAIN_DEBOUNCE_SECONDS", 2.0),
+        )
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            return 2.0
+
+    async def _wait_for_typing_to_pause(self, key: tuple, chain: dict, debounce_seconds: float):
+        if not self._typing_wait_enabled(chain["settings"]):
+            return
+
+        poll_seconds = max(0.5, min(1.5, debounce_seconds))
+        while self._is_user_typing(key):
+            elapsed = self._chain_elapsed_seconds(chain)
+            if elapsed >= self._long_typing_seconds(chain["settings"]):
+                chain["long_typing"] = True
+                logging.info(f"Processing message chain for {key}; user has been typing for {elapsed:.1f}s.")
+                return
+
+            if elapsed >= self._typing_max_wait_seconds(chain["settings"]):
+                logging.info(f"Processing message chain for {key}; typing wait reached {elapsed:.1f}s.")
+                return
+
+            await asyncio.sleep(poll_seconds)
+
+    def _typing_wait_enabled(self, settings: dict) -> bool:
+        value = settings.get(
+            "reply_chain_wait_for_typing",
+            getattr(self.bot.config, "REPLY_CHAIN_WAIT_FOR_TYPING", True),
+        )
+        return self._coerce_bool(value, default=True)
+
+    def _typing_active_seconds(self) -> float:
+        try:
+            return max(1.0, float(getattr(self.bot.config, "TYPING_ACTIVE_SECONDS", 8.0)))
+        except (TypeError, ValueError):
+            return 8.0
+
+    def _typing_max_wait_seconds(self, settings: dict) -> float:
+        value = settings.get(
+            "reply_chain_typing_max_wait_seconds",
+            getattr(self.bot.config, "REPLY_CHAIN_TYPING_MAX_WAIT_SECONDS", 12.0),
+        )
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            return 12.0
+
+    def _long_typing_seconds(self, settings: dict) -> float:
+        value = settings.get(
+            "reply_chain_long_typing_seconds",
+            getattr(self.bot.config, "REPLY_CHAIN_LONG_TYPING_SECONDS", 10.0),
+        )
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            return 10.0
+
+    def _chain_elapsed_seconds(self, chain: dict) -> float:
+        started_at = chain.get("started_at")
+        if not isinstance(started_at, datetime):
+            return 0.0
+        return max(0.0, (self._utc_now() - started_at).total_seconds())
+
+    def _is_user_typing(self, key: tuple) -> bool:
+        state = self._typing_state.get(key)
+        if not state:
+            return False
+        if self._is_typing_state_active(state):
+            return True
+        self._typing_state.pop(key, None)
+        return False
+
+    def _is_typing_state_active(self, state: dict) -> bool:
+        last_typing_at = state.get("last_typing_at")
+        if not isinstance(last_typing_at, datetime):
+            return False
+        return (self._utc_now() - last_typing_at).total_seconds() <= self._typing_active_seconds()
+
+    def _prune_typing_state(self):
+        stale_keys = [
+            key
+            for key, state in self._typing_state.items()
+            if not self._is_typing_state_active(state)
+        ]
+        for key in stale_keys:
+            self._typing_state.pop(key, None)
+
+    def _utc_now(self) -> datetime:
+        return datetime.now(timezone.utc)
+
+    def _coerce_bool(self, value, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "y", "on"}:
+                return True
+            if normalized in {"false", "0", "no", "n", "off"}:
+                return False
+        if value is None:
+            return default
+        return bool(value)
+
+    def _is_direct_interaction(self, message: discord.Message, settings: dict) -> bool:
         resolved_reference = message.reference.resolved if message.reference else None
         reference_author = getattr(resolved_reference, "author", None)
         is_reply_to_bot = reference_author == self.bot.user
         mentions_bot = self.bot.user in message.mentions
+        bypass_on_reply = self._coerce_bool(settings.get("bypass_on_reply"), default=True)
+        bypass_on_ping = self._coerce_bool(settings.get("bypass_on_ping"), default=True)
+        return (
+            bypass_on_reply and is_reply_to_bot
+        ) or (
+            bypass_on_ping and mentions_bot
+        )
 
-        if (settings.get("bypass_on_reply", True) and is_reply_to_bot) or \
-           (settings.get("bypass_on_ping", True) and mentions_bot):
+    def _has_pending_newer_chain(self, message: discord.Message) -> bool:
+        chain = self._pending_reply_chains.get(self._reply_chain_key(message))
+        latest_message = chain.get("latest_message") if chain else None
+        return bool(latest_message and latest_message.id != message.id)
+
+    async def _decide_message_action(
+        self,
+        message: discord.Message,
+        settings: dict,
+        *,
+        force_reply: bool = False,
+        chain_messages: list = None,
+        long_typing: bool = False,
+    ):
+        # Bypass commands - don't trigger LLM for messages starting with "!"
+        if message.content.startswith("!"):
+            return {"action": "none"}
+
+        # Bypass conditions
+        if force_reply or self._is_direct_interaction(message, settings):
             logging.info(f"Bypassing decision model for message {message.id} due to direct interaction.")
-            return True, None
+            return {"action": "reply"}
 
         # Use decision LLM with context built specifically for that model
         decision_model = settings.get("decision_llm_model", self.bot.config.DECISION_LLM_MODEL)
@@ -86,22 +375,38 @@ class EventHandler(commands.Cog):
         else:
             # Build context specifically for the decision model
             decision_context, _ = await self.bot.context_manager.build_context(message, model_name=decision_model)
+        decision_context = self._with_message_chain_context(decision_context, chain_messages, long_typing=long_typing)
         
         decision_prompt = """
         You are a decision-making model for a Discord bot.
-        Based on the provided context, decide if the bot should reply, react with an emoji, or do nothing.
+        Based on the provided context, decide if the bot should reply, react with an emoji, send a GIF, or do nothing.
         The final user message is the only live message to judge; earlier conversation history is background context only.
+        If a current same-user message chain note is present, treat that chain as the live message to judge.
         The bot should reply if it's directly addressed, asked a question, or can provide a meaningful contribution.
         The bot should react if the message is emotional, a simple acknowledgement is needed, or contains engaging media.
+        The bot may send a GIF only when it is clearly funny, logical, and low-risk for the current context.
+        Do not send GIFs for serious, sensitive, sad, medical, legal, financial, or moderation-related contexts.
+        If a long-typing note is present, you may choose a light joke or a typing/waiting GIF if it fits.
         Otherwise, the bot should do nothing.
+
+        Available GIF keys:
+        typing: someone intensely typing at a computer
+        waiting: waiting patiently
+        popcorn: watching drama with popcorn
+        laugh: laughing hard
+        thumbs_up: quick approval
+        mind_blown: mind blown
         
-        Respond with a single JSON object with two keys:
-        1. "action": a string, either "reply", "react", or "none".
+        Respond with a single JSON object with four keys:
+        1. "action": a string, either "reply", "react", "gif", or "none".
         2. "reaction": a string containing a single emoji if the action is "react", otherwise null.
+        3. "gif_key": one available GIF key if the action is "gif", otherwise null.
+        4. "caption": a short caption if the action is "gif" and text would improve it, otherwise null.
         
-        Example: {"action": "reply", "reaction": null}
-        Example: {"action": "react", "reaction": "👍"}
-        Example: {"action": "none", "reaction": null}
+        Example: {"action": "reply", "reaction": null, "gif_key": null, "caption": null}
+        Example: {"action": "react", "reaction": "👍", "gif_key": null, "caption": null}
+        Example: {"action": "gif", "reaction": null, "gif_key": "typing", "caption": "bro is writing chapter 4"}
+        Example: {"action": "none", "reaction": null, "gif_key": null, "caption": null}
         """
         
         decision_context[0]["content"] = decision_prompt
@@ -117,6 +422,7 @@ class EventHandler(commands.Cog):
             if decision_model != self.bot.config.MAIN_LLM_MODEL:
                 # Build context for main model and retry decision
                 main_context, _ = await self.bot.context_manager.build_context(message, model_name=self.bot.config.MAIN_LLM_MODEL)
+                main_context = self._with_message_chain_context(main_context, chain_messages, long_typing=long_typing)
                 main_context[0]["content"] = decision_prompt
                 
                 response = await self.bot.llm_provider.create_completion(
@@ -126,7 +432,7 @@ class EventHandler(commands.Cog):
                 )
             if not response or not response.choices:
                 logging.error(f"Both decision and main models failed to make a decision for message {message.id}.")
-                return False, None
+                return {"action": "none"}
 
         # Parse decision response
         try:
@@ -139,13 +445,15 @@ class EventHandler(commands.Cog):
             reaction = decision_json.get("reaction")
 
             if action == "reply":
-                return True, None
+                return {"action": "reply"}
             if action == "react" and reaction:
-                return False, reaction
-            return False, None
+                return {"action": "react", "reaction": reaction}
+            if action == "gif":
+                return self._normalize_gif_decision(decision_json, settings)
+            return {"action": "none"}
         except (json.JSONDecodeError, KeyError):
             logging.error(f"Failed to parse decision JSON: {response.choices[0].message.content}")
-            return False, None
+            return {"action": "none"}
 
     async def _update_counters_and_triggers(self, message: discord.Message, settings: dict):
         guild_id = str(message.guild.id)
@@ -268,7 +576,13 @@ class EventHandler(commands.Cog):
         except Exception as e:
             logging.error(f"Background {label} task for {key} failed: {e}")
 
-    async def _generate_and_send_reply(self, message: discord.Message, settings: dict):
+    async def _generate_and_send_reply(
+        self,
+        message: discord.Message,
+        settings: dict,
+        chain_messages: list = None,
+        long_typing: bool = False,
+    ):
         try:
             main_model = settings.get("model", self.bot.config.MAIN_LLM_MODEL)
             
@@ -276,6 +590,7 @@ class EventHandler(commands.Cog):
             async with message.channel.typing():
                 # Build context specifically for the main model (includes full media processing for that model)
                 main_context, _ = await self.bot.context_manager.build_context(message, model_name=main_model)
+                main_context = self._with_message_chain_context(main_context, chain_messages, long_typing=long_typing)
                 
                 content = await self._generate_reply_content(main_model, main_context, message, settings)
                 if not content:
@@ -288,6 +603,10 @@ class EventHandler(commands.Cog):
                 
                 # Resolve mentions
                 content = await self._resolve_mentions(content, message.guild)
+
+            if self._has_pending_newer_chain(message):
+                logging.info(f"Skipping generated reply for message {message.id}; a newer same-user message chain is pending.")
+                return
 
             # Handle message chunking (typing stops automatically when exiting the context)
             await MessageChunker.send_chunked_message(
@@ -312,6 +631,56 @@ class EventHandler(commands.Cog):
         error_text = self._safe_error_text(error_text)
         await message.reply(f"Sorry, I couldn't generate a reply.\n```text\n{error_text}\n```")
 
+    async def _send_gif_decision(self, message: discord.Message, settings: dict, decision: dict):
+        gif_key = decision.get("gif_key")
+        gif = self.GIF_LIBRARY.get(gif_key)
+        if not gif:
+            logging.warning(f"Decision model selected unknown GIF key '{gif_key}' for message {message.id}.")
+            return
+
+        caption = self._sanitize_gif_caption(decision.get("caption"))
+        content = gif["url"]
+        if caption:
+            content = f"{caption}\n{content}"
+
+        try:
+            await message.reply(content, mention_author=False)
+        except discord.HTTPException as e:
+            logging.warning(f"Failed to send GIF '{gif_key}' for message {message.id}: {e}")
+
+    def _normalize_gif_decision(self, decision_json: dict, settings: dict) -> dict:
+        if not self._gifs_enabled(settings):
+            return {"action": "none"}
+
+        gif_key = str(decision_json.get("gif_key") or "").strip().lower()
+        if gif_key not in self.GIF_LIBRARY:
+            return {"action": "none"}
+
+        return {
+            "action": "gif",
+            "gif_key": gif_key,
+            "caption": self._sanitize_gif_caption(decision_json.get("caption")),
+        }
+
+    def _gifs_enabled(self, settings: dict) -> bool:
+        value = settings.get(
+            "gifs_enabled",
+            getattr(self.bot.config, "GIFS_ENABLED", True),
+        )
+        return self._coerce_bool(value, default=True)
+
+    def _sanitize_gif_caption(self, caption: str, max_length: int = 180) -> str:
+        caption = str(caption or "").strip()
+        if not caption:
+            return ""
+
+        caption = caption.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+        caption = caption.replace("```", "'''")
+        caption = re.sub(r"\s+", " ", caption)
+        if len(caption) > max_length:
+            caption = caption[: max_length - 3].rstrip() + "..."
+        return caption
+
     def _safe_error_text(self, error_text: str, max_length: int = 1500) -> str:
         error_text = str(error_text or "Unknown error").strip()
 
@@ -332,6 +701,11 @@ class EventHandler(commands.Cog):
 
     async def _generate_reply_content(self, model: str, messages: list, origin_message: discord.Message, settings: dict):
         if not self._tools_enabled(settings):
+            response = await self.bot.llm_provider.create_completion(model=model, messages=messages)
+            return self._response_content(response)
+
+        if self._messages_have_image_content(messages):
+            logging.info(f"Skipping Discord tools for message {origin_message.id}; visual content is already attached to the model request.")
             response = await self.bot.llm_provider.create_completion(model=model, messages=messages)
             return self._response_content(response)
 
@@ -464,6 +838,21 @@ class EventHandler(commands.Cog):
 
         return True
 
+    def _messages_have_image_content(self, messages: list) -> bool:
+        for message in messages or []:
+            if self._content_has_image_part(message.get("content") if isinstance(message, dict) else None):
+                return True
+        return False
+
+    def _content_has_image_part(self, content) -> bool:
+        if isinstance(content, list):
+            return any(self._content_has_image_part(item) for item in content)
+        if not isinstance(content, dict):
+            return False
+        if content.get("type") in {"image_url", "input_image"}:
+            return True
+        return any(self._content_has_image_part(value) for value in content.values())
+
     def _preloaded_explicit_channel_summary_ids(self, messages: list) -> set:
         channel_ids = set()
         for message in messages:
@@ -499,6 +888,71 @@ class EventHandler(commands.Cog):
         except TypeError:
             serialized_arguments = str(arguments)
         return f"{tool_name}:{serialized_arguments}"
+
+    def _with_message_chain_context(self, messages: list, chain_messages: list = None, long_typing: bool = False) -> list:
+        if not chain_messages and not long_typing:
+            return messages
+
+        chain_note = self._format_message_chain_note(chain_messages, long_typing=long_typing)
+        if not chain_note:
+            return messages
+
+        updated_messages = list(messages)
+        insert_at = len(updated_messages)
+        if updated_messages and updated_messages[-1].get("role") == "user":
+            insert_at = len(updated_messages) - 1
+
+        updated_messages.insert(insert_at, {"role": "system", "content": chain_note})
+        return updated_messages
+
+    def _format_message_chain_note(
+        self,
+        chain_messages: list,
+        max_messages: int = 12,
+        max_chars: int = 2500,
+        long_typing: bool = False,
+    ) -> str:
+        visible_messages = list(chain_messages or [])[-max_messages:]
+        if len(visible_messages) <= 1 and not long_typing:
+            return ""
+
+        latest = visible_messages[-1] if visible_messages else None
+        if not latest:
+            return ""
+        author_name = getattr(latest.author, "display_name", getattr(latest.author, "name", "Unknown User"))
+        author_id = getattr(latest.author, "id", "unknown")
+        lines = [
+            (
+                f"Current same-user Discord message chain from {author_name} (User ID: {author_id}), "
+                "oldest to newest. The user sent these as separate messages in quick succession; "
+                "treat them as one current input and produce at most one reply or reaction for the whole chain."
+            )
+        ]
+        if long_typing:
+            lines.append(
+                "Long-typing note: after this message chain, the same user kept typing for a long time. "
+                "A light joke about writing a book is allowed only if it fits the channel tone."
+            )
+
+        if len(chain_messages) > max_messages:
+            lines.append(f"[{len(chain_messages) - max_messages} older chain message(s) omitted]")
+
+        for chain_message in visible_messages:
+            timestamp = chain_message.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+            content = (chain_message.content or "[empty message]").replace("\r", " ").replace("\n", " ").strip()
+            extra_parts = []
+            if chain_message.attachments:
+                filenames = ", ".join(attachment.filename for attachment in chain_message.attachments)
+                extra_parts.append(f"attachments: {filenames}")
+            if chain_message.embeds:
+                extra_parts.append(f"embeds: {len(chain_message.embeds)}")
+            extra = f" ({'; '.join(extra_parts)})" if extra_parts else ""
+            lines.append(f"[{timestamp}] message_id={chain_message.id}: {content}{extra}")
+
+        note = "\n".join(lines)
+        if len(note) > max_chars:
+            note = note[: max_chars - 3].rstrip() + "..."
+        return note
 
     def _response_message(self, response):
         if not response or not getattr(response, "choices", None):
