@@ -1,6 +1,7 @@
 # c:/Users/adri1/Documents/GitHub/LLM-Discord-Bot/bot/cogs/event_handler.py
 import discord
 from discord.ext import commands
+from discord import app_commands
 import logging
 import json
 import re
@@ -48,6 +49,7 @@ class EventHandler(commands.Cog):
         self._pending_reply_tasks = {}
         self._pending_reply_chains = {}
         self._typing_state = {}
+        self._last_reply_by_channel = {}
 
     def cog_unload(self):
         for task in self._pending_reply_tasks.values():
@@ -111,6 +113,14 @@ class EventHandler(commands.Cog):
             # Update counters and trigger summaries/profiles
             await self._update_counters_and_triggers(message, settings)
 
+        if self.bot.context_manager.is_llm_blacklisted_settings(settings, message.channel.id):
+            logging.info(
+                "Skipping LLM reply decision in blacklisted channel. message_id=%s channel_id=%s",
+                message.id,
+                message.channel.id,
+            )
+            return
+
         await self._queue_reply_decision(message, settings)
 
     def _claim_message(self, message_id: int) -> bool:
@@ -123,7 +133,71 @@ class EventHandler(commands.Cog):
             self._seen_message_ids.popitem(last=False)
         return True
 
+    @app_commands.command(name="retry", description="Delete and regenerate the bot's last generated reply in this channel.")
+    async def retry(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        if not interaction.guild or not isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
+            await interaction.followup.send("Retry can only be used in a server text channel or thread.", ephemeral=True)
+            return
+
+        guild_id = str(interaction.guild.id)
+        channel_id = str(interaction.channel.id)
+        settings = await self.bot.context_manager.get_guild_and_channel_settings(guild_id, channel_id)
+        if self.bot.context_manager.is_llm_blacklisted_settings(settings, channel_id):
+            await interaction.followup.send("LLM output is blacklisted in this channel.", ephemeral=True)
+            return
+
+        record_key = (guild_id, channel_id)
+        record = self._last_reply_by_channel.get(record_key)
+        if not record:
+            await interaction.followup.send("I do not have a generated reply to retry in this channel yet.", ephemeral=True)
+            return
+
+        if not self._can_retry_record(interaction, record):
+            await interaction.followup.send("Only the original author or someone with Manage Messages can retry that reply.", ephemeral=True)
+            return
+
+        try:
+            origin_message = await interaction.channel.fetch_message(int(record["origin_message_id"]))
+        except discord.NotFound:
+            self._last_reply_by_channel.pop(record_key, None)
+            await interaction.followup.send("The original message is gone, so I cannot retry that reply.", ephemeral=True)
+            return
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await interaction.followup.send(f"I could not fetch the original message: {e}", ephemeral=True)
+            return
+
+        chain_messages = await self._fetch_retry_chain_messages(interaction.channel, record)
+        if not chain_messages:
+            chain_messages = [origin_message]
+
+        try:
+            deleted_count = await self._delete_recorded_reply_messages(interaction.channel, record)
+        except discord.Forbidden:
+            await interaction.followup.send("I do not have permission to delete my previous reply.", ephemeral=True)
+            return
+
+        self._last_reply_by_channel.pop(record_key, None)
+        logging.info(
+            "Retrying generated reply. origin_message_id=%s chain_count=%s deleted_chunks=%s requested_by=%s",
+            origin_message.id,
+            len(chain_messages),
+            deleted_count,
+            interaction.user.id,
+        )
+
+        regenerated = await self._generate_and_send_reply(origin_message, settings, chain_messages=chain_messages)
+        if regenerated:
+            await interaction.followup.send("Regenerated the last reply.", ephemeral=True)
+        else:
+            await interaction.followup.send("I deleted the previous reply, but regeneration did not complete.", ephemeral=True)
+
     async def _queue_reply_decision(self, message: discord.Message, settings: dict):
+        if self.bot.context_manager.is_llm_blacklisted_settings(settings, message.channel.id):
+            logging.info("Skipping reply decision for blacklisted channel. message_id=%s", message.id)
+            return
+
         if message.content.startswith("!"):
             logging.info("Skipping reply decision for command message. message_id=%s", message.id)
             return
@@ -223,6 +297,11 @@ class EventHandler(commands.Cog):
         long_typing: bool = False,
     ):
         chain_messages = chain_messages or [message]
+        settings = await self.bot.context_manager.get_guild_and_channel_settings(message.guild.id, message.channel.id)
+        if self.bot.context_manager.is_llm_blacklisted_settings(settings, message.channel.id):
+            logging.info("Skipping LLM action in blacklisted channel. message_id=%s", message.id)
+            return
+
         logging.info(
             "Processing reply decision. message_id=%s force_reply=%s chain_count=%s long_typing=%s",
             message.id,
@@ -393,6 +472,66 @@ class EventHandler(commands.Cog):
         chain = self._pending_reply_chains.get(self._reply_chain_key(message))
         latest_message = chain.get("latest_message") if chain else None
         return bool(latest_message and latest_message.id != message.id)
+
+    def _can_retry_record(self, interaction: discord.Interaction, record: dict) -> bool:
+        permissions = getattr(interaction.user, "guild_permissions", None)
+        if permissions and (getattr(permissions, "manage_messages", False) or getattr(permissions, "administrator", False)):
+            return True
+        return str(interaction.user.id) == str(record.get("origin_author_id"))
+
+    async def _fetch_retry_chain_messages(self, channel, record: dict) -> list:
+        messages = []
+        for message_id in record.get("chain_message_ids") or []:
+            try:
+                messages.append(await channel.fetch_message(int(message_id)))
+            except (discord.NotFound, discord.Forbidden):
+                continue
+            except discord.HTTPException as e:
+                logging.warning("Could not fetch retry chain message %s: %s", message_id, e)
+        return messages
+
+    async def _delete_recorded_reply_messages(self, channel, record: dict) -> int:
+        deleted_count = 0
+        bot_id = getattr(self.bot.user, "id", None)
+        for message_id in reversed(record.get("bot_message_ids") or []):
+            try:
+                message = await channel.fetch_message(int(message_id))
+                if bot_id and getattr(message.author, "id", None) != bot_id:
+                    logging.warning("Refusing to delete retry message %s because it was not authored by this bot.", message_id)
+                    continue
+                await message.delete()
+                deleted_count += 1
+            except discord.NotFound:
+                continue
+            except discord.Forbidden:
+                raise
+            except discord.HTTPException as e:
+                logging.warning("Could not delete retry message %s: %s", message_id, e)
+        return deleted_count
+
+    def _record_generated_reply(self, origin_message: discord.Message, chain_messages: list, sent_messages: list, content: str):
+        if not sent_messages:
+            return
+
+        bot_id = getattr(self.bot.user, "id", None)
+        bot_message_ids = [
+            int(sent_message.id)
+            for sent_message in sent_messages
+            if sent_message and (not bot_id or getattr(sent_message.author, "id", None) == bot_id)
+        ]
+        if not bot_message_ids:
+            return
+
+        chain_messages = chain_messages or [origin_message]
+        record_key = (str(origin_message.guild.id), str(origin_message.channel.id))
+        self._last_reply_by_channel[record_key] = {
+            "origin_message_id": int(origin_message.id),
+            "origin_author_id": int(origin_message.author.id),
+            "chain_message_ids": [int(message.id) for message in chain_messages if getattr(message, "id", None)],
+            "bot_message_ids": bot_message_ids,
+            "created_at": self._utc_now().isoformat(),
+            "content_chars": len(content or ""),
+        }
 
     async def _decide_message_action(
         self,
@@ -652,6 +791,11 @@ class EventHandler(commands.Cog):
         long_typing: bool = False,
     ):
         try:
+            settings = await self.bot.context_manager.get_guild_and_channel_settings(message.guild.id, message.channel.id)
+            if self.bot.context_manager.is_llm_blacklisted_settings(settings, message.channel.id):
+                logging.info("Skipping generated reply in blacklisted channel. message_id=%s", message.id)
+                return False
+
             main_model = settings.get("model", self.bot.config.MAIN_LLM_MODEL)
             logging.info(
                 "Generating reply. message_id=%s model=%s chain_count=%s long_typing=%s",
@@ -677,7 +821,7 @@ class EventHandler(commands.Cog):
                 if not content:
                     logging.error(f"Main model failed to generate a response for message {message.id}.")
                     await self._send_generation_error(message)
-                    return
+                    return False
 
                 content = self._normalize_reply_content(content)
                 content = self._sanitize_reply_content(content, message.guild)
@@ -692,15 +836,17 @@ class EventHandler(commands.Cog):
 
             if self._has_pending_newer_chain(message):
                 logging.info(f"Skipping generated reply for message {message.id}; a newer same-user message chain is pending.")
-                return
+                return False
 
             # Handle message chunking (typing stops automatically when exiting the context)
-            await MessageChunker.send_chunked_message(
+            sent_messages = await MessageChunker.send_chunked_message(
                 target=message.channel,
                 content=content,
                 reply_to=message
             )
+            self._record_generated_reply(message, chain_messages, sent_messages, content)
             logging.info("Reply sent. message_id=%s chars=%s", message.id, len(content or ""))
+            return True
             
         except Exception as e:
             logging.exception(f"Error in _generate_and_send_reply: {e}")
@@ -708,6 +854,7 @@ class EventHandler(commands.Cog):
                 await self._send_generation_error(message, e)
             except Exception as fallback_error:
                 logging.error(f"Failed to send error message: {fallback_error}")
+            return False
 
     async def _send_generation_error(self, message: discord.Message, error: Exception = None):
         if error:

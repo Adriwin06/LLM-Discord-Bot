@@ -3,7 +3,7 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import logging
-from typing import Literal
+from typing import Literal, Optional
 from .utilities import AdvancedPaginationView, MessageChunker
 
 class AdminCommands(commands.Cog):
@@ -156,6 +156,58 @@ class AdminCommands(commands.Cog):
         except Exception as e:
             logging.error(f"Error in channel_override command: {str(e)}")
             await interaction.followup.send("❌ An unexpected error occurred while updating channel override.", ephemeral=True)
+
+    @app_commands.command(name="llm_blacklist", description="Block or unblock LLM-generated bot output in a channel.")
+    @app_commands.describe(
+        channel="Channel to configure. Defaults to the current channel.",
+        blacklisted="True blocks LLM output; false unblocks it. Leave empty to view status."
+    )
+    @app_commands.checks.has_permissions(administrator=True)
+    async def llm_blacklist(
+        self,
+        interaction: discord.Interaction,
+        channel: Optional[discord.TextChannel] = None,
+        blacklisted: Optional[bool] = None
+    ):
+        await interaction.response.defer(ephemeral=True)
+
+        target_channel = channel or interaction.channel
+        if not isinstance(target_channel, (discord.TextChannel, discord.Thread)):
+            await interaction.followup.send("This command can only target text channels or threads.", ephemeral=True)
+            return
+
+        guild_id = str(interaction.guild.id)
+        channel_id = str(target_channel.id)
+        settings = await self.bot.store.get_settings()
+        guild_settings = settings.setdefault(guild_id, {})
+        blocked_channels = guild_settings.get("llm_blacklisted_channels", [])
+        if isinstance(blocked_channels, (str, int)):
+            blocked_channels = [blocked_channels]
+        blocked_channel_ids = {str(value) for value in blocked_channels or []}
+
+        if blacklisted is None:
+            is_blocked = await self.bot.context_manager.is_channel_llm_blacklisted(guild_id, channel_id)
+            status = "blacklisted" if is_blocked else "not blacklisted"
+            channel_list = ", ".join(f"<#{cid}>" for cid in sorted(blocked_channel_ids)) if blocked_channel_ids else "None"
+            await interaction.followup.send(
+                f"{target_channel.mention} is {status} for LLM output.\nBlacklisted channels: {channel_list}",
+                ephemeral=True
+            )
+            return
+
+        if blacklisted:
+            blocked_channel_ids.add(channel_id)
+        else:
+            blocked_channel_ids.discard(channel_id)
+
+        guild_settings["llm_blacklisted_channels"] = sorted(blocked_channel_ids)
+        await self.bot.store.save_settings(settings)
+
+        action = "blacklisted" if blacklisted else "unblacklisted"
+        await interaction.followup.send(
+            f"{target_channel.mention} is now {action} for LLM-generated output.",
+            ephemeral=True
+        )
 
     @app_commands.command(name="reset_context", description="Reset the bot's context for a channel or the entire server.")
     @app_commands.checks.has_permissions(administrator=True)

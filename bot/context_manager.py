@@ -127,6 +127,24 @@ class ContextManager:
         
         return final_settings
 
+    async def is_channel_llm_blacklisted(self, guild_id, channel_id) -> bool:
+        settings = await self.get_guild_and_channel_settings(guild_id, channel_id)
+        return self.is_llm_blacklisted_settings(settings, channel_id)
+
+    def is_llm_blacklisted_settings(self, settings: dict, channel_id) -> bool:
+        if not isinstance(settings, dict):
+            return False
+
+        if self._safe_bool(settings.get("llm_blacklisted"), default=False):
+            return True
+
+        channel_id = str(channel_id)
+        blacklisted_channels = settings.get("llm_blacklisted_channels", [])
+        if isinstance(blacklisted_channels, (str, int)):
+            blacklisted_channels = [blacklisted_channels]
+
+        return channel_id in {str(value) for value in blacklisted_channels or []}
+
     def _default_media_settings(self) -> dict:
         return {
             "images": {

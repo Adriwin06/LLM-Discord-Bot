@@ -1001,6 +1001,9 @@ class LevelUpCommands(commands.Cog):
 
                 channel = message.guild.get_channel(notifylog_id) if notifylog_id else None
                 if channel and channel.id != message.channel.id:
+                    if await self.bot.context_manager.is_channel_llm_blacklisted(message.guild.id, channel.id):
+                        logging.info("Skipping level-up notification in LLM-blacklisted log channel. channel_id=%s", channel.id)
+                        return
                     await channel.send(levelup_msg, allowed_mentions=allowed_mentions)
                 
         except Exception as e:
@@ -1044,8 +1047,14 @@ class LevelUpCommands(commands.Cog):
             # Apply roles before generating message to have them available
             await self.apply_role_changes(message, new_level, new_role, new_prestige, config, is_prestige_reset)
 
-            # Build a focused notification prompt instead of passing the live
-            # conversation as answerable turns.
+            if await self.bot.context_manager.is_channel_llm_blacklisted(message.guild.id, message.channel.id):
+                logging.info("Using fallback level-up message because channel is LLM-blacklisted. channel_id=%s", message.channel.id)
+                return await self.generate_fallback_message(
+                    message, achieved_level, new_role, new_prestige, is_prestige_reset, config, achieved_prestige_level
+                )
+
+            profile_context = await self._levelup_profile_context(message.guild.id, message.author.id)
+
             level_context_parts = [
                 f"User mention: {message.author.mention}",
                 f"Display name: {UtilityHelpers.safe_username(message.author)}",
@@ -1058,39 +1067,55 @@ class LevelUpCommands(commands.Cog):
             else:
                 level_context_parts.append("Level up was from text messaging.")
             if new_role:
-                level_context_parts.append(f"New role earned: {new_role.mention}")
+                level_context_parts.append(f"New role earned: {new_role.mention} ({new_role.name})")
             if is_prestige_reset:
                 level_context_parts.append(f"This is a PRESTIGE. User is now prestige {achieved_prestige_level} and reset to level 0.")
                 if new_prestige:
-                    level_context_parts.append(f"New prestige role earned: {new_prestige.mention}")
+                    level_context_parts.append(f"New prestige role earned: {new_prestige.mention} ({new_prestige.name})")
 
             prompt = f"""Write exactly one Discord level-up notification.
 
 Level-up facts:
 {chr(10).join(f"- {part}" for part in level_context_parts)}
 
+Stored user context:
+{profile_context}
+
 Rules:
 - Keep it under 450 characters.
 - Mention the user exactly once using the provided user mention.
+- If a new role or prestige role is listed, mention it using the provided role mention.
+- Make the line feel specific to this user and achievement. Use the stored user context if it helps.
+- Avoid generic template phrases like "Great job" unless there is also a specific detail.
 - Celebrate the achievement; do not answer or quote the user's message.
 - Do not start with your bot name, a username, "Assistant:", "Bot:", or a User ID.
 - No headings, code blocks, or multi-message output."""
 
-            messages, settings = await self.bot.context_manager.build_context(
-                message=message,
-                model_name=self.bot.config.MAIN_LLM_MODEL,
-                prompt=prompt,
-                include_conversation_history=False,
-                include_current_message=False
-            )
+            settings = await self.bot.context_manager.get_guild_and_channel_settings(message.guild.id, message.channel.id)
             model = settings.get("model", self.bot.config.MAIN_LLM_MODEL)
+            behavior_prompt = settings.get("behavior_prompt", self.bot.config.BEHAVIOR_PROMPT)
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are writing as this Discord bot and must preserve its configured personality and style.\n\n"
+                        f"Configured bot behavior/personality:\n{behavior_prompt}\n\n"
+                        "For this task, write a short, punchy Discord level-up announcement. "
+                        "Use Discord mentions exactly as provided. Return only the announcement text."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ]
             
             # Call the LLM
-            response = await self.bot.llm_provider.create_completion(
-                model=model,
-                messages=messages,
-                max_tokens=240,
-                temperature=0.7
+            response = await asyncio.wait_for(
+                self.bot.llm_provider.create_completion(
+                    model=model,
+                    messages=messages,
+                    max_tokens=180,
+                    temperature=0.8
+                ),
+                timeout=45
             )
             
             if response and response.choices:
@@ -1104,7 +1129,13 @@ Rules:
 
                 raw_content = getattr(choice.message, "content", None)
                 if raw_content:
-                    levelup_msg = self._sanitize_levelup_message(raw_content, message)
+                    levelup_msg = self._sanitize_levelup_message(
+                        raw_content,
+                        message,
+                        new_role=new_role,
+                        new_prestige=new_prestige,
+                        is_prestige_reset=is_prestige_reset
+                    )
                     if levelup_msg:
                         return levelup_msg
 
@@ -1130,7 +1161,33 @@ Rules:
                 locals().get("achieved_prestige_level")
             )
     
-    def _sanitize_levelup_message(self, content: str, message: discord.Message) -> str:
+    async def _levelup_profile_context(self, guild_id, user_id, max_chars: int = 900) -> str:
+        try:
+            guild_data = await self.bot.store.get_guild_data(str(guild_id))
+            stored_user = guild_data.get("users", {}).get(str(user_id), {})
+            context_parts = []
+            manual_note = str(stored_user.get("manual_note") or "").strip()
+            ai_summary = str(stored_user.get("ai_summary") or "").strip()
+            if manual_note:
+                context_parts.append(f"Manual note: {manual_note}")
+            if ai_summary:
+                context_parts.append(f"AI profile summary: {ai_summary}")
+            if not context_parts:
+                return "- No stored user profile context yet."
+            return UtilityHelpers.truncate_string("\n".join(context_parts), max_chars)
+        except Exception as e:
+            logging.warning("Could not load level-up profile context for user %s: %s", user_id, e)
+            return "- No stored user profile context available."
+
+    def _sanitize_levelup_message(
+        self,
+        content: str,
+        message: discord.Message,
+        *,
+        new_role: Optional[discord.Role] = None,
+        new_prestige: Optional[discord.Role] = None,
+        is_prestige_reset: bool = False
+    ) -> str:
         """Keep generated level-up notifications short and free of speaker labels."""
         content = content.strip()
         if content.startswith("```"):
@@ -1157,8 +1214,13 @@ Rules:
                 ).lstrip()
 
         content = re.sub(r"^\s*(?:assistant|bot)\s*[:\-]\s*", "", content, count=1, flags=re.IGNORECASE).strip()
-        if message.author.mention not in content:
+        user_mention_pattern = re.compile(rf"<@!?{re.escape(str(message.author.id))}>")
+        if not user_mention_pattern.search(content):
             content = f"{message.author.mention} {content}"
+        if new_role and new_role.mention not in content:
+            content = f"{content} You've earned {new_role.mention}."
+        if is_prestige_reset and new_prestige and new_prestige.mention not in content:
+            content = f"{content} Prestige role: {new_prestige.mention}."
 
         if len(content) > 900:
             logging.warning("Level-up LLM response was too long; truncating to a safe Discord size.")
@@ -1199,7 +1261,7 @@ Rules:
                     level_int = int(level_str)
                     # Remove if it's an old level role, or if prestiging (remove all level roles)
                     if (not is_prestige_reset and level_int < new_level) or is_prestige_reset:
-                        if role_id != (new_role.id if new_role else None):
+                        if str(role_id) != (str(new_role.id) if new_role else None):
                             old_role = self._get_role_by_id(message.guild, role_id)
                             if old_role and old_role in message.author.roles:
                                 roles_to_remove.append(old_role)

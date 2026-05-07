@@ -4,6 +4,7 @@ from discord.ext import commands
 from discord import app_commands
 import aiohttp
 import types
+import re
 from .utilities import MessageChunker
 
 class FunCommands(commands.Cog):
@@ -41,13 +42,20 @@ class FunCommands(commands.Cog):
         await self.session.close()
 
     async def _generate_fun_response(self, interaction: discord.Interaction, user: discord.Member, command_type: str):
+        if await self.bot.context_manager.is_channel_llm_blacklisted(interaction.guild.id, interaction.channel.id):
+            await interaction.response.send_message("LLM output is blacklisted in this channel.", ephemeral=True)
+            return
+
         await interaction.response.defer()
         
         # Check if the target user is the bot itself
         if user.id == self.bot.user.id:
+            target_mention = user.mention
             if command_type == "insult":
                 examples = "\n".join([f"- {response}" for response in self.bot_insult_responses])
                 prompt = f"""Someone is trying to get me (the bot) to insult myself. Generate a funny, witty, self-aware response that shows I'm too clever to fall for this trick. Be sassy and confident.
+
+Target user mention to include exactly once: {target_mention}
 
 Here are some example responses for inspiration:
 {examples}
@@ -57,6 +65,8 @@ Generate a similar response that's creative and shows personality, but don't cop
                 examples = "\n".join([f"- {response}" for response in self.bot_compliment_responses])
                 prompt = f"""Someone just complimented me (the bot)! Generate a sweet, appreciative response that thanks them while also being a bit playful.
 
+Target user mention to include exactly once: {target_mention}
+
 Here are some example responses for inspiration:
 {examples}
 
@@ -64,6 +74,8 @@ Generate a similar response that's warm and grateful, but don't copy these exact
             else:  # reverse_trash_talk
                 examples = "\n".join([f"- {response}" for response in self.bot_reverse_trash_responses])
                 prompt = f"""Someone wants me (the bot) to do reverse trash talk on myself. Reverse trash talk means you "trash talk" but say only positive things in a playful, competitive tone. Generate a witty response that sounds like a roast but is actually flattering.
+
+Target user mention to include exactly once: {target_mention}
 
 Style rules (must follow):
 - VERY AGGRESSIVE delivery: lots of CAPITALS, exclamation marks, and "?!?!!" style punctuation.
@@ -82,17 +94,18 @@ Generate a similar response that's playful and uplifting, but don't copy these e
             ]
         else:
             # Regular user targeting - use context manager with custom prompt
+            target_mention = user.mention
             prompt_template = {
-                "insult": f"Generate a creative, personalized, and funny insult for a Discord user named {user.display_name}. Use any available profile information to make it more specific and tailored to them.",
-                "compliment": f"Generate a creative, personalized, and heartfelt compliment for a Discord user named {user.display_name}. Use any available profile information to make it more specific and meaningful.",
-                "reverse_trash_talk": f"Generate reverse trash talk for a Discord user named {user.display_name}. Reverse trash talk means you trash talk but only say positive things in a competitive, playful tone. Make it sound like a roast while actually flattering them.\n\nStyle rules (must follow):\n- VERY AGGRESSIVE delivery: lots of CAPITALS, exclamation marks, and \"?!?!!\" style punctuation.\n- Use Discord formatting for emphasis (some bold **like this** and italics *like this*).\n- Sound like a roast, but every statement is actually positive.\n- Keep it punchy (2-5 sentences), no emojis.\n\nUse any available profile information to make it more specific and tailored to them."
+                "insult": f"Generate a creative, personalized, and funny insult for a Discord user named {user.display_name}. Include this target user mention exactly once so Discord pings them: {target_mention}. Use any available profile information to make it more specific and tailored to them.",
+                "compliment": f"Generate a creative, personalized, and heartfelt compliment for a Discord user named {user.display_name}. Include this target user mention exactly once so Discord pings them: {target_mention}. Use any available profile information to make it more specific and meaningful.",
+                "reverse_trash_talk": f"Generate reverse trash talk for a Discord user named {user.display_name}. Include this target user mention exactly once so Discord pings them: {target_mention}. Reverse trash talk means you trash talk but only say positive things in a competitive, playful tone. Make it sound like a roast while actually flattering them.\n\nStyle rules (must follow):\n- VERY AGGRESSIVE delivery: lots of CAPITALS, exclamation marks, and \"?!?!!\" style punctuation.\n- Use Discord formatting for emphasis (some bold **like this** and italics *like this*).\n- Sound like a roast, but every statement is actually positive.\n- Keep it punchy (2-5 sentences), no emojis.\n\nUse any available profile information to make it more specific and tailored to them."
             }
 
             # Build context with the specific task prompt
             messages, _ = await self.bot.context_manager.build_context(
                 channel=interaction.channel,
                 prompt=prompt_template[command_type],
-                behavior_override="You are a witty and creative assistant generating fun responses for a Discord bot. Be entertaining while staying appropriate."
+                behavior_override="You are a witty and creative assistant generating fun responses for a Discord bot. Be entertaining while staying appropriate. Include the target user's Discord mention exactly once."
             )
         
         model = self.bot.config.MAIN_LLM_MODEL
@@ -100,7 +113,7 @@ Generate a similar response that's playful and uplifting, but don't copy these e
         
         response_label = command_type.replace("_", " ")
         if response and response.choices:
-            content = response.choices[0].message.content
+            content = self._ensure_target_ping(response.choices[0].message.content, user)
             await MessageChunker.send_chunked_message(
                 target=interaction,
                 content=content,
@@ -108,6 +121,16 @@ Generate a similar response that's playful and uplifting, but don't copy these e
             )
         else:
             await interaction.followup.send(f"I couldn't think of a good {response_label} right now. Sorry!", ephemeral=True)
+
+    def _ensure_target_ping(self, content: str, user: discord.Member) -> str:
+        content = str(content or "").strip()
+        if not content:
+            return user.mention
+
+        mention_pattern = re.compile(rf"<@!?{re.escape(str(user.id))}>")
+        if mention_pattern.search(content):
+            return content
+        return f"{user.mention} {content}"
 
     @app_commands.command(name="insult", description="Generate a personalized insult for a user.")
     async def insult(self, interaction: discord.Interaction, user: discord.Member):
@@ -145,6 +168,10 @@ Generate a similar response that's playful and uplifting, but don't copy these e
 
     @app_commands.command(name="mock_avatar", description="Mock a user's profile picture.")
     async def mock_avatar(self, interaction: discord.Interaction, user: discord.Member):
+        if await self.bot.context_manager.is_channel_llm_blacklisted(interaction.guild.id, interaction.channel.id):
+            await interaction.response.send_message("LLM output is blacklisted in this channel.", ephemeral=True)
+            return
+
         await interaction.response.defer()
         
         # Get the user's avatar URL
