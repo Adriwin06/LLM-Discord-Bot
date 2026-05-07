@@ -383,7 +383,8 @@ class MessageChunker:
         content: str,
         max_chunks: int = 50,
         reply_to: Optional[discord.Message] = None,
-        ephemeral: bool = False
+        ephemeral: bool = False,
+        allowed_mentions: Optional[discord.AllowedMentions] = None
     ) -> List[discord.Message]:
         """
         Send a long message as multiple chunks.
@@ -394,6 +395,7 @@ class MessageChunker:
             max_chunks: Maximum number of chunks to prevent spam
             reply_to: Message to reply to (only for first chunk)
             ephemeral: Whether the message should be ephemeral (for interactions)
+            allowed_mentions: Mention parsing policy for sent messages
             
         Returns:
             List of sent messages
@@ -425,16 +427,16 @@ class MessageChunker:
             # Handle different target types
             if isinstance(target, discord.Interaction):
                 if target.response.is_done():
-                    msg = await target.followup.send(first_chunk, ephemeral=ephemeral)
+                    msg = await target.followup.send(first_chunk, ephemeral=ephemeral, allowed_mentions=allowed_mentions)
                 else:
-                    await target.response.send_message(first_chunk, ephemeral=ephemeral)
+                    await target.response.send_message(first_chunk, ephemeral=ephemeral, allowed_mentions=allowed_mentions)
                     msg = await target.original_response()
                 sent_messages.append(msg)
             elif reply_to:
-                msg = await reply_to.reply(first_chunk)
+                msg = await reply_to.reply(first_chunk, allowed_mentions=allowed_mentions)
                 sent_messages.append(msg)
             else:
-                msg = await target.send(first_chunk)
+                msg = await target.send(first_chunk, allowed_mentions=allowed_mentions)
                 sent_messages.append(msg)
             
             # Send remaining chunks
@@ -444,9 +446,9 @@ class MessageChunker:
                     chunk += chunk_indicator
                 
                 if isinstance(target, discord.Interaction):
-                    msg = await target.followup.send(chunk, ephemeral=ephemeral)
+                    msg = await target.followup.send(chunk, ephemeral=ephemeral, allowed_mentions=allowed_mentions)
                 else:
-                    msg = await target.send(chunk)
+                    msg = await target.send(chunk, allowed_mentions=allowed_mentions)
                 sent_messages.append(msg)
                 
         except Exception as e:
@@ -456,13 +458,13 @@ class MessageChunker:
                 fallback_content = content[:1900] + "\n\n... [Error occurred, content truncated]"
                 if isinstance(target, discord.Interaction):
                     if not target.response.is_done():
-                        await target.response.send_message(fallback_content, ephemeral=ephemeral)
+                        await target.response.send_message(fallback_content, ephemeral=ephemeral, allowed_mentions=allowed_mentions)
                     else:
-                        await target.followup.send(fallback_content, ephemeral=ephemeral)
+                        await target.followup.send(fallback_content, ephemeral=ephemeral, allowed_mentions=allowed_mentions)
                 elif reply_to:
-                    await reply_to.reply(fallback_content)
+                    await reply_to.reply(fallback_content, allowed_mentions=allowed_mentions)
                 else:
-                    await target.send(fallback_content)
+                    await target.send(fallback_content, allowed_mentions=allowed_mentions)
             except Exception as fallback_error:
                 logging.error(f"Fallback also failed: {fallback_error}")
         

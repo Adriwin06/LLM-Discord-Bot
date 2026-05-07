@@ -117,23 +117,29 @@ Generate a similar response that's playful and uplifting, but don't copy these e
         response_label = command_type.replace("_", " ")
         if response and response.choices:
             content = self._ensure_target_ping(response.choices[0].message.content, user)
+            allowed_mentions = discord.AllowedMentions(users=[user], roles=False, everyone=False, replied_user=False)
             await MessageChunker.send_chunked_message(
                 target=interaction,
                 content=content,
-                ephemeral=False
+                ephemeral=False,
+                allowed_mentions=allowed_mentions
             )
         else:
             await interaction.followup.send(f"I couldn't think of a good {response_label} right now. Sorry!", ephemeral=True)
 
     def _ensure_target_ping(self, content: str, user: discord.Member) -> str:
+        """Force one parseable target mention outside model-controlled formatting."""
         content = str(content or "").strip()
         if not content:
             return user.mention
 
-        mention_pattern = re.compile(rf"<@!?{re.escape(str(user.id))}>")
-        if mention_pattern.search(content):
-            return content
-        return f"{user.mention} {content}"
+        mention_pattern = re.compile(rf"`?\\?<@!?{re.escape(str(user.id))}>`?")
+        content = mention_pattern.sub("", content).strip()
+        content = re.sub(r"^[,.;:!?]\s*", "", content)
+        content = re.sub(r"\s+([,.;:!?])", r"\1", content)
+        content = re.sub(r"([,;:])\s*([.!?])", r"\2", content)
+        content = re.sub(r"[ \t]{2,}", " ", content)
+        return f"{user.mention} {content}".strip()
 
     @fun_group.command(name="insult", description="Generate a personalized insult for a user.")
     async def insult(self, interaction: discord.Interaction, user: discord.Member):
