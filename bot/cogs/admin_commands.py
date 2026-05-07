@@ -936,8 +936,11 @@ class AdminCommands(commands.Cog):
             from bot import config
             importlib.reload(config)
             
-            # Update bot's config reference
-            self.bot.config = config
+            # Update live component references with a fresh Config instance.
+            new_config = config.Config()
+            self.bot.config = new_config
+            self.bot.llm_provider.config = new_config
+            self.bot.context_manager.config = new_config
             
             return {
                 "type": "config",
@@ -965,10 +968,9 @@ class AdminCommands(commands.Cog):
             if os.path.exists(behavior_path):
                 try:
                     with open(behavior_path, 'r', encoding='utf-8') as f:
-                        f.read()  # Just verify we can read the file
+                        self.bot.config.BEHAVIOR_PROMPT = f.read().strip()
+                    self.bot.context_manager.config = self.bot.config
                     
-                    # Update in bot (if there's a way to do this)
-                    # This depends on how your bot stores default prompts
                     results.append({
                         "type": "prompt",
                         "name": "Behavior Prompt",
@@ -988,7 +990,8 @@ class AdminCommands(commands.Cog):
             if os.path.exists(capabilities_path):
                 try:
                     with open(capabilities_path, 'r', encoding='utf-8') as f:
-                        f.read()  # Just verify we can read the file
+                        self.bot.config.CAPABILITIES_PROMPT = f.read().strip()
+                    self.bot.context_manager.config = self.bot.config
                     
                     results.append({
                         "type": "prompt",

@@ -5,6 +5,7 @@ from discord import app_commands
 import json
 import math
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Tuple, Callable
 import aiofiles
@@ -230,6 +231,13 @@ class LevelUpCommands(commands.Cog):
                 asyncio.get_running_loop().create_task(self.save_levels_data())
             except RuntimeError: pass
         return config["users"][user_id]
+
+    def _get_role_by_id(self, guild: discord.Guild, role_id) -> Optional[discord.Role]:
+        """Return a Discord role from JSON-stored IDs that may be int or str."""
+        try:
+            return guild.get_role(int(role_id))
+        except (TypeError, ValueError):
+            return None
     
     def calculate_level_from_xp(self, xp: float) -> int:
         """Calculate level from XP using the standard formula"""
@@ -487,7 +495,7 @@ class LevelUpCommands(commands.Cog):
                 lr_lines = ["➤ Level roles will Stack"]
                 # Sort by level descending to match screenshot
                 for lvl, rid in sorted(levelroles.items(), key=lambda x: int(x[0]), reverse=True):
-                    r = interaction.guild.get_role(rid)
+                    r = self._get_role_by_id(interaction.guild, rid)
                     lr_lines.append(f"• Level {lvl}: {r.mention if r else f'(deleted role {rid})'}")
                 embed.add_field(name="Level Roles", value="\n".join(lr_lines)[:1024], inline=False)
 
@@ -498,7 +506,7 @@ class LevelUpCommands(commands.Cog):
                     "➤ Level roles will be reset after prestiging"
                 ]
                 for pl, pdata in sorted(prestigedata.items(), key=lambda x: int(x[0])):
-                    r = interaction.guild.get_role(pdata.get("role", 0))
+                    r = self._get_role_by_id(interaction.guild, pdata.get("role", 0))
                     pr_lines.append(f"• Prestige {pl}: {r.mention if r else 'No Role'}")
                 embed.add_field(name="Prestige", value="\n".join(pr_lines)[:1024], inline=False)
 
@@ -507,7 +515,7 @@ class LevelUpCommands(commands.Cog):
                 if not d: return "None"
                 parts = []
                 for rid, bonus in d.items():
-                    role_obj = interaction.guild.get_role(int(rid))
+                    role_obj = self._get_role_by_id(interaction.guild, rid)
                     parts.append(f"• {role_obj.mention if role_obj else '(deleted role)'}: {bonus}")
                 return "\n".join(parts)
 
@@ -594,7 +602,7 @@ class LevelUpCommands(commands.Cog):
             embed = discord.Embed(title="🎭 Level Roles", color=discord.Color.blue())
             role_list = []
             for lvl, role_id in sorted(levelroles.items(), key=lambda x: int(x[0])):
-                role_obj = interaction.guild.get_role(role_id)
+                role_obj = self._get_role_by_id(interaction.guild, role_id)
                 role_name = role_obj.name if role_obj else f"Unknown Role ({role_id})"
                 role_list.append(f"Level {lvl}: {role_name}")
             
@@ -606,7 +614,7 @@ class LevelUpCommands(commands.Cog):
             # Remove level role
             if level_str in levelroles:
                 removed_role_id = levelroles.pop(level_str)
-                removed_role = interaction.guild.get_role(removed_role_id)
+                removed_role = self._get_role_by_id(interaction.guild, removed_role_id)
                 role_name = removed_role.name if removed_role else f"Unknown Role ({removed_role_id})"
                 await self.save_levels_data()
                 await interaction.response.send_message(f"✅ Removed level {level} role: {role_name}")
@@ -652,7 +660,7 @@ class LevelUpCommands(commands.Cog):
                 prestige_list = []
                 for lvl, data in sorted(prestigedata.items(), key=lambda x: int(x[0])):
                     role_id = data.get("role")
-                    role_obj = interaction.guild.get_role(role_id) if role_id else None
+                    role_obj = self._get_role_by_id(interaction.guild, role_id) if role_id else None
                     role_name = role_obj.mention if role_obj else "No Role"
                     emoji_str = data.get("emoji_string", "⭐")
                     prestige_list.append(f"{emoji_str} **Prestige {lvl}**: {role_name}")
@@ -922,17 +930,26 @@ class LevelUpCommands(commands.Cog):
             levelup_msg = await self.generate_personalized_levelup_message(
                 message, user_data, old_level, new_level, config, from_voice
             )
+            if not levelup_msg:
+                return
+
+            allowed_mentions = discord.AllowedMentions(users=True, roles=True, everyone=False)
             
             # Send in current channel (immediate notification)
             if config.get("notify", True):
-                await message.channel.send(levelup_msg)
+                await message.channel.send(levelup_msg, allowed_mentions=allowed_mentions)
             
             # Also send to designated log channel if configured
             notifylog = config.get("notifylog")
             if notifylog:
-                channel = message.guild.get_channel(notifylog)
-                if channel:
-                    await channel.send(levelup_msg)
+                try:
+                    notifylog_id = int(notifylog)
+                except (TypeError, ValueError):
+                    notifylog_id = None
+
+                channel = message.guild.get_channel(notifylog_id) if notifylog_id else None
+                if channel and channel.id != message.channel.id:
+                    await channel.send(levelup_msg, allowed_mentions=allowed_mentions)
                 
         except Exception as e:
             logging.error(f"Error handling level up for {message.author}: {e}")
@@ -947,9 +964,12 @@ class LevelUpCommands(commands.Cog):
             new_role = None
             new_prestige = None
             is_prestige_reset = False
+            achieved_level = new_level
+            achieved_prestige_level = None
+            total_xp_at_level_up = user_data.get("xp", 0.0)
             
             if str(new_level) in levelroles:
-                new_role = message.guild.get_role(levelroles[str(new_level)])
+                new_role = self._get_role_by_id(message.guild, levelroles[str(new_level)])
 
             if new_level >= prestigelevel:
                 current_prestige = user_data.get("prestige", 0)
@@ -958,66 +978,147 @@ class LevelUpCommands(commands.Cog):
                 if str(new_prestige_level) in prestigedata:
                     prestige_info = prestigedata[str(new_prestige_level)]
                     if prestige_info.get("role"):
-                        new_prestige = message.guild.get_role(prestige_info["role"])
+                        new_prestige = self._get_role_by_id(message.guild, prestige_info["role"])
                     
                     user_data["prestige"] = new_prestige_level
                     user_data["xp"] = 0.0 # Reset XP on prestige
                     user_data["voice"] = 0.0
                     user_data["level"] = 0
                     is_prestige_reset = True
+                    achieved_prestige_level = new_prestige_level
                     new_level = 0
                     await self.save_levels_data()
             
             # Apply roles before generating message to have them available
             await self.apply_role_changes(message, new_level, new_role, new_prestige, config, is_prestige_reset)
 
-            # Build context using the context manager
-            messages, settings = await self.bot.context_manager.build_context(message)
-            
-            # Add level-up specific context
-            level_context_parts = []
-            total_xp = user_data.get("xp", 0.0) + user_data.get("voice", 0.0)
-            level_context_parts.append(f"User is now level {new_level} with {total_xp:,.1f} total XP.")
+            # Build a focused notification prompt instead of passing the live
+            # conversation as answerable turns.
+            level_context_parts = [
+                f"User mention: {message.author.mention}",
+                f"Display name: {UtilityHelpers.safe_username(message.author)}",
+                f"Old level: {old_level}",
+                f"Reached level: {achieved_level}",
+                f"Total XP at level-up: {total_xp_at_level_up:,.1f}",
+            ]
             if from_voice:
                 level_context_parts.append("Level up was from VOICE CHAT activity.")
             else:
                 level_context_parts.append("Level up was from text messaging.")
+            if new_role:
+                level_context_parts.append(f"New role earned: {new_role.mention}")
             if is_prestige_reset:
-                level_context_parts.append(f"This is a PRESTIGE. User is now prestige {user_data.get('prestige', 1)} and reset to level 0.")
-            
-            # Modify the system prompt to include level-up celebration context
-            celebration_context = f"\n\nYou are celebrating a user's leveling achievement. Generate a personalized, enthusiastic level-up message for {message.author.mention} who just reached level {new_level}."
-            messages[0]["content"] += celebration_context
-            
-            # Add level-up specific context as a system message
-            level_context = "\n".join(level_context_parts)
-            messages.insert(-1, {"role": "system", "content": f"Level-up Context: {level_context}"})
+                level_context_parts.append(f"This is a PRESTIGE. User is now prestige {achieved_prestige_level} and reset to level 0.")
+                if new_prestige:
+                    level_context_parts.append(f"New prestige role earned: {new_prestige.mention}")
+
+            prompt = f"""Write exactly one Discord level-up notification.
+
+Level-up facts:
+{chr(10).join(f"- {part}" for part in level_context_parts)}
+
+Rules:
+- Keep it under 450 characters.
+- Mention the user exactly once using the provided user mention.
+- Celebrate the achievement; do not answer or quote the user's message.
+- Do not start with your bot name, a username, "Assistant:", "Bot:", or a User ID.
+- No headings, code blocks, or multi-message output."""
+
+            messages, settings = await self.bot.context_manager.build_context(
+                message=message,
+                model_name=self.bot.config.MAIN_LLM_MODEL,
+                prompt=prompt,
+                include_conversation_history=False,
+                include_current_message=False
+            )
+            model = settings.get("model", self.bot.config.MAIN_LLM_MODEL)
             
             # Call the LLM
             response = await self.bot.llm_provider.create_completion(
-                model=self.bot.llm_provider.config.MAIN_LLM_MODEL,
+                model=model,
                 messages=messages,
-                max_tokens=200,
-                temperature=0.8
+                max_tokens=240,
+                temperature=0.7
             )
             
             if response and response.choices:
-                levelup_msg = response.choices[0].message.content.strip()
-                return levelup_msg
+                choice = response.choices[0]
+                finish_reason = str(getattr(choice, "finish_reason", "")).lower()
+                if finish_reason in {"length", "max_tokens", "max_output_tokens"}:
+                    logging.warning("Level-up LLM response was truncated; using fallback message.")
+                    return await self.generate_fallback_message(
+                        message, achieved_level, new_role, new_prestige, is_prestige_reset, config, achieved_prestige_level
+                    )
+
+                raw_content = getattr(choice.message, "content", None)
+                if raw_content:
+                    levelup_msg = self._sanitize_levelup_message(raw_content, message)
+                    if levelup_msg:
+                        return levelup_msg
+
+                return await self.generate_fallback_message(
+                    message, achieved_level, new_role, new_prestige, is_prestige_reset, config, achieved_prestige_level
+                )
             else:
                 # Fallback to default message
-                return await self.generate_fallback_message(message, new_level, new_role, new_prestige, is_prestige_reset, config)
+                return await self.generate_fallback_message(
+                    message, achieved_level, new_role, new_prestige, is_prestige_reset, config, achieved_prestige_level
+                )
                 
         except Exception as e:
             logging.error(f"Error generating personalized level up message: {e}")
             # Fallback to default message
-            return await self.generate_fallback_message(message, new_level, None, None, False, config)
+            return await self.generate_fallback_message(
+                message,
+                locals().get("achieved_level", new_level),
+                locals().get("new_role"),
+                locals().get("new_prestige"),
+                locals().get("is_prestige_reset", False),
+                config,
+                locals().get("achieved_prestige_level")
+            )
     
-    async def generate_fallback_message(self, message, new_level, new_role, new_prestige, is_prestige_reset, config):
+    def _sanitize_levelup_message(self, content: str, message: discord.Message) -> str:
+        """Keep generated level-up notifications short and free of speaker labels."""
+        content = content.strip()
+        if content.startswith("```"):
+            content = content.strip("`").strip()
+
+        bot_user = self.bot.user
+        if bot_user:
+            bot_id = str(bot_user.id)
+            names = {
+                getattr(bot_user, "name", ""),
+                getattr(bot_user, "display_name", ""),
+                str(bot_user),
+            }
+            if message.guild and message.guild.me:
+                names.add(getattr(message.guild.me, "display_name", ""))
+            for name in {name for name in names if name}:
+                escaped = re.escape(name)
+                content = re.sub(
+                    rf"^\s*(?:\*\*)?{escaped}(?:\*\*)?\s*(?:\((?:User ID|ID):\s*{bot_id}\))?\s*[:\-]\s*",
+                    "",
+                    content,
+                    count=1,
+                    flags=re.IGNORECASE
+                ).lstrip()
+
+        content = re.sub(r"^\s*(?:assistant|bot)\s*[:\-]\s*", "", content, count=1, flags=re.IGNORECASE).strip()
+        if message.author.mention not in content:
+            content = f"{message.author.mention} {content}"
+
+        if len(content) > 900:
+            logging.warning("Level-up LLM response was too long; truncating to a safe Discord size.")
+            content = UtilityHelpers.truncate_string(content, 900)
+
+        return content
+
+    async def generate_fallback_message(self, message, new_level, new_role, new_prestige, is_prestige_reset, config, prestige_level=None):
         """Generate a fallback message when LLM is unavailable"""
         
         if is_prestige_reset:
-            prestige_level = new_level
+            prestige_level = prestige_level if prestige_level is not None else "a new prestige"
             msg = f"🌟✨ PRESTIGE ACHIEVED! ✨🌟 {message.author.mention} has reached the ultimate milestone and earned prestige level {prestige_level}!"
             if new_prestige:
                 msg += f" Welcome to the {new_prestige.mention} ranks!"
@@ -1047,7 +1148,7 @@ class LevelUpCommands(commands.Cog):
                     # Remove if it's an old level role, or if prestiging (remove all level roles)
                     if (not is_prestige_reset and level_int < new_level) or is_prestige_reset:
                         if role_id != (new_role.id if new_role else None):
-                            old_role = message.guild.get_role(role_id)
+                            old_role = self._get_role_by_id(message.guild, role_id)
                             if old_role and old_role in message.author.roles:
                                 roles_to_remove.append(old_role)
                 if roles_to_remove:

@@ -214,25 +214,65 @@ class ContextManager:
 
             sorted_messages = sorted(all_messages.values(), key=lambda m: m.created_at)
 
-            for msg in sorted_messages:
-                content = await self._format_message_content(msg, target_model)
-                role = "assistant" if self.bot and msg.author.id == self.bot.user.id else "user"
-                messages.append({"role": role, "content": content})
+            if sorted_messages:
+                context_lines = [
+                    "Recent Discord conversation context, oldest to newest.",
+                    "These lines are background only. Do not answer them one by one; answer only the current message that follows.",
+                ]
+                context_lines.extend(self._format_message_context_line(msg) for msg in sorted_messages)
+                messages.append({"role": "system", "content": "\n".join(context_lines)})
 
         # 5. Current Message or Custom Prompt
+        if include_current_message or prompt:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "Reply only to the next/current Discord message or task. "
+                    "Do not prefix the reply with your bot name, username, role label, or user ID."
+                )
+            })
+
         if prompt:
             # Use custom prompt instead of message content
             messages.append({"role": "user", "content": prompt})
         else:
             # Add the current message only if include_current_message is True
             if include_current_message:
-                current_message_content = await self._format_message_content(message, target_model)
-                current_message_role = "assistant" if self.bot and message.author.id == self.bot.user.id else "user"
-                messages.append({"role": current_message_role, "content": current_message_content})
+                current_message_content = await self._format_message_content(
+                    message,
+                    target_model,
+                    current_message=True
+                )
+                messages.append({"role": "user", "content": current_message_content})
 
         return messages, settings
 
-    async def _format_message_content(self, message: discord.Message, model_name: str = None):
+    def _format_message_context_line(self, message: discord.Message) -> str:
+        """
+        Format a Discord message as plain background context.
+
+        History is intentionally kept out of user/assistant turns so the model
+        does not treat older messages as prompts waiting for answers.
+        """
+        author_name = getattr(message.author, "display_name", getattr(message.author, "name", "Unknown User"))
+        author_id = getattr(message.author, "id", "unknown")
+        author_marker = " [bot]" if getattr(message.author, "bot", False) else ""
+        timestamp = message.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+        content = (message.content or "[empty message]").replace("\r", " ").replace("\n", " ").strip()
+
+        extra_parts = []
+        if message.attachments:
+            filenames = ", ".join(att.filename for att in message.attachments)
+            extra_parts.append(f"attachments: {filenames}")
+        if message.embeds:
+            extra_parts.append(f"embeds: {len(message.embeds)}")
+        if message.reference and message.reference.message_id:
+            extra_parts.append(f"reply_to_message_id: {message.reference.message_id}")
+
+        extra = f" ({'; '.join(extra_parts)})" if extra_parts else ""
+        return f"[{timestamp}] {author_name}{author_marker} (User ID: {author_id}): {content}{extra}"
+
+    async def _format_message_content(self, message: discord.Message, model_name: str = None, *, current_message: bool = False):
         """
         Format message content with attachments processed for the specified model.
         If model_name is not provided, uses MAIN_LLM_MODEL.
@@ -240,11 +280,12 @@ class ContextManager:
         content_parts = []
         
         # Add user information for identification
-        user_info = f"**{message.author.display_name}** (User ID: {message.author.id})"
+        user_info = f"{message.author.display_name} (User ID: {message.author.id})"
+        prefix = "Current Discord message to answer from " if current_message else "Discord message from "
         if message.content:
-            content_parts.append({"type": "text", "text": f"{user_info}: {message.content}"})
+            content_parts.append({"type": "text", "text": f"{prefix}{user_info}:\n{message.content}"})
         else:
-            content_parts.append({"type": "text", "text": f"{user_info}: [empty message]"})
+            content_parts.append({"type": "text", "text": f"{prefix}{user_info}:\n[empty message]"})
 
 
         if message.attachments:

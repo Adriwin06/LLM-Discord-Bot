@@ -5,6 +5,7 @@ import logging
 import json
 import re
 import asyncio
+from collections import OrderedDict
 from datetime import datetime, timezone
 from .utilities import MessageChunker
 
@@ -13,16 +14,27 @@ class EventHandler(commands.Cog):
         self.bot = bot
         # Lock to prevent multiple messages from triggering summaries/profiles simultaneously
         self._processing_lock = asyncio.Lock()
+        self._seen_message_ids = OrderedDict()
+        self._seen_message_limit = 1000
+        self._summary_tasks = set()
+        self._profile_tasks = set()
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        if message.author.bot:
+        if message.author.bot or not message.guild:
+            return
+
+        if not self._claim_message(message.id):
+            logging.info(f"Ignoring duplicate on_message event for message {message.id}.")
             return
 
         # Use lock to prevent race conditions in message processing
         async with self._processing_lock:
             # Get settings first for bypass conditions
-            _, settings = await self.bot.context_manager.build_context(message)
+            settings = await self.bot.context_manager.get_guild_and_channel_settings(
+                str(message.guild.id),
+                str(message.channel.id)
+            )
             
             # Update counters and trigger summaries/profiles
             await self._update_counters_and_triggers(message, settings)
@@ -38,13 +50,25 @@ class EventHandler(commands.Cog):
                 except discord.HTTPException:
                     logging.warning(f"Failed to add reaction '{reaction}'. It might be an invalid or custom emoji not available.")
 
+    def _claim_message(self, message_id: int) -> bool:
+        """Return False if this Discord message was already handled recently."""
+        if message_id in self._seen_message_ids:
+            return False
+
+        self._seen_message_ids[message_id] = None
+        while len(self._seen_message_ids) > self._seen_message_limit:
+            self._seen_message_ids.popitem(last=False)
+        return True
+
     async def _should_reply_or_react(self, message: discord.Message, settings: dict):
         # Bypass commands - don't trigger LLM for messages starting with "!"
         if message.content.startswith("!"):
             return False, None
         
         # Bypass conditions
-        is_reply_to_bot = message.reference and message.reference.resolved.author == self.bot.user
+        resolved_reference = message.reference.resolved if message.reference else None
+        reference_author = getattr(resolved_reference, "author", None)
+        is_reply_to_bot = reference_author == self.bot.user
         mentions_bot = self.bot.user in message.mentions
 
         if (settings.get("bypass_on_reply", True) and is_reply_to_bot) or \
@@ -66,6 +90,7 @@ class EventHandler(commands.Cog):
         decision_prompt = """
         You are a decision-making model for a Discord bot.
         Based on the provided context, decide if the bot should reply, react with an emoji, or do nothing.
+        The final user message is the only live message to judge; earlier conversation history is background context only.
         The bot should reply if it's directly addressed, asked a question, or can provide a meaningful contribution.
         The bot should react if the message is emotional, a simple acknowledgement is needed, or contains engaging media.
         Otherwise, the bot should do nothing.
@@ -110,7 +135,7 @@ class EventHandler(commands.Cog):
             cleaned_content = self._clean_json_response(raw_content)
             
             decision_json = json.loads(cleaned_content)
-            action = decision_json.get("action", "none")
+            action = str(decision_json.get("action", "none")).lower()
             reaction = decision_json.get("reaction")
 
             if action == "reply":
@@ -128,10 +153,11 @@ class EventHandler(commands.Cog):
         user_id = str(message.author.id)
 
         try:
-            # Use the data store's lock to prevent race conditions
-            async with self.bot.store._lock:
+            # Use the data store's lock to prevent race conditions without
+            # re-entering Store.save_data(), which also owns this lock.
+            async with self.bot.store.data_lock:
                 # Get fresh data to avoid conflicts
-                fresh_data = await self.bot.store.get_data()
+                fresh_data = await self.bot.store._read_json(self.bot.store.data_path)
                 
                 # Ensure paths exist
                 if str(guild_id) not in fresh_data:
@@ -156,7 +182,7 @@ class EventHandler(commands.Cog):
                 user_data["messages_since_profile_update"] = profile_msg_count
 
                 # Save counter updates first
-                await self.bot.store.save_data(fresh_data)
+                await self.bot.store._write_json(self.bot.store.data_path, fresh_data)
                 
                 # Check triggers and schedule asynchronously to avoid blocking
                 should_update_summary = False
@@ -205,15 +231,42 @@ class EventHandler(commands.Cog):
 
             # Execute updates asynchronously outside the lock to prevent deadlock
             if should_update_summary:
-                # Schedule summary update asynchronously
-                asyncio.create_task(self.bot.context_manager.update_channel_summary(guild_id, channel_id))
+                self._schedule_summary_update(guild_id, channel_id)
                 
             if should_update_profile:
-                # Schedule profile update asynchronously
-                asyncio.create_task(self.bot.context_manager.update_user_profile(guild_id, user_id, message.guild))
+                self._schedule_profile_update(guild_id, user_id, message.guild)
 
         except Exception as e:
             logging.error(f"Error updating counters and triggers: {e}")
+
+    def _schedule_summary_update(self, guild_id: str, channel_id: str):
+        key = (guild_id, channel_id)
+        if key in self._summary_tasks:
+            logging.info(f"Summary update already running for channel {channel_id}; skipping duplicate trigger.")
+            return
+
+        self._summary_tasks.add(key)
+        task = asyncio.create_task(self.bot.context_manager.update_channel_summary(guild_id, channel_id))
+        task.add_done_callback(lambda done_task, task_key=key: self._finish_background_task(done_task, self._summary_tasks, task_key, "summary"))
+
+    def _schedule_profile_update(self, guild_id: str, user_id: str, guild: discord.Guild):
+        key = (guild_id, user_id)
+        if key in self._profile_tasks:
+            logging.info(f"Profile update already running for user {user_id}; skipping duplicate trigger.")
+            return
+
+        self._profile_tasks.add(key)
+        task = asyncio.create_task(self.bot.context_manager.update_user_profile(guild_id, user_id, guild))
+        task.add_done_callback(lambda done_task, task_key=key: self._finish_background_task(done_task, self._profile_tasks, task_key, "profile"))
+
+    def _finish_background_task(self, task: asyncio.Task, task_set: set, key: tuple, label: str):
+        task_set.discard(key)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            logging.info(f"Background {label} task for {key} was cancelled.")
+        except Exception as e:
+            logging.error(f"Background {label} task for {key} failed: {e}")
 
     async def _generate_and_send_reply(self, message: discord.Message, settings: dict):
         try:
@@ -231,6 +284,7 @@ class EventHandler(commands.Cog):
                     return
 
                 content = response.choices[0].message.content
+                content = self._sanitize_reply_content(content, message.guild)
                 
                 # Resolve mentions
                 content = await self._resolve_mentions(content, message.guild)
@@ -292,6 +346,35 @@ class EventHandler(commands.Cog):
         # Remove any remaining leading/trailing whitespace
         content = content.strip()
         
+        return content
+
+    def _sanitize_reply_content(self, content: str, guild: discord.Guild = None) -> str:
+        """Remove model-leaked speaker labels from the start of a Discord reply."""
+        content = content.strip()
+        if not self.bot.user:
+            return content
+
+        bot_id = str(self.bot.user.id)
+        names = {
+            getattr(self.bot.user, "name", ""),
+            getattr(self.bot.user, "display_name", ""),
+            str(self.bot.user),
+        }
+        if guild and guild.me:
+            names.add(getattr(guild.me, "display_name", ""))
+        names = {name for name in names if name}
+
+        for name in names:
+            escaped = re.escape(name)
+            patterns = [
+                rf"^\s*\*\*{escaped}\*\*\s*(?:\((?:User ID|ID):\s*{bot_id}\))?\s*[:\-]\s*",
+                rf"^\s*{escaped}\s*(?:\((?:User ID|ID):\s*{bot_id}\))?\s*[:\-]\s*",
+            ]
+            for pattern in patterns:
+                content = re.sub(pattern, "", content, count=1, flags=re.IGNORECASE).lstrip()
+
+        content = re.sub(rf"^\s*<@!?{bot_id}>\s*[:\-]\s*", "", content, count=1).lstrip()
+        content = re.sub(r"^\s*(?:assistant|bot)\s*[:\-]\s*", "", content, count=1, flags=re.IGNORECASE).lstrip()
         return content
 
 async def setup(bot):
