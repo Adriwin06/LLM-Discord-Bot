@@ -24,6 +24,7 @@ class LiteLLMProvider:
         self.decision_llm_rate_limiter = asyncio.Semaphore(1)
         self.main_llm_last_call = 0
         self.decision_llm_last_call = 0
+        self.last_error = None
 
     async def _rate_limit(self, limiter_type: str):
         """
@@ -73,6 +74,7 @@ class LiteLLMProvider:
         """
         limiter_type = 'main' if model == self.config.MAIN_LLM_MODEL else 'decision'
         await self._rate_limit(limiter_type)
+        self.last_error = None
         
         try:
             # Set API keys for providers
@@ -91,7 +93,13 @@ class LiteLLMProvider:
                 completion_kwargs.get('response_format', {}).get('type') == 'json_object'
             )
             
-            if self.supports_web_search(model) and not has_json_response_format and self.config.WEB_SEARCH_ENABLED:
+            has_local_tools = 'tools' in completion_kwargs
+            auto_web_search_enabled = (
+                self.config.WEB_SEARCH_ENABLED and
+                getattr(self.config, "WEB_SEARCH_AUTO_ENABLED", False)
+            )
+
+            if self.supports_web_search(model) and not has_json_response_format and not has_local_tools and auto_web_search_enabled:
                 # Add web search options if not already provided in kwargs
                 # Skip web search if JSON response format is requested due to tool conflicts
                 if 'web_search_options' not in completion_kwargs:
@@ -101,8 +109,10 @@ class LiteLLMProvider:
                 logging.info(f"Using web search for model {model} with options: {completion_kwargs.get('web_search_options')}")
             elif self.supports_web_search(model) and has_json_response_format:
                 logging.info(f"Skipping web search for model {model} due to JSON response format requirement")
-            elif self.supports_web_search(model) and not self.config.WEB_SEARCH_ENABLED:
-                logging.info(f"Web search disabled in configuration for model {model}")
+            elif self.supports_web_search(model) and has_local_tools:
+                logging.info(f"Skipping provider-side web search for model {model}; explicit local tools are available")
+            elif self.supports_web_search(model) and not auto_web_search_enabled:
+                logging.info(f"Provider-side automatic web search disabled in configuration for model {model}")
 
             # Use the async completion function directly
             response = await acompletion(
@@ -112,8 +122,44 @@ class LiteLLMProvider:
             )
             return response
         except Exception as e:
+            if 'tools' in completion_kwargs and 'web_search_options' in completion_kwargs:
+                self._record_error(model, e)
+                logging.warning(
+                    f"LiteLLM completion error for model {model} with local tools and web search: {e}. "
+                    "Retrying without provider web search options."
+                )
+                completion_kwargs.pop('web_search_options', None)
+                try:
+                    response = await acompletion(
+                        model=model,
+                        messages=messages,
+                        **completion_kwargs
+                    )
+                    return response
+                except Exception as retry_error:
+                    self._record_error(model, retry_error)
+                    logging.error(f"LiteLLM retry without web search failed for model {model}: {retry_error}")
+                    return None
+
+            self._record_error(model, e)
             logging.error(f"LiteLLM completion error for model {model}: {e}")
             return None
+
+    def _record_error(self, model: str, error: Exception):
+        self.last_error = {
+            "model": model,
+            "type": type(error).__name__,
+            "message": str(error),
+        }
+
+    def get_last_error_message(self) -> str:
+        if not self.last_error:
+            return "No provider error was recorded."
+
+        error_type = self.last_error.get("type", "Error")
+        model = self.last_error.get("model", "unknown model")
+        message = self.last_error.get("message", "")
+        return f"{error_type} from {model}: {message}"
 
     def supports_vision(self, model: str) -> bool:
         # Check if LiteLLM has built-in support detection

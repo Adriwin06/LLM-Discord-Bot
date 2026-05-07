@@ -277,13 +277,13 @@ class EventHandler(commands.Cog):
                 # Build context specifically for the main model (includes full media processing for that model)
                 main_context, _ = await self.bot.context_manager.build_context(message, model_name=main_model)
                 
-                response = await self.bot.llm_provider.create_completion(model=main_model, messages=main_context)
-
-                if not response or not response.choices or not response.choices[0].message.content:
+                content = await self._generate_reply_content(main_model, main_context, message, settings)
+                if not content:
                     logging.error(f"Main model failed to generate a response for message {message.id}.")
+                    await self._send_generation_error(message)
                     return
 
-                content = response.choices[0].message.content
+                content = self._normalize_reply_content(content)
                 content = self._sanitize_reply_content(content, message.guild)
                 
                 # Resolve mentions
@@ -299,9 +299,203 @@ class EventHandler(commands.Cog):
         except Exception as e:
             logging.error(f"Error in _generate_and_send_reply: {e}")
             try:
-                await message.reply("Sorry, I encountered an error while generating a response.")
+                await self._send_generation_error(message, e)
             except Exception as fallback_error:
                 logging.error(f"Failed to send error message: {fallback_error}")
+
+    async def _send_generation_error(self, message: discord.Message, error: Exception = None):
+        if error:
+            error_text = f"{type(error).__name__}: {error}"
+        else:
+            error_text = self.bot.llm_provider.get_last_error_message()
+
+        error_text = self._safe_error_text(error_text)
+        await message.reply(f"Sorry, I couldn't generate a reply.\n```text\n{error_text}\n```")
+
+    def _safe_error_text(self, error_text: str, max_length: int = 1500) -> str:
+        error_text = str(error_text or "Unknown error").strip()
+
+        sensitive_values = [
+            getattr(self.bot.config, "DISCORD_TOKEN", None),
+            getattr(self.bot.config, "OPENAI_API_KEY", None),
+            getattr(self.bot.config, "GEMINI_API_KEY", None),
+            getattr(self.bot.config, "ANTHROPIC_API_KEY", None),
+        ]
+        for value in sensitive_values:
+            if value:
+                error_text = error_text.replace(value, "[redacted]")
+
+        error_text = error_text.replace("```", "'''")
+        if len(error_text) > max_length:
+            error_text = error_text[:max_length - 3].rstrip() + "..."
+        return error_text
+
+    async def _generate_reply_content(self, model: str, messages: list, origin_message: discord.Message, settings: dict):
+        if not self._tools_enabled(settings):
+            response = await self.bot.llm_provider.create_completion(model=model, messages=messages)
+            return self._response_content(response)
+
+        tool_manager = getattr(self.bot, "tool_manager", None)
+        if not tool_manager:
+            response = await self.bot.llm_provider.create_completion(model=model, messages=messages)
+            return self._response_content(response)
+
+        tool_messages = list(messages)
+        tool_messages.append({
+            "role": "system",
+            "content": "Final Discord replies must be plain message text only. Do not return JSON, do not include `content` or `reactions` fields, and do not list available tools."
+        })
+        tools = tool_manager.tool_definitions()
+        max_rounds = max(0, int(getattr(self.bot.config, "TOOL_MAX_ROUNDS", 0)))
+
+        response = await self.bot.llm_provider.create_completion(
+            model=model,
+            messages=tool_messages,
+            tools=tools,
+            tool_choice="auto"
+        )
+        if not response:
+            logging.warning("Tool-capable completion failed; retrying without local tools.")
+            response = await self.bot.llm_provider.create_completion(model=model, messages=messages)
+            return self._response_content(response)
+
+        tool_round = 0
+        while max_rounds == 0 or tool_round < max_rounds:
+            assistant_message = self._response_message(response)
+            tool_calls = tool_manager.get_tool_calls(assistant_message)
+            if not tool_calls:
+                return self._message_content(assistant_message)
+
+            tool_round += 1
+            logging.info(f"Model requested {len(tool_calls)} Discord tool call(s) in round {tool_round}.")
+            tool_messages.append(tool_manager.assistant_message_for_history(assistant_message, tool_calls))
+
+            for tool_call in tool_calls:
+                tool_name, _ = tool_manager.parse_tool_call(tool_call)
+                result = await tool_manager.execute_tool_call(tool_call, origin_message)
+                logging.info(f"Executed Discord tool '{tool_name}' for message {origin_message.id}.")
+                tool_messages.append(tool_manager.tool_result_message(tool_call, result))
+
+            response = await self.bot.llm_provider.create_completion(
+                model=model,
+                messages=tool_messages,
+                tools=tools,
+                tool_choice="auto"
+            )
+            if not response:
+                logging.warning("Completion after Discord tool call failed; forcing a final response without tools.")
+                break
+
+        stop_reason = (
+            "Tool loop stopped because a completion failed. Use the tool results already provided to write one final Discord reply now."
+            if max_rounds == 0
+            else "Tool call limit reached. Use the tool results already provided to write one final Discord reply now."
+        )
+        tool_messages.append({
+            "role": "system",
+            "content": stop_reason
+        })
+        response = await self.bot.llm_provider.create_completion(model=model, messages=tool_messages)
+        return self._response_content(response)
+
+    def _tools_enabled(self, settings: dict) -> bool:
+        if not getattr(self.bot.config, "TOOLS_ENABLED", True):
+            return False
+
+        if settings.get("tools_enabled") is not None:
+            return bool(settings.get("tools_enabled"))
+
+        tool_settings = settings.get("tools", {})
+        if isinstance(tool_settings, dict) and tool_settings.get("enabled") is not None:
+            return bool(tool_settings.get("enabled"))
+
+        return True
+
+    def _response_message(self, response):
+        if not response or not getattr(response, "choices", None):
+            return None
+        choice = response.choices[0]
+        if isinstance(choice, dict):
+            return choice.get("message")
+        return getattr(choice, "message", None)
+
+    def _response_content(self, response):
+        return self._message_content(self._response_message(response))
+
+    def _message_content(self, message):
+        if not message:
+            return None
+        if isinstance(message, dict):
+            return message.get("content")
+        return getattr(message, "content", None)
+
+    def _normalize_reply_content(self, content: str) -> str:
+        """Convert common model-emitted response envelopes into plain Discord text."""
+        content = str(content or "").strip()
+        cleaned = self._clean_json_response(content)
+
+        jsonish_content = self._extract_jsonish_reply_field(cleaned)
+        if jsonish_content:
+            return jsonish_content
+
+        try:
+            parsed = json.loads(cleaned)
+        except (json.JSONDecodeError, TypeError):
+            return content
+
+        if isinstance(parsed, dict):
+            for key in ("content", "message", "reply", "text"):
+                value = parsed.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+
+        return content
+
+    def _extract_jsonish_reply_field(self, content: str) -> str:
+        """
+        Best-effort extraction for model replies that look like
+        {"content":"...","reactions":...} but are not valid JSON.
+        """
+        if not content.lstrip().startswith("{"):
+            return ""
+
+        for key in ("content", "message", "reply", "text"):
+            extracted = self._extract_jsonish_string_value(content, key)
+            if extracted:
+                return extracted
+        return ""
+
+    def _extract_jsonish_string_value(self, content: str, key: str) -> str:
+        match = re.search(rf'["\']{re.escape(key)}["\']\s*:\s*["\']', content)
+        if not match:
+            return ""
+
+        quote = content[match.end() - 1]
+        value_start = match.end()
+        escaped = False
+        chars = []
+
+        for char in content[value_start:]:
+            if escaped:
+                chars.append("\\" + char)
+                escaped = False
+                continue
+
+            if char == "\\":
+                escaped = True
+                continue
+
+            if char == quote:
+                raw_value = "".join(chars)
+                try:
+                    return json.loads(f'"{raw_value}"').strip()
+                except json.JSONDecodeError:
+                    return raw_value.replace("\\n", "\n").replace("\\t", "\t").strip()
+
+            chars.append(char)
+
+        raw_value = "".join(chars)
+        return raw_value.replace("\\n", "\n").replace("\\t", "\t").strip()
 
     async def _resolve_mentions(self, content: str, guild: discord.Guild) -> str:
         mention_pattern = re.compile(r'<mention (user|role)="([^"]+)">')

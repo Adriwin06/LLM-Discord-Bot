@@ -11,6 +11,7 @@ from bot.config import Config
 from bot.store import Store
 from bot.llm_provider import LiteLLMProvider
 from bot.context_manager import ContextManager
+from bot.discord_tools import DiscordToolManager
 
 
 # Configure logging
@@ -30,6 +31,7 @@ class LLMDiscordBot(commands.Bot):
         self.store = Store()
         self.llm_provider = LiteLLMProvider(self.config)
         self.context_manager = ContextManager(self.store, self.llm_provider, self)
+        self.tool_manager = DiscordToolManager(self)
         self.shutdown_event = asyncio.Event()
 
     async def setup_hook(self):

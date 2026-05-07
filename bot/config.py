@@ -37,7 +37,13 @@ class Config:
 
         # Web Search Configuration
         self.WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "True").lower() == "true"
+        self.WEB_SEARCH_AUTO_ENABLED = os.getenv("WEB_SEARCH_AUTO_ENABLED", "False").lower() == "true"
         self.WEB_SEARCH_CONTEXT_SIZE = os.getenv("WEB_SEARCH_CONTEXT_SIZE", "medium")
+        self.WEB_FETCH_MAX_CHARS = int(os.getenv("WEB_FETCH_MAX_CHARS", 6000))
+
+        # Agentic Tool Configuration
+        self.TOOLS_ENABLED = os.getenv("TOOLS_ENABLED", "True").lower() == "true"
+        self.TOOL_MAX_ROUNDS = int(os.getenv("TOOL_MAX_ROUNDS", 0))
 
         # Backup Configuration
         self.BACKUP_INTERVAL_HOURS = int(os.getenv("BACKUP_INTERVAL_HOURS", 24))
