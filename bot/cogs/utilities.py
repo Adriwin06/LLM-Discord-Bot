@@ -214,6 +214,14 @@ class AdvancedPaginationView(discord.ui.View):
                         value=field.get("value", "No value"),
                         inline=field.get("inline", False)
                     )
+
+                thumbnail_url = page_data.get("thumbnail_url")
+                if thumbnail_url:
+                    embed.set_thumbnail(url=thumbnail_url)
+
+                image_url = page_data.get("image_url")
+                if image_url:
+                    embed.set_image(url=image_url)
         
         # Add metadata fields
         for key, value in self.metadata.items():
@@ -223,6 +231,90 @@ class AdvancedPaginationView(discord.ui.View):
             embed.set_footer(text=f"Page {self.current_page + 1} of {len(self.pages)}")
         
         return embed
+
+    @staticmethod
+    async def send_paginated_text(
+        interaction: discord.Interaction,
+        content: str,
+        title: str,
+        color: discord.Color = discord.Color.blue(),
+        ephemeral: bool = False,
+        max_chars_per_page: int = 1800,
+        use_embed_for_single: bool = True,
+        fields: Optional[List[Dict[str, Any]]] = None,
+        thumbnail_url: Optional[str] = None,
+        image_url: Optional[str] = None
+    ) -> Optional[discord.Message]:
+        safe_content = content or "No content."
+        pages = MessageChunker.split_content(safe_content, max_length=max_chars_per_page)
+        if not pages:
+            pages = ["No content."]
+
+        if len(pages) == 1:
+            if not use_embed_for_single and not fields and not thumbnail_url and not image_url:
+                return await AdvancedPaginationView._send_interaction_message(
+                    interaction,
+                    content=pages[0],
+                    ephemeral=ephemeral
+                )
+
+            embed = discord.Embed(title=title, description=pages[0], color=color)
+            if thumbnail_url:
+                embed.set_thumbnail(url=thumbnail_url)
+            if image_url:
+                embed.set_image(url=image_url)
+            if fields:
+                for field in fields:
+                    embed.add_field(
+                        name=field.get("name", "Field"),
+                        value=field.get("value", "No value"),
+                        inline=field.get("inline", False)
+                    )
+            return await AdvancedPaginationView._send_interaction_message(
+                interaction,
+                embed=embed,
+                ephemeral=ephemeral
+            )
+
+        page_entries = []
+        for page in pages:
+            entry = {"description": page}
+            if fields:
+                entry["fields"] = fields
+            if thumbnail_url:
+                entry["thumbnail_url"] = thumbnail_url
+            if image_url:
+                entry["image_url"] = image_url
+            page_entries.append(entry)
+
+        view = AdvancedPaginationView(content=page_entries, title=title, color=color)
+        embed = view.create_embed()
+        return await AdvancedPaginationView._send_interaction_message(
+            interaction,
+            embed=embed,
+            view=view,
+            ephemeral=ephemeral
+        )
+
+    @staticmethod
+    async def _send_interaction_message(
+        interaction: discord.Interaction,
+        content: Optional[str] = None,
+        embed: Optional[discord.Embed] = None,
+        view: Optional[discord.ui.View] = None,
+        ephemeral: bool = False
+    ) -> Optional[discord.Message]:
+        send_kwargs: Dict[str, Any] = {"ephemeral": ephemeral}
+        if content is not None:
+            send_kwargs["content"] = content
+        if embed is not None:
+            send_kwargs["embed"] = embed
+        if view is not None:
+            send_kwargs["view"] = view
+
+        if interaction.response.is_done():
+            return await interaction.followup.send(**send_kwargs)
+        return await interaction.response.send_message(**send_kwargs)
 
 
 class MessageChunker:
@@ -598,10 +690,12 @@ class Utilities(commands.Cog):
         test_content += "\n\nThis content is intentionally long to demonstrate how the chunking system "
         test_content += "splits messages at natural break points while preserving formatting. " * 50
         
-        # Send chunked message
-        await MessageChunker.send_chunked_message(
-            target=interaction,
+        # Send paginated message
+        await AdvancedPaginationView.send_paginated_text(
+            interaction=interaction,
             content=test_content,
+            title="Test Chunking",
+            color=discord.Color.purple(),
             ephemeral=True
         )
 

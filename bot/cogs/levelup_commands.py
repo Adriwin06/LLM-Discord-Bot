@@ -11,7 +11,7 @@ from typing import Optional, Dict, Any, List, Tuple, Callable
 import aiofiles
 import os
 import asyncio
-from .utilities import UtilityHelpers
+from .utilities import UtilityHelpers, AdvancedPaginationView
 
 # Interactive View for the Leaderboard
 class LeaderboardView(discord.ui.View):
@@ -429,66 +429,51 @@ class LevelUpCommands(commands.Cog):
             rolebonus = config.get("rolebonus", {"msg": {}, "voice": {}})
             prestigedata = config.get("prestigedata", {})
             
-            embed = discord.Embed(title="LevelUp Settings", color=discord.Color.red())
-            embed.set_author(name=interaction.guild.name, icon_url=interaction.guild.icon.url if interaction.guild.icon else None)
+            sections = []
+            needs_pagination = False
 
-            embed.add_field(
-                name="Main",
-                value=(
-                    f"System Enabled: {fmt_bool(config.get('enabled', True))}\n"
-                    f"Profile Type: Embeds\n"
-                    f"Style Override: None\n"
-                    f"Include Balance: No"
-                ),
-                inline=False
+            main_value = (
+                f"System Enabled: {fmt_bool(config.get('enabled', True))}\n"
+                f"Profile Type: Embeds\n"
+                f"Style Override: None\n"
+                f"Include Balance: No"
             )
+            sections.append(("Main", main_value))
 
-            embed.add_field(
-                name="Messages",
-                value=(
-                    f"Message XP: {msgxp.get('min', 3)} - {msgxp.get('max', 6)}\n"
-                    f"Min Msg Length: {config.get('min_length', 4)}\n"
-                    f"Cooldown: {config.get('cooldown', 60)} seconds\n"
-                    f"Command XP: False"
-                ),
-                inline=False
+            messages_value = (
+                f"Message XP: {msgxp.get('min', 3)} - {msgxp.get('max', 6)}\n"
+                f"Min Msg Length: {config.get('min_length', 4)}\n"
+                f"Cooldown: {config.get('cooldown', 60)} seconds\n"
+                f"Command XP: False"
             )
+            sections.append(("Messages", messages_value))
 
-            embed.add_field(
-                name="Voice",
-                value=(
-                    f"Voice XP: {voice.get('xp_per_minute', 1.0)} per minute\n"
-                    f"Ignore Muted: {fmt_bool(voice.get('ignore_muted', False))}\n"
-                    f"Ignore Solo: {fmt_bool(voice.get('ignore_solo', False))}\n"
-                    f"Ignore Deafened: {fmt_bool(voice.get('ignore_deafened', False))}\n"
-                    f"Ignore Invisible: True" # Hardcoded as per screenshot
-                ),
-                inline=False
+            voice_value = (
+                f"Voice XP: {voice.get('xp_per_minute', 1.0)} per minute\n"
+                f"Ignore Muted: {fmt_bool(voice.get('ignore_muted', False))}\n"
+                f"Ignore Solo: {fmt_bool(voice.get('ignore_solo', False))}\n"
+                f"Ignore Deafened: {fmt_bool(voice.get('ignore_deafened', False))}\n"
+                f"Ignore Invisible: True"
             )
+            sections.append(("Voice", voice_value))
 
-            embed.add_field(
-                name="Level Algorithm",
-                value=(
-                    "Base Multiplier: 100\n"
-                    "Exp Multiplier: 2.0\n"
-                    "Equation: 100 x (level ^ 2.0) = XP"
-                ),
-                inline=False
+            algorithm_value = (
+                "Base Multiplier: 100\n"
+                "Exp Multiplier: 2.0\n"
+                "Equation: 100 x (level ^ 2.0) = XP"
             )
+            sections.append(("Level Algorithm", algorithm_value))
 
-            embed.add_field(
-                name="LevelUps",
-                value=(
-                    f"Notify In channel: {fmt_bool(config.get('notify', True))}\n"
-                    f"• Send levelup message in the channel the user is typing in\n"
-                    f"Notify in DMs: False\n"
-                    f"• Log channel for levelup messages\n"
-                    f"Notify Channel: {fmt_channel(config.get('notifylog'))}\n"
-                    f"Mention User: False\n" # Hardcoded as per screenshot
-                    f"AutoRemove Roles: {fmt_bool(config.get('autoremove', True))}"
-                ),
-                inline=False
+            levelups_value = (
+                f"Notify In channel: {fmt_bool(config.get('notify', True))}\n"
+                f"• Send levelup message in the channel the user is typing in\n"
+                f"Notify in DMs: False\n"
+                f"• Log channel for levelup messages\n"
+                f"Notify Channel: {fmt_channel(config.get('notifylog'))}\n"
+                f"Mention User: False\n"
+                f"AutoRemove Roles: {fmt_bool(config.get('autoremove', True))}"
             )
+            sections.append(("LevelUps", levelups_value))
 
             levelroles = config.get("levelroles", {})
             if levelroles:
@@ -497,7 +482,10 @@ class LevelUpCommands(commands.Cog):
                 for lvl, rid in sorted(levelroles.items(), key=lambda x: int(x[0]), reverse=True):
                     r = self._get_role_by_id(interaction.guild, rid)
                     lr_lines.append(f"• Level {lvl}: {r.mention if r else f'(deleted role {rid})'}")
-                embed.add_field(name="Level Roles", value="\n".join(lr_lines)[:1024], inline=False)
+                levelroles_value = "\n".join(lr_lines)
+                sections.append(("Level Roles", levelroles_value))
+                if len(levelroles_value) > 1024:
+                    needs_pagination = True
 
             if prestigedata:
                 pr_lines = [
@@ -508,11 +496,15 @@ class LevelUpCommands(commands.Cog):
                 for pl, pdata in sorted(prestigedata.items(), key=lambda x: int(x[0])):
                     r = self._get_role_by_id(interaction.guild, pdata.get("role", 0))
                     pr_lines.append(f"• Prestige {pl}: {r.mention if r else 'No Role'}")
-                embed.add_field(name="Prestige", value="\n".join(pr_lines)[:1024], inline=False)
+                prestige_value = "\n".join(pr_lines)
+                sections.append(("Prestige", prestige_value))
+                if len(prestige_value) > 1024:
+                    needs_pagination = True
 
             # FIXED: fmt_bonus now correctly displays the raw data from json
             def fmt_bonus(d):
-                if not d: return "None"
+                if not d:
+                    return "None"
                 parts = []
                 for rid, bonus in d.items():
                     role_obj = self._get_role_by_id(interaction.guild, rid)
@@ -521,21 +513,57 @@ class LevelUpCommands(commands.Cog):
 
             msg_bonus = rolebonus.get("msg", {})
             if msg_bonus:
-                embed.add_field(name="Message XP Bonus Roles", value=fmt_bonus(msg_bonus)[:1024], inline=False)
-            
+                msg_bonus_value = fmt_bonus(msg_bonus)
+                sections.append(("Message XP Bonus Roles", msg_bonus_value))
+                if len(msg_bonus_value) > 1024:
+                    needs_pagination = True
+
             voice_bonus = rolebonus.get("voice", {})
             if voice_bonus:
-                embed.add_field(name="Voice XP Bonus Roles", value=fmt_bonus(voice_bonus)[:1024], inline=False)
+                voice_bonus_value = fmt_bonus(voice_bonus)
+                sections.append(("Voice XP Bonus Roles", voice_bonus_value))
+                if len(voice_bonus_value) > 1024:
+                    needs_pagination = True
 
             ignored_channels = config.get("ignoredchannels", [])
             if ignored_channels:
                 ch_text = " ".join(fmt_channel(c) for c in ignored_channels)
-                embed.add_field(name="Ignored Channels", value=ch_text[:1024], inline=False)
+                sections.append(("Ignored Channels", ch_text))
+                if len(ch_text) > 1024:
+                    needs_pagination = True
 
             ignored_users = config.get("ignoredusers", [])
             if ignored_users:
                 user_text = " ".join(f"<@{u}>" for u in ignored_users)
-                embed.add_field(name="Ignored Users", value=user_text[:1024], inline=False)
+                sections.append(("Ignored Users", user_text))
+                if len(user_text) > 1024:
+                    needs_pagination = True
+
+            settings_text = "\n\n".join(
+                f"**{section_title}**\n{section_value}" for section_title, section_value in sections
+            )
+            if len(settings_text) > 1800:
+                needs_pagination = True
+
+            if needs_pagination:
+                await AdvancedPaginationView.send_paginated_text(
+                    interaction=interaction,
+                    content=settings_text,
+                    title="LevelUp Settings",
+                    color=discord.Color.red(),
+                    ephemeral=False
+                )
+                return
+
+            embed = discord.Embed(title="LevelUp Settings", color=discord.Color.red())
+            embed.set_author(name=interaction.guild.name, icon_url=interaction.guild.icon.url if interaction.guild.icon else None)
+
+            for section_title, section_value in sections:
+                embed.add_field(
+                    name=section_title,
+                    value=section_value[:1024] if section_value else "None",
+                    inline=False
+                )
 
             # --- END OF MAJOR REFACTOR ---
 
@@ -605,8 +633,19 @@ class LevelUpCommands(commands.Cog):
                 role_obj = self._get_role_by_id(interaction.guild, role_id)
                 role_name = role_obj.name if role_obj else f"Unknown Role ({role_id})"
                 role_list.append(f"Level {lvl}: {role_name}")
-            
-            embed.description = "\n".join(role_list) if role_list else "No level roles found."
+
+            role_text = "\n".join(role_list) if role_list else "No level roles found."
+            if len(role_text) > 1800:
+                await AdvancedPaginationView.send_paginated_text(
+                    interaction=interaction,
+                    content=role_text,
+                    title="🎭 Level Roles",
+                    color=discord.Color.blue(),
+                    ephemeral=False
+                )
+                return
+
+            embed.description = role_text
             await interaction.response.send_message(embed=embed)
             return
         
@@ -669,6 +708,19 @@ class LevelUpCommands(commands.Cog):
             
             # Show prestige level requirement
             prestigelevel = config.get("prestigelevel", 10)
+            prestige_text = (embed.description or "No prestige levels configured.")
+            prestige_text += f"\n\n**Prestige Requirement**\nLevel {prestigelevel}"
+
+            if len(prestige_text) > 1800:
+                await AdvancedPaginationView.send_paginated_text(
+                    interaction=interaction,
+                    content=prestige_text,
+                    title="⭐ Prestige System",
+                    color=embed.color,
+                    ephemeral=False
+                )
+                return
+
             embed.add_field(
                 name="📊 Prestige Requirement",
                 value=f"Level {prestigelevel}",

@@ -3,6 +3,7 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import logging
+from .utilities import AdvancedPaginationView
 
 class ProfileCommands(commands.Cog):
     def __init__(self, bot):
@@ -81,6 +82,27 @@ class ProfileCommands(commands.Cog):
             metadata_parts.append("Last AI update: Never")
             
         metadata_parts.append(f"Messages since last update: {msg_count}")
+        profile_text = (
+            f"**Manual Note**\n{manual_note or 'No manual note set.'}\n\n"
+            f"**AI-Generated Summary**\n{ai_summary or 'No AI summary available yet.'}\n\n"
+            f"**Profile Info**\n" + "\n".join(metadata_parts)
+        )
+        needs_pagination = len(profile_text) > 1800
+        if manual_note and len(manual_note) > 1024:
+            needs_pagination = True
+        if ai_summary and len(ai_summary) > 1024:
+            needs_pagination = True
+
+        if needs_pagination:
+            await AdvancedPaginationView.send_paginated_text(
+                interaction=interaction,
+                content=profile_text,
+                title=f"Profile for {user.display_name}",
+                color=discord.Color.blue(),
+                ephemeral=True
+            )
+            return
+
         embed.add_field(name="Profile Info", value="\n".join(metadata_parts), inline=False)
 
         await interaction.followup.send(embed=embed, ephemeral=True)

@@ -566,7 +566,7 @@ class AdminCommands(commands.Cog):
             if raw_format:
                 # Show raw JSON format as sent to the AI
                 import json
-                context_text = "```json\n" + json.dumps(context, indent=2, ensure_ascii=False) + "\n```"
+                context_text = json.dumps(context, indent=2, ensure_ascii=False)
             else:
                 # Show formatted version with role headers
                 context_text = ""
@@ -616,94 +616,56 @@ class AdminCommands(commands.Cog):
                         context_text += f"{content_text[:500]}...\n\n"
                     else:
                         context_text += f"{content_text}\n\n"
-            
-            # If context is too long, use MessageChunker for smart splitting
-            if len(context_text) > 1900:  # Leave room for embed formatting
-                # Use MessageChunker to split the content intelligently
-                chunks = MessageChunker.split_content(context_text, max_length=1900)
-                
-                # Create a simple embed for the first page
-                embed = discord.Embed(
-                    title=f"LLM Context Debug (Page 1/{len(chunks)})",
-                    description=chunks[0] if chunks else "No context generated.",
-                    color=discord.Color.purple()
-                )
-                
-                embed.add_field(
-                    name="Source Message",
-                    value=f"ID: {target_message.id}\nAuthor: {target_message.author.display_name}\nChannel: #{target_message.channel.name}",
-                    inline=False
-                )
-                
-                embed.add_field(
-                    name="Context Components",
-                    value=f"Bot Identity: {'✅' if include_bot_identity else '❌'}\n"
-                          f"Channel Summary: {'✅' if include_channel_summary else '❌'}\n"
-                          f"User Profiles: {'✅' if include_user_profiles else '❌'}\n"
-                          f"Conversation History: {'✅' if include_conversation_history else '❌'}\n"
-                          f"Reply Chain: {'✅' if include_reply_chain else '❌'}\n"
-                          f"Current Message: {'✅' if include_current_message else '❌'}",
-                    inline=False
-                )
-                
-                # Note: For now, just show the first page. A full pagination system would require more code.
-                if len(chunks) > 1:
-                    embed.set_footer(text=f"Note: Context is {len(chunks)} pages long. Only showing first page.")
-                
-                await interaction.followup.send(embed=embed, ephemeral=True)
-                
-                # If there are multiple pages, send additional messages
-                if len(chunks) > 1:
-                    for i, page in enumerate(chunks[1:], 2):
-                        embed = discord.Embed(
-                            title=f"LLM Context Debug (Page {i}/{len(chunks)})",
-                            description=page,
-                            color=discord.Color.purple()
-                        )
-                        await interaction.followup.send(embed=embed, ephemeral=True)
-                        
-                        # Discord rate limiting - don't send too many messages at once
-                        if i >= 5:  # Limit to 5 total messages
-                            embed = discord.Embed(
-                                title="Context Truncated",
-                                description=f"Remaining {len(chunks) - i} pages not shown to avoid rate limits.",
-                                color=discord.Color.orange()
-                            )
-                            await interaction.followup.send(embed=embed, ephemeral=True)
-                            break
+
+            common_fields = [
+                {
+                    "name": "Source Message",
+                    "value": f"ID: {target_message.id}\nAuthor: {target_message.author.display_name}\nChannel: #{target_message.channel.name}",
+                    "inline": False
+                },
+                {
+                    "name": "Context Components",
+                    "value": (
+                        f"Bot Identity: {'✅' if include_bot_identity else '❌'}\n"
+                        f"Channel Summary: {'✅' if include_channel_summary else '❌'}\n"
+                        f"User Profiles: {'✅' if include_user_profiles else '❌'}\n"
+                        f"Conversation History: {'✅' if include_conversation_history else '❌'}\n"
+                        f"Reply Chain: {'✅' if include_reply_chain else '❌'}\n"
+                        f"Current Message: {'✅' if include_current_message else '❌'}"
+                    ),
+                    "inline": False
+                },
+                {
+                    "name": "Settings Used",
+                    "value": (
+                        f"Model: {settings.get('model', 'N/A')}\n"
+                        f"Messages: {len(context)} total\n"
+                        f"Context Length: {len(context_text)} chars"
+                    ),
+                    "inline": False
+                }
+            ]
+
+            if raw_format:
+                raw_pages = MessageChunker.split_content(context_text, max_length=1800)
+                page_descriptions = [f"```json\n{page}\n```" for page in raw_pages]
             else:
-                # Context fits in one message
-                embed = discord.Embed(
-                    title="LLM Context Debug",
-                    description=context_text or "No context generated.",
-                    color=discord.Color.purple()
-                )
-                
-                embed.add_field(
-                    name="Source Message",
-                    value=f"ID: {target_message.id}\nAuthor: {target_message.author.display_name}\nChannel: #{target_message.channel.name}",
-                    inline=False
-                )
-                
-                embed.add_field(
-                    name="Context Components",
-                    value=f"Bot Identity: {'✅' if include_bot_identity else '❌'}\n"
-                          f"Channel Summary: {'✅' if include_channel_summary else '❌'}\n"
-                          f"User Profiles: {'✅' if include_user_profiles else '❌'}\n"
-                          f"Conversation History: {'✅' if include_conversation_history else '❌'}\n"
-                          f"Reply Chain: {'✅' if include_reply_chain else '❌'}\n"
-                          f"Current Message: {'✅' if include_current_message else '❌'}",
-                    inline=False
-                )
-                
-                embed.add_field(
-                    name="Settings Used",
-                    value=f"Model: {settings.get('model', 'N/A')}\n"
-                          f"Messages: {len(context)} total\n"
-                          f"Context Length: {len(context_text)} chars",
-                    inline=False
-                )
-                
+                page_descriptions = MessageChunker.split_content(context_text, max_length=1800)
+
+            if not page_descriptions:
+                page_descriptions = ["No context generated."]
+
+            pages = [{"description": page, "fields": common_fields} for page in page_descriptions]
+            view = AdvancedPaginationView(
+                content=pages,
+                title="LLM Context Debug",
+                color=discord.Color.purple()
+            )
+
+            embed = view.create_embed()
+            if len(pages) > 1:
+                await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+            else:
                 await interaction.followup.send(embed=embed, ephemeral=True)
             
             # If show_gif_frames is enabled, extract and display GIF frames separately
@@ -840,16 +802,18 @@ class AdminCommands(commands.Cog):
             success_count = sum(1 for r in results if r["success"])
             total_count = len(results)
             
-            embed = discord.Embed(
-                title=f"🔄 Reload Results ({success_count}/{total_count} successful)",
-                color=discord.Color.green() if success_count == total_count else discord.Color.orange()
-            )
+            title = f"🔄 Reload Results ({success_count}/{total_count} successful)"
+            color = discord.Color.green() if success_count == total_count else discord.Color.orange()
+            embed = discord.Embed(title=title, color=color)
             
             # Group results by type
             cog_results = [r for r in results if r["type"] == "cog"]
             config_results = [r for r in results if r["type"] == "config"]
             prompt_results = [r for r in results if r["type"] == "prompt"]
             
+            sections = []
+            needs_pagination = False
+
             if cog_results:
                 cog_text = []
                 for result in cog_results:
@@ -857,13 +821,14 @@ class AdminCommands(commands.Cog):
                     cog_text.append(f"{status} {result['name']}")
                     if not result["success"]:
                         cog_text.append(f"   └─ {result['error']}")
-                
-                embed.add_field(
-                    name=f"Cogs ({sum(1 for r in cog_results if r['success'])}/{len(cog_results)})",
-                    value="\n".join(cog_text) if cog_text else "None",
-                    inline=False
-                )
-            
+                cog_value = "\n".join(cog_text) if cog_text else "None"
+                sections.append((
+                    f"Cogs ({sum(1 for r in cog_results if r['success'])}/{len(cog_results)})",
+                    cog_value
+                ))
+                if len(cog_value) > 1000:
+                    needs_pagination = True
+
             if config_results:
                 config_text = []
                 for result in config_results:
@@ -871,13 +836,11 @@ class AdminCommands(commands.Cog):
                     config_text.append(f"{status} {result['name']}")
                     if not result["success"]:
                         config_text.append(f"   └─ {result['error']}")
-                
-                embed.add_field(
-                    name="Configuration",
-                    value="\n".join(config_text),
-                    inline=False
-                )
-            
+                config_value = "\n".join(config_text)
+                sections.append(("Configuration", config_value))
+                if len(config_value) > 1000:
+                    needs_pagination = True
+
             if prompt_results:
                 prompt_text = []
                 for result in prompt_results:
@@ -885,13 +848,30 @@ class AdminCommands(commands.Cog):
                     prompt_text.append(f"{status} {result['name']}")
                     if not result["success"]:
                         prompt_text.append(f"   └─ {result['error']}")
-                
-                embed.add_field(
-                    name="Prompts",
-                    value="\n".join(prompt_text),
-                    inline=False
+                prompt_value = "\n".join(prompt_text)
+                sections.append(("Prompts", prompt_value))
+                if len(prompt_value) > 1000:
+                    needs_pagination = True
+
+            result_text = "\n\n".join(
+                f"**{section_title}**\n{section_value}" for section_title, section_value in sections
+            )
+            if len(result_text) > 1800:
+                needs_pagination = True
+
+            if needs_pagination:
+                await AdvancedPaginationView.send_paginated_text(
+                    interaction=interaction,
+                    content=result_text or "No reload results available.",
+                    title=title,
+                    color=color,
+                    ephemeral=True
                 )
-            
+                return
+
+            for section_title, section_value in sections:
+                embed.add_field(name=section_title, value=section_value or "None", inline=False)
+
             await interaction.followup.send(embed=embed, ephemeral=True)
             
         except Exception as e:

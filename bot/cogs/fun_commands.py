@@ -4,6 +4,7 @@ from discord.ext import commands
 from discord import app_commands
 import aiohttp
 import types
+from .utilities import AdvancedPaginationView
 
 class FunCommands(commands.Cog):
     def __init__(self, bot):
@@ -77,7 +78,14 @@ Generate a similar response that's warm and grateful, but don't copy these exact
         
         if response and response.choices:
             content = response.choices[0].message.content
-            await interaction.followup.send(content)
+            await AdvancedPaginationView.send_paginated_text(
+                interaction=interaction,
+                content=content,
+                title=f"{command_type.title()} for {user.display_name}",
+                color=discord.Color.purple(),
+                ephemeral=False,
+                use_embed_for_single=False
+            )
         else:
             await interaction.followup.send(f"I couldn't think of a good {command_type} right now. Sorry!", ephemeral=True)
 
@@ -286,17 +294,19 @@ Analyze the sequence of frames to understand the full animation and create a wit
                     content = None
             
             if content:
-                # Create an embed for the response
-                embed = discord.Embed(
+                await AdvancedPaginationView.send_paginated_text(
+                    interaction=interaction,
+                    content=content,
                     title=f"{interaction.user.display_name} mocked {user.display_name}'s Profile Picture 🎭",
-                    description=content,
-                    color=discord.Color.red()
+                    color=discord.Color.red(),
+                    ephemeral=False,
+                    thumbnail_url=avatar_url
                 )
-                embed.set_thumbnail(url=avatar_url)
-                
-                await interaction.followup.send(embed=embed)
             else:
-                await interaction.followup.send(f"I couldn't come up with a good roast for {user.display_name}'s avatar right now. Maybe it's too perfect to mock! 😅", ephemeral=True)
+                await interaction.followup.send(
+                    f"I couldn't come up with a good roast for {user.display_name}'s avatar right now. Maybe it's too perfect to mock! 😅",
+                    ephemeral=True
+                )
                 
         except Exception as e:
             print(f"DEBUG: Exception occurred: {type(e).__name__}: {e}")
