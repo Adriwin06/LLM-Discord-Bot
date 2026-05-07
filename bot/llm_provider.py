@@ -39,22 +39,26 @@ class LiteLLMProvider:
         """
         if limiter_type == 'main':
             if not self.config.MAIN_LLM_RATE_LIMIT_ENABLED:
+                logging.debug("Main LLM rate limiting disabled.")
                 return
             async with self.main_llm_rate_limiter:
                 now = asyncio.get_event_loop().time()
                 elapsed = now - self.main_llm_last_call
                 delay = self.config.MAIN_LLM_RATE_LIMIT_SECONDS - elapsed
                 if delay > 0:
+                    logging.info("Rate limiting main LLM for %.2fs.", delay)
                     await asyncio.sleep(delay)
                 self.main_llm_last_call = asyncio.get_event_loop().time()
         elif limiter_type == 'decision':
             if not self.config.DECISION_LLM_RATE_LIMIT_ENABLED:
+                logging.debug("Decision LLM rate limiting disabled.")
                 return
             async with self.decision_llm_rate_limiter:
                 now = asyncio.get_event_loop().time()
                 elapsed = now - self.decision_llm_last_call
                 delay = self.config.DECISION_LLM_RATE_LIMIT_SECONDS - elapsed
                 if delay > 0:
+                    logging.info("Rate limiting decision LLM for %.2fs.", delay)
                     await asyncio.sleep(delay)
                 self.decision_llm_last_call = asyncio.get_event_loop().time()
 
@@ -79,6 +83,7 @@ class LiteLLMProvider:
         limiter_type = 'main' if model == self.config.MAIN_LLM_MODEL else 'decision'
         await self._rate_limit(limiter_type)
         self.last_error = None
+        completion_kwargs = kwargs.copy()
         
         try:
             # Set API keys for providers
@@ -89,7 +94,18 @@ class LiteLLMProvider:
                 litellm.anthropic_api_key = self.config.ANTHROPIC_API_KEY
 
             # Check if model supports web search and add web search options
-            completion_kwargs = kwargs.copy()
+            request_stats = self._message_stats(messages)
+            logging.info(
+                "LLM request starting. model=%s limiter=%s messages=%s text_chars=%s image_parts=%s tools=%s json_response=%s",
+                model,
+                limiter_type,
+                request_stats["message_count"],
+                request_stats["text_chars"],
+                request_stats["image_parts"],
+                len(completion_kwargs.get("tools") or []),
+                completion_kwargs.get("response_format", {}).get("type") == "json_object",
+            )
+            logging.debug("LLM request content stats: %s", request_stats)
             
             # Check if JSON response format is requested
             has_json_response_format = (
@@ -124,6 +140,7 @@ class LiteLLMProvider:
                 messages=messages,
                 **completion_kwargs
             )
+            self._log_response_summary(model, response)
             return response
         except Exception as e:
             if 'tools' in completion_kwargs and 'web_search_options' in completion_kwargs:
@@ -139,15 +156,79 @@ class LiteLLMProvider:
                         messages=messages,
                         **completion_kwargs
                     )
+                    self._log_response_summary(model, response)
                     return response
                 except Exception as retry_error:
                     self._record_error(model, retry_error)
-                    logging.error(f"LiteLLM retry without web search failed for model {model}: {retry_error}")
+                    logging.exception(f"LiteLLM retry without web search failed for model {model}: {retry_error}")
                     return None
 
             self._record_error(model, e)
-            logging.error(f"LiteLLM completion error for model {model}: {e}")
+            logging.exception(f"LiteLLM completion error for model {model}: {e}")
             return None
+
+    def _message_stats(self, messages: list) -> dict:
+        stats = {
+            "message_count": len(messages or []),
+            "roles": {},
+            "text_chars": 0,
+            "image_parts": 0,
+            "inline_image_parts": 0,
+            "other_parts": 0,
+        }
+
+        for message in messages or []:
+            if not isinstance(message, dict):
+                stats["other_parts"] += 1
+                continue
+
+            role = message.get("role", "unknown")
+            stats["roles"][role] = stats["roles"].get(role, 0) + 1
+            self._add_content_stats(message.get("content"), stats)
+
+        return stats
+
+    def _add_content_stats(self, content, stats: dict):
+        if isinstance(content, str):
+            stats["text_chars"] += len(content)
+            return
+
+        if isinstance(content, list):
+            for item in content:
+                self._add_content_stats(item, stats)
+            return
+
+        if isinstance(content, dict):
+            content_type = content.get("type")
+            if content_type == "text":
+                stats["text_chars"] += len(content.get("text") or "")
+            elif content_type in {"image_url", "input_image"}:
+                stats["image_parts"] += 1
+                image_url = (content.get("image_url") or {}).get("url") or content.get("image_url") or ""
+                if isinstance(image_url, str) and image_url.startswith("data:image/"):
+                    stats["inline_image_parts"] += 1
+            else:
+                stats["other_parts"] += 1
+            return
+
+        if content is not None:
+            stats["other_parts"] += 1
+
+    def _log_response_summary(self, model: str, response):
+        if not response or not getattr(response, "choices", None):
+            logging.warning("LLM response was empty or missing choices. model=%s", model)
+            return
+
+        choice = response.choices[0]
+        message = getattr(choice, "message", None)
+        content = getattr(message, "content", None) if message is not None else None
+        logging.info(
+            "LLM response received. model=%s finish_reason=%s content_chars=%s choices=%s",
+            model,
+            getattr(choice, "finish_reason", None),
+            len(content or ""),
+            len(response.choices),
+        )
 
     def _record_error(self, model: str, error: Exception):
         self.last_error = {

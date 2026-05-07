@@ -1,21 +1,78 @@
 # c:/Users/adri1/Documents/GitHub/LLM-Discord-Bot/main.py
-import logging
-
-# Configure logging as early as possible
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    force=True
-)
-logging.getLogger("discord").setLevel(logging.INFO)
-logging.getLogger("discord.http").setLevel(logging.WARNING)
-logging.info("Logging initialized.")
-
 import discord
 from discord.ext import commands, tasks
 import os
 import asyncio
 import sys
+import logging
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+def _logging_level(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if not value:
+        return default
+
+    normalized = value.strip().upper()
+    if normalized.isdigit():
+        return int(normalized)
+    return getattr(logging, normalized, default)
+
+
+def _configure_logging():
+    log_dir = Path(os.getenv("LOG_DIR", "logs"))
+    log_file = os.getenv("LOG_FILE", "bot.log")
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    root_level = _logging_level("LOG_LEVEL", logging.DEBUG)
+    console_level = _logging_level("LOG_CONSOLE_LEVEL", logging.INFO)
+    file_level = _logging_level("LOG_FILE_LEVEL", logging.DEBUG)
+    max_bytes = int(os.getenv("LOG_MAX_BYTES", str(10 * 1024 * 1024)))
+    backup_count = int(os.getenv("LOG_BACKUP_COUNT", "5"))
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(console_level)
+    console_handler.setFormatter(logging.Formatter(
+        "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+    ))
+
+    file_handler = RotatingFileHandler(
+        log_dir / log_file,
+        maxBytes=max_bytes,
+        backupCount=backup_count,
+        encoding="utf-8",
+    )
+    file_handler.setLevel(file_level)
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s - %(levelname)s - %(name)s:%(lineno)d - %(funcName)s - %(message)s"
+    ))
+
+    logging.basicConfig(
+        level=root_level,
+        handlers=[console_handler, file_handler],
+        force=True,
+    )
+
+    logging.getLogger("discord").setLevel(logging.INFO)
+    logging.getLogger("discord.http").setLevel(logging.WARNING)
+    logging.getLogger("litellm").setLevel(logging.WARNING)
+    logging.getLogger("LiteLLM").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.info(
+        "Logging initialized. console_level=%s file_level=%s file=%s",
+        logging.getLevelName(console_level),
+        logging.getLevelName(file_level),
+        log_dir / log_file,
+    )
+
+
+_configure_logging()
 
 # Import core bot components
 from bot.config import Config
@@ -113,10 +170,6 @@ class LLMDiscordBot(commands.Bot):
             # Cancel background tasks
             if hasattr(self, 'backup_task') and self.backup_task.is_running():
                 self.backup_task.cancel()
-                try:
-                    await asyncio.wait_for(self.backup_task, timeout=2.0)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    pass
                 logging.info("Backup task cancelled")
             
             # Close LLM provider if it has cleanup methods

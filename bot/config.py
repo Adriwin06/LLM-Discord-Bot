@@ -85,5 +85,8 @@ class Config:
         self.LOCAL_STT_LANGUAGE = os.getenv("LOCAL_STT_LANGUAGE") or None
 
         # Video Processing Defaults
+        self.DEFAULT_VIDEO_MAX_SIZE_MB = float(os.getenv("DEFAULT_VIDEO_MAX_SIZE_MB", 250))
+        self.DEFAULT_MEDIA_PROBE_TIMEOUT_SECONDS = float(os.getenv("DEFAULT_MEDIA_PROBE_TIMEOUT_SECONDS", 10))
+        self.DEFAULT_VIDEO_FRAME_TIMEOUT_SECONDS = float(os.getenv("DEFAULT_VIDEO_FRAME_TIMEOUT_SECONDS", 20))
         self.DEFAULT_VIDEO_MAX_FRAMES = int(os.getenv("DEFAULT_VIDEO_MAX_FRAMES", 8))
         self.DEFAULT_VIDEO_FRAME_QUALITY = int(os.getenv("DEFAULT_VIDEO_FRAME_QUALITY", 85))

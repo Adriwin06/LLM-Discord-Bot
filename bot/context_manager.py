@@ -8,8 +8,12 @@ import asyncio
 import base64
 import copy
 import importlib.util
+import json
 import mimetypes
 import os
+import re
+import shutil
+import subprocess
 import tempfile
 import aiohttp
 import PyPDF2
@@ -105,6 +109,13 @@ class ContextManager:
     async def get_guild_and_channel_settings(self, guild_id, channel_id):
         guild_settings = await self.store.get_guild_settings(guild_id)
         channel_overrides = guild_settings.get("channel_overrides", {}).get(str(channel_id), {})
+        logging.debug(
+            "Loaded guild/channel settings. guild_id=%s channel_id=%s guild_keys=%s override_keys=%s",
+            guild_id,
+            channel_id,
+            sorted(guild_settings.keys()),
+            sorted(channel_overrides.keys()) if isinstance(channel_overrides, dict) else [],
+        )
         
         final_settings = guild_settings.copy()
         final_settings.update(channel_overrides)
@@ -146,13 +157,15 @@ class ContextManager:
             },
             "video": {
                 "enabled": self.config.DEFAULT_MEDIA_VIDEO_ENABLED,
-                "max_size_mb": 50,
+                "max_size_mb": self.config.DEFAULT_VIDEO_MAX_SIZE_MB,
                 "max_duration_seconds": 120,
                 "extract_audio": True,
                 "extract_frames": True,
                 "frame_interval_seconds": 10,
                 "max_frames": self.config.DEFAULT_VIDEO_MAX_FRAMES,
                 "frame_quality": self.config.DEFAULT_VIDEO_FRAME_QUALITY,
+                "probe_timeout_seconds": self.config.DEFAULT_MEDIA_PROBE_TIMEOUT_SECONDS,
+                "frame_timeout_seconds": self.config.DEFAULT_VIDEO_FRAME_TIMEOUT_SECONDS,
                 "ocr_frames_for_text_models": True,
                 "max_transcript_chars": 12000,
                 "stt_engine": self.config.LOCAL_STT_ENGINE,
@@ -251,6 +264,26 @@ class ContextManager:
 
         # Use specified model or default to main model
         target_model = model_name or self.config.MAIN_LLM_MODEL
+        logging.info(
+            "Building LLM context. message_id=%s channel_id=%s guild_id=%s author_id=%s model=%s attachments=%s embeds=%s",
+            getattr(message, "id", None),
+            channel_id,
+            guild_id,
+            user_id,
+            target_model,
+            len(getattr(message, "attachments", []) or []),
+            len(getattr(message, "embeds", []) or []),
+        )
+        logging.debug(
+            "Context include flags. bot_identity=%s channel_summary=%s user_profiles=%s history=%s reply_chain=%s current_message=%s prompt_override=%s",
+            include_bot_identity,
+            include_channel_summary,
+            include_user_profiles,
+            include_conversation_history,
+            include_reply_chain,
+            include_current_message,
+            bool(prompt),
+        )
 
         # 1. System Prompts with optional overrides
         capabilities_prompt = capabilities_override or self.config.CAPABILITIES_PROMPT
@@ -329,6 +362,14 @@ class ContextManager:
             # Fetch recent messages
             recent_messages = [msg async for msg in message.channel.history(limit=history_limit)]
             recent_messages.reverse() # Oldest to newest
+            logging.debug(
+                "Fetched context history. message_id=%s reply_chain_count=%s recent_count=%s history_limit=%s reply_chain_limit=%s",
+                getattr(message, "id", None),
+                len(reply_chain),
+                len(recent_messages),
+                history_limit,
+                reply_chain_limit,
+            )
 
             # Combine and deduplicate
             all_messages = {msg.id: msg for msg in reply_chain}
@@ -372,6 +413,13 @@ class ContextManager:
                 )
                 messages.append({"role": "user", "content": current_message_content})
 
+        logging.info(
+            "LLM context built. message_id=%s model=%s messages=%s stats=%s",
+            getattr(message, "id", None),
+            target_model,
+            len(messages),
+            self._content_stats_for_logging(messages),
+        )
         return messages, settings
 
     def _message_channel_mention_ids(self, message: discord.Message) -> set:
@@ -557,6 +605,15 @@ class ContextManager:
         Format message content with attachments processed for the specified model.
         If model_name is not provided, uses MAIN_LLM_MODEL.
         """
+        logging.info(
+            "Formatting Discord message content. message_id=%s model=%s current_message=%s text_chars=%s attachments=%s embeds=%s",
+            getattr(message, "id", None),
+            model_name or self.config.MAIN_LLM_MODEL,
+            current_message,
+            len(message.content or ""),
+            len(getattr(message, "attachments", []) or []),
+            len(getattr(message, "embeds", []) or []),
+        )
         content_parts = []
         
         # Add user information for identification
@@ -574,7 +631,21 @@ class ContextManager:
             media_settings = (await self.get_guild_and_channel_settings(message.guild.id, message.channel.id)).get("media", {})
             
             for attachment in message.attachments:
+                logging.info(
+                    "Processing message attachment. message_id=%s filename=%s content_type=%s declared_size=%s model=%s",
+                    getattr(message, "id", None),
+                    getattr(attachment, "filename", "unknown"),
+                    getattr(attachment, "content_type", None),
+                    getattr(attachment, "size", None),
+                    target_model,
+                )
                 processed_content = await self._process_attachment(attachment, target_model, media_settings)
+                logging.info(
+                    "Attachment processing finished. message_id=%s filename=%s summary=%s",
+                    getattr(message, "id", None),
+                    getattr(attachment, "filename", "unknown"),
+                    self._processed_content_summary(processed_content),
+                )
                 if isinstance(processed_content, dict) and processed_content.get("type") == "animated_gif":
                     # Handle animated GIF: convert to list of content parts for message processing
                     frame_info = f"Animated GIF: {processed_content['filename']}"
@@ -607,7 +678,19 @@ class ContextManager:
             media_settings = (await self.get_guild_and_channel_settings(message.guild.id, message.channel.id)).get("media", {})
             
             for embed in message.embeds:
+                logging.info(
+                    "Processing message embed. message_id=%s embed_type=%s title_present=%s url_present=%s",
+                    getattr(message, "id", None),
+                    getattr(embed, "type", None),
+                    bool(getattr(embed, "title", None)),
+                    bool(getattr(embed, "url", None)),
+                )
                 processed_embed = await self._process_embed(embed, target_model, media_settings)
+                logging.info(
+                    "Embed processing finished. message_id=%s summary=%s",
+                    getattr(message, "id", None),
+                    self._processed_content_summary(processed_embed),
+                )
                 if isinstance(processed_embed, list):
                     content_parts.extend(processed_embed)
                 elif isinstance(processed_embed, dict):
@@ -617,11 +700,86 @@ class ContextManager:
         
         # If we only have text content, return it as a string for simplicity
         if len(content_parts) == 1 and content_parts[0].get("type") == "text":
+            logging.debug(
+                "Formatted message content as plain text. message_id=%s text_chars=%s",
+                getattr(message, "id", None),
+                len(content_parts[0]["text"]),
+            )
             return content_parts[0]["text"]
         elif content_parts:
+            logging.info(
+                "Formatted message content as structured parts. message_id=%s summary=%s",
+                getattr(message, "id", None),
+                self._processed_content_summary(content_parts),
+            )
             return content_parts
         else:
             return "[empty message]"
+
+    def _processed_content_summary(self, content) -> str:
+        if isinstance(content, str):
+            return f"text chars={len(content)} preview={content[:120]!r}"
+        if isinstance(content, dict):
+            content_type = content.get("type")
+            if content_type == "animated_gif":
+                return (
+                    "animated_gif "
+                    f"filename={content.get('filename')} total_frames={content.get('total_frames')} "
+                    f"extracted_frames={content.get('extracted_frames')}"
+                )
+            if content_type in {"image_url", "input_image"}:
+                image_url = (content.get("image_url") or {}).get("url") or ""
+                source = "inline_base64" if isinstance(image_url, str) and image_url.startswith("data:image/") else "url"
+                return f"{content_type} source={source}"
+            return f"dict type={content_type or 'unknown'} keys={sorted(content.keys())}"
+        if isinstance(content, list):
+            stats = self._content_stats_for_logging([{"role": "user", "content": content}])
+            return f"list parts={len(content)} stats={stats}"
+        if content is None:
+            return "none"
+        return f"{type(content).__name__}"
+
+    def _content_stats_for_logging(self, messages: list) -> dict:
+        stats = {
+            "text_chars": 0,
+            "image_parts": 0,
+            "inline_image_parts": 0,
+            "other_parts": 0,
+            "roles": {},
+        }
+
+        for message in messages or []:
+            if isinstance(message, dict):
+                role = message.get("role", "unknown")
+                stats["roles"][role] = stats["roles"].get(role, 0) + 1
+                self._add_content_stats_for_logging(message.get("content"), stats)
+            else:
+                stats["other_parts"] += 1
+
+        return stats
+
+    def _add_content_stats_for_logging(self, content, stats: dict):
+        if isinstance(content, str):
+            stats["text_chars"] += len(content)
+            return
+        if isinstance(content, list):
+            for part in content:
+                self._add_content_stats_for_logging(part, stats)
+            return
+        if isinstance(content, dict):
+            content_type = content.get("type")
+            if content_type == "text":
+                stats["text_chars"] += len(content.get("text") or "")
+            elif content_type in {"image_url", "input_image"}:
+                stats["image_parts"] += 1
+                image_url = (content.get("image_url") or {}).get("url") or ""
+                if isinstance(image_url, str) and image_url.startswith("data:image/"):
+                    stats["inline_image_parts"] += 1
+            else:
+                stats["other_parts"] += 1
+            return
+        if content is not None:
+            stats["other_parts"] += 1
 
     def _is_audio_file(self, mime_type: str, file_ext: str) -> bool:
         return bool((mime_type and mime_type.startswith("audio/")) or file_ext in AUDIO_EXTENSIONS)
@@ -640,7 +798,9 @@ class ContextManager:
 
     async def _write_temp_file(self, file_bytes: bytes, file_ext: str) -> str:
         suffix = f".{file_ext.lstrip('.')}" if file_ext else ""
-        return await asyncio.to_thread(self._write_temp_file_sync, file_bytes, suffix)
+        path = await asyncio.to_thread(self._write_temp_file_sync, file_bytes, suffix)
+        logging.debug("Wrote temporary media file. path=%s bytes=%s suffix=%s", path, len(file_bytes or b""), suffix)
+        return path
 
     def _write_temp_file_sync(self, file_bytes: bytes, suffix: str) -> str:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
@@ -652,36 +812,169 @@ class ContextManager:
             return
         try:
             os.remove(path)
+            logging.debug("Removed temporary media file. path=%s", path)
         except FileNotFoundError:
             pass
         except OSError as e:
             logging.warning(f"Could not remove temporary media file {path}: {e}")
 
-    async def _get_media_duration(self, file_path: str, media_kind: str):
-        if not MOVIEPY_AVAILABLE:
-            return None
-        return await asyncio.to_thread(self._get_media_duration_sync, file_path, media_kind)
+    async def _get_media_duration(self, file_path: str, media_kind: str, media_config: dict = None):
+        timeout_seconds = self._safe_float(
+            (media_config or {}).get("probe_timeout_seconds"),
+            default=self.config.DEFAULT_MEDIA_PROBE_TIMEOUT_SECONDS,
+            minimum=1.0,
+            maximum=120.0,
+        )
+        logging.debug("Reading %s duration. file=%s timeout=%.1fs", media_kind, file_path, timeout_seconds)
+        return await asyncio.to_thread(self._get_media_duration_sync, file_path, media_kind, timeout_seconds)
 
-    def _get_media_duration_sync(self, file_path: str, media_kind: str):
-        clip = None
-        try:
-            clip_class = VideoFileClip if media_kind == "video" else AudioFileClip
-            clip = clip_class(file_path)
-            duration = getattr(clip, "duration", None)
-            return float(duration) if duration is not None else None
-        except Exception as e:
-            logging.warning(f"Could not read {media_kind} duration from {file_path}: {e}")
+    def _get_media_duration_sync(self, file_path: str, media_kind: str, timeout_seconds: float = 10.0):
+        duration = self._probe_duration_with_ffprobe(file_path, timeout_seconds)
+        if duration is not None:
+            logging.debug("Read %s duration with ffprobe. file=%s duration=%s", media_kind, file_path, duration)
+            return duration
+
+        duration = self._probe_duration_with_ffmpeg(file_path, timeout_seconds)
+        if duration is not None:
+            logging.debug("Read %s duration with ffmpeg metadata. file=%s duration=%s", media_kind, file_path, duration)
+            return duration
+
+        logging.warning("Could not read %s duration with bounded FFmpeg probes. file=%s", media_kind, file_path)
+        return None
+
+    def _probe_duration_with_ffprobe(self, file_path: str, timeout_seconds: float):
+        ffprobe = self._ffprobe_executable()
+        if not ffprobe:
             return None
-        finally:
-            if clip is not None:
-                try:
-                    clip.close()
-                except Exception:
-                    pass
+
+        command = [
+            ffprobe,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "json",
+            file_path,
+        ]
+        try:
+            completed = self._run_media_subprocess(command, timeout_seconds)
+            payload = json.loads(completed.stdout or "{}")
+            duration = payload.get("format", {}).get("duration")
+            if duration not in (None, "N/A", ""):
+                return max(0.0, float(duration))
+        except subprocess.TimeoutExpired:
+            logging.warning("ffprobe duration probe timed out after %.1fs. file=%s", timeout_seconds, file_path)
+        except Exception as e:
+            logging.debug("ffprobe duration probe failed. file=%s error=%s", file_path, e)
+        return None
+
+    def _probe_duration_with_ffmpeg(self, file_path: str, timeout_seconds: float):
+        ffmpeg = self._ffmpeg_executable()
+        if not ffmpeg:
+            return None
+
+        command = [
+            ffmpeg,
+            "-hide_banner",
+            "-nostdin",
+            "-i",
+            file_path,
+        ]
+        try:
+            completed = self._run_media_subprocess(command, timeout_seconds)
+            output = f"{completed.stderr or ''}\n{completed.stdout or ''}"
+            match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", output)
+            if not match:
+                return None
+            hours, minutes, seconds = match.groups()
+            return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+        except subprocess.TimeoutExpired:
+            logging.warning("ffmpeg duration metadata probe timed out after %.1fs. file=%s", timeout_seconds, file_path)
+        except Exception as e:
+            logging.debug("ffmpeg duration metadata probe failed. file=%s error=%s", file_path, e)
+        return None
+
+    def _run_media_subprocess(self, command: list, timeout_seconds: float):
+        logging.debug("Running media subprocess. command=%s timeout=%.1fs", command, timeout_seconds)
+        startupinfo = None
+        creationflags = 0
+        if os.name == "nt":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+        return subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            stdin=subprocess.DEVNULL,
+            startupinfo=startupinfo,
+            creationflags=creationflags,
+        )
+
+    def _run_media_subprocess_bytes(self, command: list, timeout_seconds: float):
+        logging.debug("Running media bytes subprocess. command=%s timeout=%.1fs", command, timeout_seconds)
+        startupinfo = None
+        creationflags = 0
+        if os.name == "nt":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+        return subprocess.run(
+            command,
+            capture_output=True,
+            timeout=timeout_seconds,
+            stdin=subprocess.DEVNULL,
+            startupinfo=startupinfo,
+            creationflags=creationflags,
+        )
+
+    def _ffprobe_executable(self):
+        ffprobe = shutil.which("ffprobe")
+        if ffprobe:
+            return ffprobe
+
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg:
+            sibling = os.path.join(os.path.dirname(ffmpeg), "ffprobe.exe" if os.name == "nt" else "ffprobe")
+            if os.path.exists(sibling):
+                return sibling
+        return None
+
+    def _ffmpeg_executable(self):
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg:
+            return ffmpeg
+
+        try:
+            import imageio_ffmpeg
+            return imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception as e:
+            logging.debug("imageio_ffmpeg fallback unavailable: %s", e)
+            return None
 
     async def _transcribe_media_file(self, file_path: str, media_config: dict) -> dict:
+        logging.info(
+            "Starting local media transcription. file=%s engine=%s model=%s device=%s",
+            file_path,
+            media_config.get("stt_engine") or self.config.LOCAL_STT_ENGINE,
+            media_config.get("stt_model") or self.config.LOCAL_STT_MODEL,
+            media_config.get("stt_device") or self.config.LOCAL_STT_DEVICE,
+        )
         async with self._stt_lock:
-            return await asyncio.to_thread(self._transcribe_media_file_sync, file_path, media_config)
+            transcript = await asyncio.to_thread(self._transcribe_media_file_sync, file_path, media_config)
+        logging.info(
+            "Finished local media transcription. file=%s engine=%s chars=%s segments=%s language=%s",
+            file_path,
+            transcript.get("engine"),
+            len(transcript.get("text") or ""),
+            len(transcript.get("segments") or []),
+            transcript.get("language"),
+        )
+        return transcript
 
     def _transcribe_media_file_sync(self, file_path: str, media_config: dict) -> dict:
         engine = str(media_config.get("stt_engine") or self.config.LOCAL_STT_ENGINE).strip().lower().replace("_", "-")
@@ -735,6 +1028,14 @@ class ContextManager:
             for segment in segments
         ]
         text = " ".join(segment["text"] for segment in segment_list if segment["text"]).strip()
+        logging.debug(
+            "faster-whisper transcription details. file=%s segments=%s chars=%s language=%s probability=%s",
+            file_path,
+            len(segment_list),
+            len(text),
+            getattr(info, "language", None),
+            getattr(info, "language_probability", None),
+        )
         return {
             "engine": "faster-whisper",
             "model": model_name,
@@ -779,6 +1080,13 @@ class ContextManager:
         text = str(result.get("text", "")).strip()
         if not text:
             text = " ".join(segment["text"] for segment in segment_list if segment["text"]).strip()
+        logging.debug(
+            "openai-whisper transcription details. file=%s segments=%s chars=%s language=%s",
+            file_path,
+            len(segment_list),
+            len(text),
+            result.get("language"),
+        )
         return {
             "engine": "openai-whisper-local",
             "model": model_name,
@@ -856,44 +1164,121 @@ class ContextManager:
         return f"{minutes:02d}:{secs:06.3f}"
 
     async def _extract_video_frames(self, file_path: str, video_config: dict) -> dict:
-        if not MOVIEPY_AVAILABLE:
-            raise RuntimeError("moviepy is not installed")
+        if not self._ffmpeg_executable():
+            raise RuntimeError("ffmpeg is not installed or not available on PATH")
+        logging.info(
+            "Starting video frame extraction. file=%s max_frames=%s interval=%s quality=%s",
+            file_path,
+            video_config.get("max_frames", self.config.DEFAULT_VIDEO_MAX_FRAMES),
+            video_config.get("frame_interval_seconds", 10),
+            video_config.get("frame_quality", self.config.DEFAULT_VIDEO_FRAME_QUALITY),
+        )
         return await asyncio.to_thread(self._extract_video_frames_sync, file_path, video_config)
 
     def _extract_video_frames_sync(self, file_path: str, video_config: dict) -> dict:
-        clip = None
-        try:
-            clip = VideoFileClip(file_path)
-            duration = float(getattr(clip, "duration", 0) or 0)
-            max_frames = self._safe_int(video_config.get("max_frames"), default=self.config.DEFAULT_VIDEO_MAX_FRAMES, minimum=1, maximum=30)
-            frame_interval = self._safe_float(video_config.get("frame_interval_seconds"), default=10.0, minimum=0.1, maximum=3600.0)
-            frame_quality = self._safe_int(video_config.get("frame_quality"), default=self.config.DEFAULT_VIDEO_FRAME_QUALITY, minimum=1, maximum=100)
-            frame_times = self._sample_video_times(duration, max_frames, frame_interval)
+        ffmpeg = self._ffmpeg_executable()
+        duration = float(self._get_media_duration_sync(
+            file_path,
+            "video",
+            self._safe_float(
+                video_config.get("probe_timeout_seconds"),
+                default=self.config.DEFAULT_MEDIA_PROBE_TIMEOUT_SECONDS,
+                minimum=1.0,
+                maximum=120.0,
+            ),
+        ) or 0)
+        max_frames = self._safe_int(video_config.get("max_frames"), default=self.config.DEFAULT_VIDEO_MAX_FRAMES, minimum=1, maximum=30)
+        frame_interval = self._safe_float(video_config.get("frame_interval_seconds"), default=10.0, minimum=0.1, maximum=3600.0)
+        frame_quality = self._safe_int(video_config.get("frame_quality"), default=self.config.DEFAULT_VIDEO_FRAME_QUALITY, minimum=1, maximum=100)
+        frame_timeout = self._safe_float(
+            video_config.get("frame_timeout_seconds"),
+            default=self.config.DEFAULT_VIDEO_FRAME_TIMEOUT_SECONDS,
+            minimum=1.0,
+            maximum=120.0,
+        )
+        frame_times = self._sample_video_times(duration, max_frames, frame_interval)
+        logging.info(
+            "Video frame sampling plan. file=%s duration=%s max_frames=%s interval=%s quality=%s frame_timeout=%.1fs frame_times=%s",
+            file_path,
+            self._format_seconds(duration),
+            max_frames,
+            frame_interval,
+            frame_quality,
+            frame_timeout,
+            [self._format_seconds(t) for t in frame_times],
+        )
 
-            frames = []
-            for frame_time in frame_times:
-                try:
-                    frame_array = clip.get_frame(frame_time)
-                    frame = Image.fromarray(frame_array).convert("RGB")
-                    buffer = io.BytesIO()
-                    frame.save(buffer, format="JPEG", quality=frame_quality)
-                    frame_bytes = buffer.getvalue()
-                    frame_b64 = base64.b64encode(frame_bytes).decode()
-                    frames.append({
-                        "timestamp": frame_time,
-                        "data_url": f"data:image/jpeg;base64,{frame_b64}",
-                        "jpeg_bytes": frame_bytes,
-                    })
-                except Exception as e:
-                    logging.warning(f"Could not extract video frame at {frame_time:.2f}s from {file_path}: {e}")
+        frames = []
+        qscale = self._jpeg_quality_to_ffmpeg_qscale(frame_quality)
+        for frame_time in frame_times:
+            command = [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-ss",
+                f"{frame_time:.3f}",
+                "-i",
+                file_path,
+                "-frames:v",
+                "1",
+                "-an",
+                "-f",
+                "image2pipe",
+                "-vcodec",
+                "mjpeg",
+                "-q:v",
+                str(qscale),
+                "pipe:1",
+            ]
+            try:
+                completed = self._run_media_subprocess_bytes(command, frame_timeout)
+                frame_bytes = completed.stdout or b""
+                if completed.returncode != 0 or not frame_bytes:
+                    stderr = (completed.stderr or b"").decode("utf-8", errors="ignore")
+                    logging.warning(
+                        "Could not extract video frame. file=%s timestamp=%s returncode=%s stderr=%s",
+                        file_path,
+                        self._format_seconds(frame_time),
+                        completed.returncode,
+                        stderr[:500],
+                    )
+                    continue
 
-            return {"duration": duration, "frames": frames}
-        finally:
-            if clip is not None:
-                try:
-                    clip.close()
-                except Exception:
-                    pass
+                frame_b64 = base64.b64encode(frame_bytes).decode()
+                frames.append({
+                    "timestamp": frame_time,
+                    "data_url": f"data:image/jpeg;base64,{frame_b64}",
+                    "jpeg_bytes": frame_bytes,
+                })
+                logging.debug(
+                    "Extracted video frame. file=%s timestamp=%s jpeg_bytes=%s",
+                    file_path,
+                    self._format_seconds(frame_time),
+                    len(frame_bytes),
+                )
+            except subprocess.TimeoutExpired:
+                logging.warning(
+                    "Video frame extraction timed out. file=%s timestamp=%s timeout=%.1fs",
+                    file_path,
+                    self._format_seconds(frame_time),
+                    frame_timeout,
+                )
+            except Exception as e:
+                logging.warning("Could not extract video frame at %.2fs from %s: %s", frame_time, file_path, e)
+
+        logging.info(
+            "Video frame extraction finished. file=%s extracted=%s requested=%s",
+            file_path,
+            len(frames),
+            len(frame_times),
+        )
+        return {"duration": duration, "frames": frames}
+
+    def _jpeg_quality_to_ffmpeg_qscale(self, frame_quality: int) -> int:
+        quality = max(1, min(100, int(frame_quality)))
+        return max(2, min(31, round((100 - quality) / 3.5) + 2))
 
     def _sample_video_times(self, duration: float, max_frames: int, frame_interval: float) -> list:
         if duration <= 0:
@@ -917,7 +1302,9 @@ class ContextManager:
 
     async def _ocr_video_frames(self, frames: list) -> str:
         if not TESSERACT_AVAILABLE:
+            logging.info("Skipping video frame OCR because pytesseract is unavailable. frames=%s", len(frames or []))
             return ""
+        logging.info("Starting video frame OCR. frames=%s", len(frames or []))
         return await asyncio.to_thread(self._ocr_video_frames_sync, frames)
 
     def _ocr_video_frames_sync(self, frames: list) -> str:
@@ -928,8 +1315,14 @@ class ContextManager:
                     text = pytesseract.image_to_string(img).strip()
                 if text:
                     lines.append(f"[{self._format_seconds(frame['timestamp'])}] {text}")
+                    logging.debug(
+                        "Video frame OCR text found. timestamp=%s chars=%s",
+                        self._format_seconds(frame["timestamp"]),
+                        len(text),
+                    )
             except Exception as e:
                 logging.warning(f"Could not OCR video frame at {frame.get('timestamp', 0)}s: {e}")
+        logging.info("Video frame OCR finished. frames_with_text=%s chars=%s", len(lines), len("\n".join(lines)))
         return "\n".join(lines)
 
     async def _process_audio_attachment(
@@ -941,32 +1334,75 @@ class ContextManager:
         model_name: str,
         audio_config: dict,
     ):
+        logging.info(
+            "Audio attachment processing started. filename=%s size_mb=%.2f ext=%s model=%s config=%s",
+            getattr(attachment, "filename", "unknown"),
+            file_size_mb,
+            file_ext,
+            model_name,
+            {
+                "enabled": audio_config.get("enabled"),
+                "max_size_mb": audio_config.get("max_size_mb"),
+                "max_duration_seconds": audio_config.get("max_duration_seconds"),
+                "transcribe": audio_config.get("transcribe"),
+                "stt_engine": audio_config.get("stt_engine"),
+                "stt_model": audio_config.get("stt_model"),
+            },
+        )
         if not self._safe_bool(audio_config.get("enabled"), default=True):
+            logging.info("Audio processing disabled. filename=%s", attachment.filename)
             return f"[Audio processing disabled: {attachment.filename}]"
 
         max_size = self._safe_float(audio_config.get("max_size_mb"), default=25.0, minimum=0.1, maximum=500.0)
         if file_size_mb > max_size:
+            logging.warning(
+                "Audio attachment over size limit. filename=%s size_mb=%.2f max_size_mb=%.2f",
+                attachment.filename,
+                file_size_mb,
+                max_size,
+            )
             return f"[Audio too large for processing: {attachment.filename} - {file_size_mb:.1f}MB]"
 
         if self.llm_provider.supports_audio(model_name) and self._safe_bool(audio_config.get("send_direct_if_supported"), default=False):
+            logging.info("Sending audio directly to model. filename=%s model=%s", attachment.filename, model_name)
             return {"type": "audio_url", "audio_url": {"url": attachment.url}}
 
         if not self._safe_bool(audio_config.get("transcribe"), default=True):
+            logging.info("Audio transcription disabled; returning metadata only. filename=%s", attachment.filename)
             return f"--- Audio Metadata: {attachment.filename} ---\nFile Size: {file_size_mb:.2f} MB\nTranscription disabled."
 
         temp_path = await self._write_temp_file(file_bytes, file_ext)
         try:
-            duration = await self._get_media_duration(temp_path, "audio")
+            duration = await self._get_media_duration(temp_path, "audio", audio_config)
             max_duration = self._safe_float(audio_config.get("max_duration_seconds"), default=300.0, minimum=0.0, maximum=86400.0)
+            logging.info(
+                "Audio attachment duration checked. filename=%s duration=%s max_duration=%s",
+                attachment.filename,
+                self._format_seconds(duration),
+                self._format_seconds(max_duration),
+            )
             if duration is not None and max_duration > 0 and duration > max_duration:
+                logging.warning(
+                    "Audio attachment over duration limit. filename=%s duration=%s max_duration=%s",
+                    attachment.filename,
+                    self._format_seconds(duration),
+                    self._format_seconds(max_duration),
+                )
                 return (
                     f"[Audio too long for processing: {attachment.filename} - "
                     f"{self._format_seconds(duration)} > {self._format_seconds(max_duration)}]"
                 )
 
             transcript = await self._transcribe_media_file(temp_path, audio_config)
+            logging.info(
+                "Audio attachment processing finished. filename=%s transcript_chars=%s segments=%s",
+                attachment.filename,
+                len(transcript.get("text") or ""),
+                len(transcript.get("segments") or []),
+            )
             return self._format_transcript_block("Audio Transcript", attachment.filename, transcript, duration, audio_config)
         except Exception as e:
+            logging.exception("Audio transcription failed. filename=%s", attachment.filename)
             return f"[Audio transcription failed: {attachment.filename} - {str(e)[:80]}]"
         finally:
             self._remove_temp_file(temp_path)
@@ -980,18 +1416,56 @@ class ContextManager:
         model_name: str,
         video_config: dict,
     ):
+        logging.info(
+            "Video attachment processing started. filename=%s size_mb=%.2f ext=%s model=%s supports_vision=%s config=%s",
+            getattr(attachment, "filename", "unknown"),
+            file_size_mb,
+            file_ext,
+            model_name,
+            self.llm_provider.supports_vision(model_name),
+            {
+                "enabled": video_config.get("enabled"),
+                "max_size_mb": video_config.get("max_size_mb"),
+                "max_duration_seconds": video_config.get("max_duration_seconds"),
+                "extract_audio": video_config.get("extract_audio"),
+                "extract_frames": video_config.get("extract_frames"),
+                "frame_interval_seconds": video_config.get("frame_interval_seconds"),
+                "max_frames": video_config.get("max_frames"),
+                "frame_quality": video_config.get("frame_quality"),
+                "ocr_frames_for_text_models": video_config.get("ocr_frames_for_text_models"),
+            },
+        )
         if not self._safe_bool(video_config.get("enabled"), default=True):
+            logging.info("Video processing disabled. filename=%s", attachment.filename)
             return f"[Video processing disabled: {attachment.filename}]"
 
-        max_size = self._safe_float(video_config.get("max_size_mb"), default=50.0, minimum=0.1, maximum=1000.0)
+        max_size = self._safe_float(video_config.get("max_size_mb"), default=250.0, minimum=0.1, maximum=1000.0)
         if file_size_mb > max_size:
+            logging.warning(
+                "Video attachment over size limit. filename=%s size_mb=%.2f max_size_mb=%.2f",
+                attachment.filename,
+                file_size_mb,
+                max_size,
+            )
             return f"[Video too large for processing: {attachment.filename} - {file_size_mb:.1f}MB]"
 
         temp_path = await self._write_temp_file(file_bytes, file_ext)
         try:
-            duration = await self._get_media_duration(temp_path, "video")
+            duration = await self._get_media_duration(temp_path, "video", video_config)
             max_duration = self._safe_float(video_config.get("max_duration_seconds"), default=120.0, minimum=0.0, maximum=86400.0)
+            logging.info(
+                "Video attachment duration checked. filename=%s duration=%s max_duration=%s",
+                attachment.filename,
+                self._format_seconds(duration),
+                self._format_seconds(max_duration),
+            )
             if duration is not None and max_duration > 0 and duration > max_duration:
+                logging.warning(
+                    "Video attachment over duration limit. filename=%s duration=%s max_duration=%s",
+                    attachment.filename,
+                    self._format_seconds(duration),
+                    self._format_seconds(max_duration),
+                )
                 return (
                     f"[Video too long for processing: {attachment.filename} - "
                     f"{self._format_seconds(duration)} > {self._format_seconds(max_duration)}]"
@@ -1000,6 +1474,12 @@ class ContextManager:
             content_parts = []
             extract_audio = self._safe_bool(video_config.get("extract_audio"), default=True)
             extract_frames = self._safe_bool(video_config.get("extract_frames"), default=True)
+            logging.info(
+                "Video extraction choices. filename=%s extract_audio=%s extract_frames=%s",
+                attachment.filename,
+                extract_audio,
+                extract_frames,
+            )
 
             if extract_audio:
                 try:
@@ -1008,7 +1488,14 @@ class ContextManager:
                         "type": "text",
                         "text": self._format_transcript_block("Video Audio Transcript", attachment.filename, transcript, duration, video_config),
                     })
+                    logging.info(
+                        "Video audio transcript added. filename=%s transcript_chars=%s segments=%s",
+                        attachment.filename,
+                        len(transcript.get("text") or ""),
+                        len(transcript.get("segments") or []),
+                    )
                 except Exception as e:
+                    logging.exception("Video audio transcription failed. filename=%s", attachment.filename)
                     content_parts.append({
                         "type": "text",
                         "text": f"[Video audio transcription failed: {attachment.filename} - {str(e)[:80]}]",
@@ -1031,30 +1518,58 @@ class ContextManager:
                         content_parts.append({"type": "text", "text": frame_summary})
                         for frame in frames:
                             content_parts.append({"type": "image_url", "image_url": {"url": frame["data_url"]}})
+                        logging.info(
+                            "Video frames attached to vision model request. filename=%s frames=%s model=%s",
+                            attachment.filename,
+                            len(frames),
+                            model_name,
+                        )
                     elif frames:
                         ocr_text = ""
                         if self._safe_bool(video_config.get("ocr_frames_for_text_models"), default=True):
                             ocr_text = await self._ocr_video_frames(frames)
 
                         if ocr_text:
+                            logging.info(
+                                "Video frame OCR added for text-only model. filename=%s frames=%s ocr_chars=%s model=%s",
+                                attachment.filename,
+                                len(frames),
+                                len(ocr_text),
+                                model_name,
+                            )
                             content_parts.append({
                                 "type": "text",
                                 "text": f"--- Video Frame OCR: {attachment.filename} ---\n{ocr_text}",
                             })
                         else:
+                            logging.info(
+                                "Video frames extracted but not attached; target model has no vision and OCR produced no text. filename=%s frames=%s model=%s",
+                                attachment.filename,
+                                len(frames),
+                                model_name,
+                            )
                             content_parts.append({
                                 "type": "text",
                                 "text": frame_summary + "\n[Frames were extracted locally but not attached because the target model does not support vision.]",
                             })
                     else:
+                        logging.warning("Video frame extraction returned no frames. filename=%s", attachment.filename)
                         content_parts.append({"type": "text", "text": f"[No video frames extracted: {attachment.filename}]"})
                 except Exception as e:
+                    logging.exception("Video frame extraction failed. filename=%s", attachment.filename)
                     content_parts.append({"type": "text", "text": f"[Video frame extraction failed: {attachment.filename} - {str(e)[:80]}]"})
 
             if not content_parts:
                 duration_text = self._format_seconds(duration) if duration is not None else "unknown"
+                logging.info("Video processing produced metadata only. filename=%s duration=%s", attachment.filename, duration_text)
                 return f"--- Video Metadata: {attachment.filename} ---\nDuration: {duration_text}\nFile Size: {file_size_mb:.2f} MB"
 
+            logging.info(
+                "Video attachment processing finished. filename=%s parts=%s summary=%s",
+                attachment.filename,
+                len(content_parts),
+                self._processed_content_summary(content_parts),
+            )
             return content_parts
         finally:
             self._remove_temp_file(temp_path)
@@ -1068,6 +1583,14 @@ class ContextManager:
             file_size_mb = getattr(attachment, "size", 0) / (1024 * 1024)
             attachment_url = getattr(attachment, "url", "")
             actual_content_type = ""
+            logging.info(
+                "Attachment processing started. filename=%s declared_mime=%s ext=%s declared_size_mb=%.2f model=%s",
+                getattr(attachment, "filename", "unknown"),
+                mime_type,
+                file_ext,
+                file_size_mb,
+                model_name,
+            )
             
             # Enhanced detection for GIFs, especially Tenor GIFs
             is_likely_gif = (
@@ -1077,6 +1600,12 @@ class ContextManager:
                 'tenor.com' in attachment_url.lower() or
                 'giphy.com' in attachment_url.lower() or
                 '?format=gif' in attachment_url.lower()
+            )
+            logging.debug(
+                "Attachment initial media detection. filename=%s is_likely_gif=%s supports_vision=%s",
+                attachment.filename,
+                is_likely_gif,
+                self.llm_provider.supports_vision(model_name),
             )
             
             # Configure headers for better compatibility with GIF services
@@ -1088,9 +1617,10 @@ class ContextManager:
             }
             
             async with aiohttp.ClientSession() as session:
+                logging.info("Downloading attachment. filename=%s", attachment.filename)
                 async with session.get(attachment_url, headers=headers, allow_redirects=True, timeout=30) as resp:
                     if resp.status != 200:
-                        logging.warning(f"HTTP {resp.status} when fetching {attachment_url}")
+                        logging.warning("HTTP %s when fetching attachment. filename=%s", resp.status, attachment.filename)
                         return f"[Could not fetch attachment: {attachment.filename} (HTTP {resp.status})]"
                     
                     # Check actual content type from response headers
@@ -1098,9 +1628,22 @@ class ContextManager:
                     actual_mime_type = actual_content_type.split(';', 1)[0].strip()
                     content_length = resp.headers.get('content-length')
                     
-                    logging.debug(f"Fetched {attachment_url}: Content-Type={actual_content_type}, Content-Length={content_length}")
+                    logging.debug(
+                        "Fetched attachment headers. filename=%s content_type=%s content_length=%s",
+                        attachment.filename,
+                        actual_content_type,
+                        content_length,
+                    )
                     
                     file_bytes = await resp.read()
+                    logging.info(
+                        "Attachment downloaded. filename=%s status=%s actual_content_type=%s content_length_header=%s downloaded_bytes=%s",
+                        attachment.filename,
+                        resp.status,
+                        actual_content_type,
+                        content_length,
+                        len(file_bytes),
+                    )
                     
                     # Update file size based on actual downloaded content
                     if len(file_bytes) > 0:
@@ -1113,21 +1656,42 @@ class ContextManager:
                     # Enhanced GIF detection with actual content type
                     if not is_likely_gif and actual_mime_type == 'image/gif':
                         is_likely_gif = True
+                    logging.info(
+                        "Attachment MIME finalized. filename=%s mime_type=%s actual_mime=%s size_mb=%.2f is_likely_gif=%s",
+                        attachment.filename,
+                        mime_type,
+                        actual_mime_type,
+                        file_size_mb,
+                        is_likely_gif,
+                    )
 
             # Image processing (including GIFs)
             if (mime_type and mime_type.startswith("image/")) or is_likely_gif:
+                logging.info("Attachment routed to image processor. filename=%s mime_type=%s", attachment.filename, mime_type)
                 images_config = media_settings.get("images", {})
                 if not images_config.get("enabled", True):
+                    logging.info("Image processing disabled. filename=%s", attachment.filename)
                     return f"[Image processing disabled: {attachment.filename}]"
                 
                 max_size = images_config.get("max_size_mb", 10)
                 if file_size_mb > max_size:
+                    logging.warning(
+                        "Image attachment over size limit. filename=%s size_mb=%.2f max_size_mb=%s",
+                        attachment.filename,
+                        file_size_mb,
+                        max_size,
+                    )
                     return f"[Image too large for processing: {attachment.filename} - {file_size_mb:.1f}MB]"
                 
                 if self.llm_provider.supports_vision(model_name):
                     # Check if this is an animated GIF using enhanced detection
                     if is_likely_gif:
-                        logging.info(f"Processing potential GIF: {attachment.filename}, URL: {attachment.url}, Content-Type: {actual_content_type}, MIME: {mime_type}")
+                        logging.info(
+                            "Processing potential GIF. filename=%s content_type=%s mime=%s",
+                            attachment.filename,
+                            actual_content_type,
+                            mime_type,
+                        )
                         # Handle animated GIF by extracting frames
                         gif_config = images_config.get("gif", {})
                         if gif_config.get("extract_frames", True):
@@ -1219,6 +1783,12 @@ class ContextManager:
                                             pass
                                     
                                     if frames:
+                                        logging.info(
+                                            "Animated GIF frames extracted. filename=%s total_frames=%s extracted_frames=%s",
+                                            attachment.filename,
+                                            total_frames,
+                                            len(frames),
+                                        )
                                         # Return structured data for animated GIFs that can be used in different contexts
                                         return {
                                             "type": "animated_gif",
@@ -1229,12 +1799,19 @@ class ContextManager:
                                         }
                                     else:
                                         # Fallback to treating as static image
+                                        logging.warning("Animated GIF extraction produced no frames; falling back to image. filename=%s", attachment.filename)
                                         return self._image_content_part(attachment.url, file_bytes, mime_type, model_name)
                                 else:
                                     # Static GIF, treat as regular image
+                                    logging.info("GIF is not animated; sending as static image. filename=%s", attachment.filename)
                                     return self._image_content_part(attachment.url, file_bytes, mime_type, model_name)
                             except Exception as e:
-                                logging.warning(f"Failed to process potential GIF {attachment.filename} from {attachment.url}: {type(e).__name__}: {e}")
+                                logging.warning(
+                                    "Failed to process potential GIF. filename=%s error_type=%s error=%s",
+                                    attachment.filename,
+                                    type(e).__name__,
+                                    e,
+                                )
                                 # Check if this was an image format issue
                                 if "cannot identify image file" in str(e).lower() or "truncated" in str(e).lower():
                                     logging.info(f"Image format issue with {attachment.filename}, might not be a valid image file")
@@ -1242,30 +1819,43 @@ class ContextManager:
                                 return self._image_content_part(attachment.url, model_name=model_name)
                         else:
                             # GIF frame extraction disabled, treat as static image
+                            logging.info("GIF frame extraction disabled; sending as static image. filename=%s", attachment.filename)
                             return self._image_content_part(attachment.url, file_bytes, mime_type, model_name)
                     else:
                         # Regular static image
+                        logging.info("Static image will be attached to vision model. filename=%s model=%s", attachment.filename, model_name)
                         return self._image_content_part(attachment.url, file_bytes, mime_type, model_name)
                 else:
                     # Fallback: OCR for text-only models
+                    logging.info("Image target model has no vision; attempting OCR fallback. filename=%s model=%s", attachment.filename, model_name)
                     if images_config.get("ocr_enabled", True) and TESSERACT_AVAILABLE:
                         try:
                             with Image.open(io.BytesIO(file_bytes)) as img:
                                 ocr_text = pytesseract.image_to_string(img)
                                 if ocr_text.strip():
+                                    logging.info("Image OCR succeeded. filename=%s chars=%s", attachment.filename, len(ocr_text.strip()))
                                     return f"--- Image OCR Text: {attachment.filename} ---\n{ocr_text.strip()}"
                                 else:
+                                    logging.info("Image OCR found no readable text. filename=%s", attachment.filename)
                                     return f"[Image contains no readable text: {attachment.filename}]"
                         except Exception as e:
+                            logging.exception("Image OCR failed. filename=%s", attachment.filename)
                             if images_config.get("description_fallback", True):
                                 return f"[Image with OCR failure: {attachment.filename} - {str(e)[:50]}...]"
                             else:
                                 return f"[Image omitted: {attachment.filename}]"
                     else:
+                        logging.info(
+                            "Image omitted for text-only model because OCR is disabled or unavailable. filename=%s ocr_enabled=%s tesseract_available=%s",
+                            attachment.filename,
+                            images_config.get("ocr_enabled", True),
+                            TESSERACT_AVAILABLE,
+                        )
                         return f"[Image omitted - OCR disabled or unavailable: {attachment.filename}]"
 
             # Audio processing
             elif self._is_audio_file(mime_type, file_ext):
+                logging.info("Attachment routed to audio processor. filename=%s mime_type=%s", attachment.filename, mime_type)
                 audio_config = media_settings.get("audio", {})
                 return await self._process_audio_attachment(
                     attachment,
@@ -1278,6 +1868,7 @@ class ContextManager:
 
             # Video processing
             elif self._is_video_file(mime_type, file_ext):
+                logging.info("Attachment routed to video processor. filename=%s mime_type=%s", attachment.filename, mime_type)
                 video_config = media_settings.get("video", {})
                 return await self._process_video_attachment(
                     attachment,
@@ -1290,16 +1881,25 @@ class ContextManager:
 
             # PDF processing
             elif mime_type == "application/pdf":
+                logging.info("Attachment routed to PDF processor. filename=%s", attachment.filename)
                 pdf_config = media_settings.get("pdf", {})
                 if not pdf_config.get("enabled", True):
+                    logging.info("PDF processing disabled. filename=%s", attachment.filename)
                     return f"[PDF processing disabled: {attachment.filename}]"
                 
                 max_size = pdf_config.get("max_size_mb", 10)
                 if file_size_mb > max_size:
+                    logging.warning(
+                        "PDF attachment over size limit. filename=%s size_mb=%.2f max_size_mb=%s",
+                        attachment.filename,
+                        file_size_mb,
+                        max_size,
+                    )
                     return f"[PDF too large for processing: {attachment.filename} - {file_size_mb:.1f}MB]"
                 
                 if self.llm_provider.supports_pdf(model_name):
                     # Send directly as PDF data for PDF-capable models
+                    logging.info("Sending PDF directly to model. filename=%s model=%s", attachment.filename, model_name)
                     return {"type": "pdf_url", "pdf_url": {"url": attachment.url}}
                 else:
                     # Fallback: Text extraction for all models
@@ -1322,20 +1922,30 @@ class ContextManager:
                                         text += f"\n--- Page {page_num + 1} ---\n{page_text}\n"
                                     else:
                                         text += page_text + "\n"
+                        logging.info("PDF text extracted. filename=%s chars=%s", attachment.filename, len(text.strip()))
                         return f"--- PDF Content: {attachment.filename} ---\n{text.strip()}"
                     except Exception as e:
+                        logging.exception("PDF text extraction failed. filename=%s", attachment.filename)
                         return f"[PDF text extraction failed: {attachment.filename} - {str(e)[:50]}...]"
 
             # Office Documents (DOCX, XLSX, PPTX)
             elif mime_type in ["application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", 
                                "application/vnd.openxmlformats-officedocument.presentationml.presentation"] or file_ext in OFFICE_EXTENSIONS:
+                logging.info("Attachment routed to Office document processor. filename=%s ext=%s", attachment.filename, file_ext)
                 office_config = media_settings.get("office_documents", {})
                 if not office_config.get("enabled", True):
+                    logging.info("Office document processing disabled. filename=%s", attachment.filename)
                     return f"[Office document processing disabled: {attachment.filename}]"
                 
                 max_size = office_config.get("max_size_mb", 10)
                 if file_size_mb > max_size:
+                    logging.warning(
+                        "Office document over size limit. filename=%s size_mb=%.2f max_size_mb=%s",
+                        attachment.filename,
+                        file_size_mb,
+                        max_size,
+                    )
                     return f"[Document too large for processing: {attachment.filename} - {file_size_mb:.1f}MB]"
                 
                 preserve_structure = office_config.get("preserve_structure", True)
@@ -1352,6 +1962,7 @@ class ContextManager:
                                     text += f"{para.text}\n"
                         else:
                             text = "\n".join([para.text for para in doc.paragraphs])
+                        logging.info("DOCX text extracted. filename=%s paragraphs=%s chars=%s", attachment.filename, len(doc.paragraphs), len(text.strip()))
                         return f"--- Document Content: {attachment.filename} ---\n{text.strip()}"
                     
                     elif file_ext == "xlsx":
@@ -1363,6 +1974,7 @@ class ContextManager:
                                 text += f"\n--- Sheet: {sheet_name} ---\n"
                             for row in sheet.iter_rows(values_only=True):
                                 text += ", ".join([str(cell) if cell is not None else "" for cell in row]) + "\n"
+                        logging.info("XLSX text extracted. filename=%s sheets=%s chars=%s", attachment.filename, len(wb.sheetnames), len(text.strip()))
                         return f"--- Excel Content: {attachment.filename} ---\n{text.strip()}"
                     
                     elif file_ext == "pptx" and PPTX_AVAILABLE:
@@ -1374,52 +1986,76 @@ class ContextManager:
                             for shape in slide.shapes:
                                 if hasattr(shape, "text"):
                                     text += shape.text + "\n"
+                        logging.info("PPTX text extracted. filename=%s slides=%s chars=%s", attachment.filename, len(prs.slides), len(text.strip()))
                         return f"--- PowerPoint Content: {attachment.filename} ---\n{text.strip()}"
                     elif file_ext == "pptx" and not PPTX_AVAILABLE:
+                        logging.info("PPTX processing unavailable because python-pptx is not installed. filename=%s", attachment.filename)
                         return f"[PowerPoint processing unavailable - python-pptx not installed: {attachment.filename}]"
                         
                 except Exception as e:
+                    logging.exception("Office document processing failed. filename=%s", attachment.filename)
                     return f"[Document processing failed: {attachment.filename} - {str(e)[:50]}...]"
 
             # Text files
             elif (mime_type and mime_type.startswith("text/")) or file_ext in TEXT_EXTENSIONS:
+                logging.info("Attachment routed to text file processor. filename=%s ext=%s", attachment.filename, file_ext)
                 text_config = media_settings.get("text_files", {})
                 if not text_config.get("enabled", True):
+                    logging.info("Text file processing disabled. filename=%s", attachment.filename)
                     return f"[Text file processing disabled: {attachment.filename}]"
                 
                 max_size = text_config.get("max_size_mb", 5)
                 if file_size_mb > max_size:
+                    logging.warning(
+                        "Text file over size limit. filename=%s size_mb=%.2f max_size_mb=%s",
+                        attachment.filename,
+                        file_size_mb,
+                        max_size,
+                    )
                     return f"[Text file too large for processing: {attachment.filename} - {file_size_mb:.1f}MB]"
                 
                 supported_extensions = text_config.get("supported_extensions", sorted(TEXT_EXTENSIONS))
                 if file_ext not in supported_extensions:
+                    logging.info("Text file extension unsupported. filename=%s ext=%s", attachment.filename, file_ext)
                     return f"[Text file extension not supported: {attachment.filename}]"
                 
                 try:
                     # Full content read and included as text context for both decision and main models
                     text_content = file_bytes.decode('utf-8', errors='ignore')
+                    logging.info("Text file decoded. filename=%s chars=%s", attachment.filename, len(text_content))
                     return f"--- File Content: {attachment.filename} ---\n{text_content}"
                 except Exception as e:
+                    logging.exception("Text file reading failed. filename=%s", attachment.filename)
                     return f"[Text file reading failed: {attachment.filename} - {str(e)[:50]}...]"
 
             # Other files - metadata only
             else:
+                logging.info("Attachment routed to fallback/other processor. filename=%s mime_type=%s ext=%s", attachment.filename, mime_type, file_ext)
                 other_config = media_settings.get("other_files", {})
                 if not other_config.get("enabled", True):
+                    logging.info("Other file processing disabled. filename=%s", attachment.filename)
                     return f"[Other file processing disabled: {attachment.filename}]"
                 
                 max_size = other_config.get("max_size_mb", 20)
                 if file_size_mb > max_size:
+                    logging.warning(
+                        "Other file over size limit. filename=%s size_mb=%.2f max_size_mb=%s",
+                        attachment.filename,
+                        file_size_mb,
+                        max_size,
+                    )
                     return f"[File too large for processing: {attachment.filename} - {file_size_mb:.1f}MB]"
                 
                 if other_config.get("include_metadata_only", True):
                     # File name, size, type, and basic metadata included as text description
+                    logging.info("Returning metadata for unsupported attachment. filename=%s", attachment.filename)
                     return f"--- File Metadata: {attachment.filename} ---\nFile Type: {mime_type or 'Unknown'}\nFile Size: {file_size_mb:.2f} MB\nFile Extension: .{file_ext}\nUpload URL: {attachment.url}"
                 else:
+                    logging.info("Unsupported attachment omitted. filename=%s", attachment.filename)
                     return f"[Unsupported file type: {attachment.filename}]"
 
         except Exception as e:
-            logging.error(f"Error processing attachment {attachment.filename}: {e}")
+            logging.exception(f"Error processing attachment {attachment.filename}: {e}")
             return f"[Could not process file: {attachment.filename} - Error: {str(e)[:50]}...]"
 
     async def _process_embed(self, embed: discord.Embed, model_name: str, media_settings: dict):

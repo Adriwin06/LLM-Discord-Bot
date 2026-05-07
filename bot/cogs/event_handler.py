@@ -81,12 +81,31 @@ class EventHandler(commands.Cog):
             logging.info(f"Ignoring duplicate on_message event for message {message.id}.")
             return
 
+        logging.info(
+            "Received Discord message. message_id=%s guild_id=%s channel_id=%s author_id=%s text_chars=%s attachments=%s embeds=%s mentions_bot=%s",
+            message.id,
+            message.guild.id,
+            message.channel.id,
+            message.author.id,
+            len(message.content or ""),
+            len(message.attachments or []),
+            len(message.embeds or []),
+            self.bot.user in message.mentions if self.bot.user else False,
+        )
+
         # Use lock to prevent race conditions in message processing
         async with self._processing_lock:
             # Get settings first for bypass conditions
             settings = await self.bot.context_manager.get_guild_and_channel_settings(
                 str(message.guild.id),
                 str(message.channel.id)
+            )
+            logging.debug(
+                "Loaded message settings. message_id=%s model=%s decision_model=%s tools_enabled=%s",
+                message.id,
+                settings.get("model", self.bot.config.MAIN_LLM_MODEL),
+                settings.get("decision_llm_model", self.bot.config.DECISION_LLM_MODEL),
+                settings.get("tools_enabled", getattr(self.bot.config, "TOOLS_ENABLED", True)),
             )
             
             # Update counters and trigger summaries/profiles
@@ -106,9 +125,15 @@ class EventHandler(commands.Cog):
 
     async def _queue_reply_decision(self, message: discord.Message, settings: dict):
         if message.content.startswith("!"):
+            logging.info("Skipping reply decision for command message. message_id=%s", message.id)
             return
 
         debounce_seconds = self._reply_chain_debounce_seconds(settings)
+        logging.info(
+            "Queueing reply decision. message_id=%s debounce_seconds=%.2f",
+            message.id,
+            debounce_seconds,
+        )
         if debounce_seconds <= 0:
             await self._process_reply_decision(message, settings, chain_messages=[message])
             return
@@ -130,6 +155,13 @@ class EventHandler(commands.Cog):
                 "force_reply": force_reply,
                 "long_typing": False,
             }
+        logging.debug(
+            "Reply decision chain updated. key=%s message_count=%s latest_message_id=%s force_reply=%s",
+            key,
+            len(self._pending_reply_chains[key]["messages"]),
+            self._pending_reply_chains[key]["latest_message"].id,
+            self._pending_reply_chains[key]["force_reply"],
+        )
 
         existing_task = self._pending_reply_tasks.get(key)
         if existing_task and not existing_task.done():
@@ -137,6 +169,7 @@ class EventHandler(commands.Cog):
 
         task = asyncio.create_task(self._run_debounced_reply_decision(key, message.id, debounce_seconds))
         self._pending_reply_tasks[key] = task
+        logging.debug("Reply decision debounce task scheduled. key=%s latest_message_id=%s", key, message.id)
 
     async def _run_debounced_reply_decision(self, key: tuple, latest_message_id: int, debounce_seconds: float):
         try:
@@ -164,6 +197,12 @@ class EventHandler(commands.Cog):
 
         latest_message = chain["latest_message"]
         try:
+            logging.info(
+                "Running debounced reply decision. latest_message_id=%s chain_count=%s long_typing=%s",
+                latest_message.id,
+                len(chain.get("messages") or []),
+                bool(chain.get("long_typing")),
+            )
             await self._process_reply_decision(
                 latest_message,
                 chain["settings"],
@@ -184,6 +223,13 @@ class EventHandler(commands.Cog):
         long_typing: bool = False,
     ):
         chain_messages = chain_messages or [message]
+        logging.info(
+            "Processing reply decision. message_id=%s force_reply=%s chain_count=%s long_typing=%s",
+            message.id,
+            force_reply,
+            len(chain_messages),
+            long_typing,
+        )
         decision = await self._decide_message_action(
             message,
             settings,
@@ -197,6 +243,7 @@ class EventHandler(commands.Cog):
             return
 
         action = str(decision.get("action", "none")).lower()
+        logging.info("Reply decision result. message_id=%s action=%s decision=%s", message.id, action, decision)
         if action == "reply":
             await self._generate_and_send_reply(
                 message,
@@ -358,6 +405,7 @@ class EventHandler(commands.Cog):
     ):
         # Bypass commands - don't trigger LLM for messages starting with "!"
         if message.content.startswith("!"):
+            logging.info("Decision model skipped for command message. message_id=%s", message.id)
             return {"action": "none"}
 
         # Bypass conditions
@@ -367,6 +415,12 @@ class EventHandler(commands.Cog):
 
         # Use decision LLM with context built specifically for that model
         decision_model = settings.get("decision_llm_model", self.bot.config.DECISION_LLM_MODEL)
+        logging.info(
+            "Decision model context build starting. message_id=%s decision_model=%s main_model=%s",
+            message.id,
+            decision_model,
+            self.bot.config.MAIN_LLM_MODEL,
+        )
         
         # Only build separate context if decision model is different from main model
         if decision_model == self.bot.config.MAIN_LLM_MODEL:
@@ -416,11 +470,18 @@ class EventHandler(commands.Cog):
             messages=decision_context,
             response_format={"type": "json_object"}
         )
+        logging.info("Decision model response received. message_id=%s has_response=%s", message.id, bool(response and response.choices))
 
         if not response or not response.choices:
             # Fallback to main model if decision model fails and they are different
             if decision_model != self.bot.config.MAIN_LLM_MODEL:
                 # Build context for main model and retry decision
+                logging.warning(
+                    "Decision model failed; retrying decision with main model. message_id=%s decision_model=%s main_model=%s",
+                    message.id,
+                    decision_model,
+                    self.bot.config.MAIN_LLM_MODEL,
+                )
                 main_context, _ = await self.bot.context_manager.build_context(message, model_name=self.bot.config.MAIN_LLM_MODEL)
                 main_context = self._with_message_chain_context(main_context, chain_messages, long_typing=long_typing)
                 main_context[0]["content"] = decision_prompt
@@ -439,6 +500,13 @@ class EventHandler(commands.Cog):
             # Clean the response content by removing markdown code blocks if present
             raw_content = response.choices[0].message.content.strip()
             cleaned_content = self._clean_json_response(raw_content)
+            logging.debug(
+                "Decision model raw output. message_id=%s raw_chars=%s cleaned_chars=%s cleaned=%s",
+                message.id,
+                len(raw_content),
+                len(cleaned_content),
+                cleaned_content[:500],
+            )
             
             decision_json = json.loads(cleaned_content)
             action = str(decision_json.get("action", "none")).lower()
@@ -452,7 +520,7 @@ class EventHandler(commands.Cog):
                 return self._normalize_gif_decision(decision_json, settings)
             return {"action": "none"}
         except (json.JSONDecodeError, KeyError):
-            logging.error(f"Failed to parse decision JSON: {response.choices[0].message.content}")
+            logging.exception(f"Failed to parse decision JSON: {response.choices[0].message.content}")
             return {"action": "none"}
 
     async def _update_counters_and_triggers(self, message: discord.Message, settings: dict):
@@ -585,12 +653,25 @@ class EventHandler(commands.Cog):
     ):
         try:
             main_model = settings.get("model", self.bot.config.MAIN_LLM_MODEL)
+            logging.info(
+                "Generating reply. message_id=%s model=%s chain_count=%s long_typing=%s",
+                message.id,
+                main_model,
+                len(chain_messages or []),
+                long_typing,
+            )
             
             # Start typing indicator while processing
             async with message.channel.typing():
                 # Build context specifically for the main model (includes full media processing for that model)
                 main_context, _ = await self.bot.context_manager.build_context(message, model_name=main_model)
                 main_context = self._with_message_chain_context(main_context, chain_messages, long_typing=long_typing)
+                logging.info(
+                    "Main reply context ready. message_id=%s model=%s messages=%s",
+                    message.id,
+                    main_model,
+                    len(main_context),
+                )
                 
                 content = await self._generate_reply_content(main_model, main_context, message, settings)
                 if not content:
@@ -600,6 +681,11 @@ class EventHandler(commands.Cog):
 
                 content = self._normalize_reply_content(content)
                 content = self._sanitize_reply_content(content, message.guild)
+                logging.info(
+                    "Reply content generated. message_id=%s chars=%s",
+                    message.id,
+                    len(content or ""),
+                )
                 
                 # Resolve mentions
                 content = await self._resolve_mentions(content, message.guild)
@@ -614,9 +700,10 @@ class EventHandler(commands.Cog):
                 content=content,
                 reply_to=message
             )
+            logging.info("Reply sent. message_id=%s chars=%s", message.id, len(content or ""))
             
         except Exception as e:
-            logging.error(f"Error in _generate_and_send_reply: {e}")
+            logging.exception(f"Error in _generate_and_send_reply: {e}")
             try:
                 await self._send_generation_error(message, e)
             except Exception as fallback_error:
@@ -701,6 +788,7 @@ class EventHandler(commands.Cog):
 
     async def _generate_reply_content(self, model: str, messages: list, origin_message: discord.Message, settings: dict):
         if not self._tools_enabled(settings):
+            logging.info("Generating reply without tools; tools disabled. message_id=%s model=%s", origin_message.id, model)
             response = await self.bot.llm_provider.create_completion(model=model, messages=messages)
             return self._response_content(response)
 
@@ -711,6 +799,7 @@ class EventHandler(commands.Cog):
 
         tool_manager = getattr(self.bot, "tool_manager", None)
         if not tool_manager:
+            logging.info("Generating reply without tools; tool manager missing. message_id=%s model=%s", origin_message.id, model)
             response = await self.bot.llm_provider.create_completion(model=model, messages=messages)
             return self._response_content(response)
 
@@ -720,6 +809,13 @@ class EventHandler(commands.Cog):
             "content": "Final Discord replies must be plain message text only. Do not return JSON, do not include `content` or `reactions` fields, and do not list available tools."
         })
         tools = tool_manager.tool_definitions()
+        logging.info(
+            "Generating reply with local Discord tools available. message_id=%s model=%s tools=%s max_rounds=%s",
+            origin_message.id,
+            model,
+            len(tools),
+            getattr(self.bot.config, "TOOL_MAX_ROUNDS", 0),
+        )
         preloaded_summary_channel_ids = self._preloaded_explicit_channel_summary_ids(tool_messages)
         if preloaded_summary_channel_ids:
             tool_messages.append({
