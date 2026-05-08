@@ -662,7 +662,8 @@ class AdminCommands(commands.Cog):
                           include_user_profiles: bool = True,
                           include_conversation_history: bool = True,
                           include_reply_chain: bool = True,
-                          include_current_message: bool = True):
+                          include_current_message: bool = True,
+                          include_server_emojis: bool = True):
         """
         Show the complete context that would be sent to the LLM.
         
@@ -705,7 +706,8 @@ class AdminCommands(commands.Cog):
                 include_user_profiles=include_user_profiles,
                 include_conversation_history=include_conversation_history,
                 include_reply_chain=include_reply_chain,
-                include_current_message=include_current_message
+                include_current_message=include_current_message,
+                include_server_emojis=include_server_emojis
             )
             
             # Format the context for display
@@ -777,7 +779,8 @@ class AdminCommands(commands.Cog):
                         f"User Profiles: {'✅' if include_user_profiles else '❌'}\n"
                         f"Conversation History: {'✅' if include_conversation_history else '❌'}\n"
                         f"Reply Chain: {'✅' if include_reply_chain else '❌'}\n"
-                        f"Current Message: {'✅' if include_current_message else '❌'}"
+                        f"Current Message: {'✅' if include_current_message else '❌'}\n"
+                        f"Server Emojis: {'✅' if include_server_emojis else '❌'}"
                     ),
                     "inline": False
                 },

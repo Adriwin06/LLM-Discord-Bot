@@ -96,6 +96,8 @@ class ContextManager:
         self._faster_whisper_model_key = None
         self._openai_whisper_model = None
         self._openai_whisper_model_name = None
+        self._guild_emoji_cache = {}
+        self._guild_emoji_cache_ttl_seconds = 300
 
     async def get_guild_and_channel_settings(self, guild_id, channel_id):
         guild_settings = await self.store.get_guild_settings(guild_id)
@@ -223,7 +225,8 @@ class ContextManager:
                            prompt: str = None, behavior_override: str = None, capabilities_override: str = None,
                            include_bot_identity: bool = True, include_channel_summary: bool = True, 
                            include_user_profiles: bool = True, include_conversation_history: bool = True,
-                           include_reply_chain: bool = True, include_current_message: bool = True):
+                           include_reply_chain: bool = True, include_current_message: bool = True,
+                           include_server_emojis: bool = True):
         """
         Build context for a specific model. If model_name is not provided, uses MAIN_LLM_MODEL.
         
@@ -240,6 +243,7 @@ class ContextManager:
             include_conversation_history: Optional. Include recent message history. Default True.
             include_reply_chain: Optional. Include reply chain context (requires include_conversation_history). Default True.
             include_current_message: Optional. Include the current message in history (ignored if prompt is provided). Default True.
+            include_server_emojis: Optional. Include custom server emojis available to the bot. Default True.
         
         According to the spec, both decision and main models should receive identical media processing
         but processed according to each model's individual capabilities.
@@ -306,7 +310,13 @@ class ContextManager:
             bot_identity = f"Your Bot name: {self.bot.user.name}\nYour Bot user ID: {self.bot.user.id}"
             messages.append({"role": "system", "content": bot_identity})
 
-        # 2. Channel Summary
+        # 2. Server Emojis
+        if include_server_emojis:
+            emoji_context = await self._server_emoji_context(getattr(channel, "guild", None))
+            if emoji_context:
+                messages.append({"role": "system", "content": emoji_context})
+
+        # 3. Channel Summary
         if include_channel_summary:
             mentioned_channel_ids = self._message_channel_mention_ids(message)
             channel_data = data.get("channels", {}).get(channel_id, {})
@@ -332,7 +342,7 @@ class ContextManager:
                 )
             )
 
-        # 3. User Profiles
+        # 4. User Profiles
         if include_user_profiles:
             user_data = data.get("users", {}).get(user_id, {})
             user_profile_content = []
@@ -348,7 +358,7 @@ class ContextManager:
             if user_profile_content:
                 messages.append({"role": "system", "content": "\n".join(user_profile_content)})
 
-        # 4. Conversation History (Reply Chain + Recent Messages)
+        # 5. Conversation History (Reply Chain + Recent Messages)
         if include_conversation_history:
             history_limit = settings.get("context", {}).get("history_messages", 15)
             reply_chain_limit = settings.get("context", {}).get("reply_chain_limit", 5)
@@ -399,7 +409,7 @@ class ContextManager:
                 context_lines.extend(self._format_message_context_line(msg) for msg in sorted_messages)
                 messages.append({"role": "system", "content": "\n".join(context_lines)})
 
-        # 5. Current Message or Custom Prompt
+        # 6. Current Message or Custom Prompt
         if include_current_message or prompt:
             messages.append({
                 "role": "system",
@@ -430,6 +440,72 @@ class ContextManager:
             self._content_stats_for_logging(messages),
         )
         return messages, settings
+
+    async def _server_emoji_context(self, guild: discord.Guild) -> str:
+        if not guild:
+            return ""
+
+        emojis = await self._get_guild_emojis(guild)
+        if not emojis:
+            return ""
+
+        lines = [
+            "Available Server Emojis:",
+            (
+                "These are custom emojis from this Discord server. In replies, use the message_format exactly. "
+                "For reaction decisions, return either message_format or reaction_format. "
+                "Only use emojis marked status=available."
+            ),
+        ]
+
+        for emoji in sorted(emojis, key=lambda item: (str(getattr(item, "name", "")).lower(), int(getattr(item, "id", 0) or 0))):
+            name = str(getattr(emoji, "name", "") or "").strip()
+            emoji_id = getattr(emoji, "id", None)
+            if not name or not emoji_id:
+                continue
+
+            animated = bool(getattr(emoji, "animated", False))
+            status = "available" if getattr(emoji, "available", True) else "unavailable"
+            message_format = f"<{'a' if animated else ''}:{name}:{emoji_id}>"
+            reaction_format = f"{name}:{emoji_id}"
+            emoji_type = "animated" if animated else "static"
+            lines.append(
+                f"- name={name} id={emoji_id} type={emoji_type} status={status} "
+                f"message_format={message_format} reaction_format={reaction_format}"
+            )
+
+        return "\n".join(lines) if len(lines) > 2 else ""
+
+    async def _get_guild_emojis(self, guild: discord.Guild) -> list:
+        guild_id = str(getattr(guild, "id", ""))
+        if not guild_id:
+            return []
+
+        now = asyncio.get_running_loop().time()
+        cached = self._guild_emoji_cache.get(guild_id)
+        if cached and now - cached.get("fetched_at", 0) <= self._guild_emoji_cache_ttl_seconds:
+            return list(cached.get("emojis") or [])
+
+        emojis = []
+        if hasattr(guild, "fetch_emojis"):
+            try:
+                emojis = await guild.fetch_emojis()
+            except discord.HTTPException as e:
+                logging.warning("Could not fetch server emojis for guild %s; using cache fallback: %s", guild_id, e)
+                emojis = getattr(guild, "emojis", []) or []
+            except Exception as e:
+                logging.warning("Unexpected error fetching server emojis for guild %s; using cache fallback: %s", guild_id, e)
+                emojis = getattr(guild, "emojis", []) or []
+        else:
+            emojis = getattr(guild, "emojis", []) or []
+
+        emojis = list(emojis or [])
+        self._guild_emoji_cache[guild_id] = {
+            "fetched_at": now,
+            "emojis": emojis,
+        }
+        logging.debug("Loaded server emojis for context. guild_id=%s emoji_count=%s", guild_id, len(emojis))
+        return emojis
 
     def _message_channel_mention_ids(self, message: discord.Message) -> set:
         return {

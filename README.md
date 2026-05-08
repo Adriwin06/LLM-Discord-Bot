@@ -10,6 +10,7 @@ This is a sophisticated, LLM-powered Discord bot built with Python, `discord.py`
     - **Channel Summaries**: Automatically creates and maintains evolving summaries of channel conversations.
     - **User Profiles**: Generates AI-powered summaries of user personalities and interests, which can be supplemented with manual notes.
     - **Dynamic History**: Fetches recent messages and follows reply chains to understand the immediate context of a conversation.
+    - **Server Emojis**: Provides the LLM with custom server emoji formats so it can use them in replies and reactions.
 - **Advanced Media Handling**:
     - Processes images, audio, video, PDFs, and Office documents.
     - Conditionally uses vision, audio, and document-processing capabilities based on the configured LLM.

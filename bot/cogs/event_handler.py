@@ -368,11 +368,19 @@ class EventHandler(commands.Cog):
                 long_typing=long_typing,
             )
         elif action == "react" and decision.get("reaction"):
+            reaction = self._normalize_reaction_emoji(decision["reaction"], message.guild)
+            if not reaction:
+                logging.warning("Decision model returned an unusable reaction for message %s: %r", message.id, decision.get("reaction"))
+                return
             try:
-                await message.add_reaction(decision["reaction"])
+                await message.add_reaction(reaction)
                 self._mark_bot_involved(message)
             except discord.HTTPException:
-                logging.warning(f"Failed to add reaction '{decision['reaction']}'. It might be an invalid or custom emoji not available.")
+                logging.warning(
+                    "Failed to add reaction %r (normalized from %r). It might be invalid or unavailable.",
+                    reaction,
+                    decision.get("reaction"),
+                )
         elif action == "gif":
             await self._send_gif_decision(message, settings, decision)
 
@@ -709,6 +717,8 @@ class EventHandler(commands.Cog):
         Respond with a single JSON object with four keys:
         1. "action": a string, either "reply", "react", "gif", or "none".
         2. "reaction": a string containing a single emoji if the action is "react", otherwise null.
+           If an Available Server Emojis block is present, you may use one of those custom emojis.
+           For custom emoji reactions, return either its message_format (<:name:id> or <a:name:id>) or reaction_format (name:id).
         3. "gif_key": one available GIF key if the action is "gif", otherwise null.
         4. "caption": a short caption if the action is "gif" and text would improve it, otherwise null.
         
@@ -1022,6 +1032,44 @@ class EventHandler(commands.Cog):
             "gif_key": gif_key,
             "caption": self._sanitize_gif_caption(decision_json.get("caption")),
         }
+
+    def _normalize_reaction_emoji(self, reaction, guild: discord.Guild = None):
+        reaction_text = str(reaction or "").strip()
+        if not reaction_text:
+            return None
+
+        custom_match = re.fullmatch(r"<a?:([A-Za-z0-9_]+):(\d+)>", reaction_text)
+        if custom_match:
+            name, emoji_id = custom_match.groups()
+            emoji = self._guild_emoji_by_id(guild, emoji_id)
+            return emoji or f"{name}:{emoji_id}"
+
+        reaction_format_match = re.fullmatch(r"([A-Za-z0-9_]+):(\d+)", reaction_text)
+        if reaction_format_match:
+            name, emoji_id = reaction_format_match.groups()
+            emoji = self._guild_emoji_by_id(guild, emoji_id)
+            return emoji or f"{name}:{emoji_id}"
+
+        name_match = re.fullmatch(r":([A-Za-z0-9_]+):", reaction_text)
+        if name_match and guild:
+            emoji = discord.utils.get(getattr(guild, "emojis", []) or [], name=name_match.group(1))
+            if emoji:
+                return emoji
+
+        return reaction_text
+
+    def _guild_emoji_by_id(self, guild: discord.Guild, emoji_id):
+        if not guild:
+            return None
+
+        try:
+            emoji_id = int(emoji_id)
+        except (TypeError, ValueError):
+            return None
+
+        if hasattr(guild, "get_emoji"):
+            return guild.get_emoji(emoji_id)
+        return discord.utils.get(getattr(guild, "emojis", []) or [], id=emoji_id)
 
     def _gifs_enabled(self, settings: dict) -> bool:
         value = settings.get(
