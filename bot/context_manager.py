@@ -13,6 +13,7 @@ import mimetypes
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import aiohttp
@@ -21,7 +22,9 @@ import docx
 import openpyxl
 from PIL import Image
 import io
+from ipaddress import ip_address
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 # Optional imports for media processing
 try:
@@ -34,19 +37,6 @@ except ImportError:
 
 openai_whisper = None
 OPENAI_WHISPER_AVAILABLE = importlib.util.find_spec("whisper") is not None
-
-try:
-    from moviepy import AudioFileClip, VideoFileClip
-    MOVIEPY_AVAILABLE = True
-except ImportError:
-    try:
-        from moviepy.editor import AudioFileClip, VideoFileClip
-        MOVIEPY_AVAILABLE = True
-    except ImportError:
-        AudioFileClip = None
-        VideoFileClip = None
-        MOVIEPY_AVAILABLE = False
-        logging.warning("moviepy not available. Audio/video duration and frame extraction will be limited.")
 
 # Optional imports for advanced document processing
 try:
@@ -478,7 +468,7 @@ class ContextManager:
                 continue
             seen_channel_ids.add(mentioned_channel_id)
 
-            if not self._can_include_mentioned_channel_summary(mentioned_channel, message.guild):
+            if not self._can_include_mentioned_channel_summary(mentioned_channel, message.guild, getattr(message, "author", None)):
                 continue
 
             channel_data = channel_data_by_id.get(mentioned_channel_id, {})
@@ -537,7 +527,12 @@ class ContextManager:
 
         return f"{label} for #{channel_name} (Channel ID: {channel_id}):\n{summary}{metadata}{instruction}"
 
-    def _can_include_mentioned_channel_summary(self, channel: discord.abc.GuildChannel, current_guild: discord.Guild) -> bool:
+    def _can_include_mentioned_channel_summary(
+        self,
+        channel: discord.abc.GuildChannel,
+        current_guild: discord.Guild,
+        requester: discord.Member = None,
+    ) -> bool:
         if not channel or not current_guild:
             return False
 
@@ -556,9 +551,29 @@ class ContextManager:
         except Exception:
             return False
 
-        return bool(
+        bot_can_read = bool(
             getattr(permissions, "view_channel", False)
             and getattr(permissions, "read_message_history", False)
+        )
+        if not bot_can_read:
+            return False
+
+        if not requester:
+            return False
+
+        if not isinstance(requester, discord.Member) or getattr(getattr(requester, "guild", None), "id", None) != guild.id:
+            requester = guild.get_member(getattr(requester, "id", 0)) if hasattr(guild, "get_member") else None
+        if not requester:
+            return False
+
+        try:
+            requester_permissions = channel.permissions_for(requester)
+        except Exception:
+            return False
+
+        return bool(
+            getattr(requester_permissions, "view_channel", False)
+            and getattr(requester_permissions, "read_message_history", False)
         )
 
     def _safe_int(self, value, *, default: int, minimum: int, maximum: int) -> int:
@@ -835,6 +850,72 @@ class ContextManager:
             pass
         except OSError as e:
             logging.warning(f"Could not remove temporary media file {path}: {e}")
+
+    async def _validate_public_media_url(self, url: str) -> str | None:
+        parsed = urlparse(url or "")
+        if parsed.scheme not in {"http", "https"}:
+            return "Only http and https attachment URLs are allowed."
+        if not parsed.hostname:
+            return "Attachment URL must include a hostname."
+        if parsed.username or parsed.password:
+            return "Attachment URLs with embedded credentials are not allowed."
+
+        host = parsed.hostname.strip().lower()
+        if host in {"localhost", "0.0.0.0"} or host.endswith(".local"):
+            return "Local or private attachment hostnames are not allowed."
+
+        try:
+            literal_ip = ip_address(host)
+            if self._is_private_or_local_ip(literal_ip):
+                return "Local or private attachment IP addresses are not allowed."
+            return None
+        except ValueError:
+            pass
+
+        loop = asyncio.get_running_loop()
+        try:
+            infos = await loop.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
+        except socket.gaierror:
+            return "Could not resolve attachment hostname."
+
+        for info in infos:
+            resolved_host = info[4][0]
+            try:
+                resolved_ip = ip_address(resolved_host)
+            except ValueError:
+                continue
+            if self._is_private_or_local_ip(resolved_ip):
+                return "Attachment URL resolves to a local or private network address."
+
+        return None
+
+    def _is_private_or_local_ip(self, value) -> bool:
+        return any([
+            value.is_private,
+            value.is_loopback,
+            value.is_link_local,
+            value.is_multicast,
+            value.is_reserved,
+            value.is_unspecified,
+        ])
+
+    def _attachment_download_limit_bytes(self, media_settings: dict, mime_type: str, file_ext: str, is_likely_gif: bool) -> int:
+        if (mime_type and mime_type.startswith("image/")) or is_likely_gif:
+            max_size_mb = self._safe_float(media_settings.get("images", {}).get("max_size_mb"), default=10.0, minimum=0.1, maximum=100.0)
+        elif self._is_audio_file(mime_type, file_ext):
+            max_size_mb = self._safe_float(media_settings.get("audio", {}).get("max_size_mb"), default=25.0, minimum=0.1, maximum=500.0)
+        elif self._is_video_file(mime_type, file_ext):
+            max_size_mb = self._safe_float(media_settings.get("video", {}).get("max_size_mb"), default=250.0, minimum=0.1, maximum=1000.0)
+        elif mime_type == "application/pdf":
+            max_size_mb = self._safe_float(media_settings.get("pdf", {}).get("max_size_mb"), default=10.0, minimum=0.1, maximum=100.0)
+        elif file_ext in OFFICE_EXTENSIONS:
+            max_size_mb = self._safe_float(media_settings.get("office_documents", {}).get("max_size_mb"), default=10.0, minimum=0.1, maximum=100.0)
+        elif (mime_type and mime_type.startswith("text/")) or file_ext in TEXT_EXTENSIONS:
+            max_size_mb = self._safe_float(media_settings.get("text_files", {}).get("max_size_mb"), default=5.0, minimum=0.1, maximum=100.0)
+        else:
+            max_size_mb = self._safe_float(media_settings.get("other_files", {}).get("max_size_mb"), default=20.0, minimum=0.1, maximum=100.0)
+
+        return max(1, int(max_size_mb * 1024 * 1024))
 
     async def _get_media_duration(self, file_path: str, media_kind: str, media_config: dict = None):
         timeout_seconds = self._safe_float(
@@ -1633,10 +1714,38 @@ class ContextManager:
                 'Accept-Encoding': 'gzip, deflate',
                 'Connection': 'keep-alive',
             }
+
+            if not attachment_url:
+                return f"[Could not fetch attachment: {attachment.filename} (missing URL)]"
+
+            safety_error = await self._validate_public_media_url(attachment_url)
+            if safety_error:
+                logging.warning(
+                    "Rejected unsafe attachment URL. filename=%s url=%s reason=%s",
+                    attachment.filename,
+                    attachment_url,
+                    safety_error,
+                )
+                return f"[Attachment URL rejected: {attachment.filename} - {safety_error}]"
+
+            max_download_bytes = self._attachment_download_limit_bytes(media_settings, mime_type, file_ext, is_likely_gif)
+            max_download_mb = max_download_bytes / (1024 * 1024)
             
             async with aiohttp.ClientSession() as session:
                 logging.info("Downloading attachment. filename=%s", attachment.filename)
                 async with session.get(attachment_url, headers=headers, allow_redirects=True, timeout=30) as resp:
+                    final_url = str(resp.url)
+                    safety_error = await self._validate_public_media_url(final_url)
+                    if safety_error:
+                        logging.warning(
+                            "Rejected unsafe attachment redirect. filename=%s original_url=%s final_url=%s reason=%s",
+                            attachment.filename,
+                            attachment_url,
+                            final_url,
+                            safety_error,
+                        )
+                        return f"[Attachment redirect rejected: {attachment.filename} - {safety_error}]"
+
                     if resp.status != 200:
                         logging.warning("HTTP %s when fetching attachment. filename=%s", resp.status, attachment.filename)
                         return f"[Could not fetch attachment: {attachment.filename} (HTTP {resp.status})]"
@@ -1645,6 +1754,19 @@ class ContextManager:
                     actual_content_type = resp.headers.get('content-type', '').lower()
                     actual_mime_type = actual_content_type.split(';', 1)[0].strip()
                     content_length = resp.headers.get('content-length')
+                    if content_length:
+                        try:
+                            response_size = int(content_length)
+                            if response_size > max_download_bytes:
+                                logging.warning(
+                                    "Attachment response over download limit. filename=%s content_length=%s max_download_mb=%.2f",
+                                    attachment.filename,
+                                    response_size,
+                                    max_download_mb,
+                                )
+                                return f"[Attachment too large for processing: {attachment.filename} - larger than {max_download_mb:.1f}MB]"
+                        except ValueError:
+                            logging.debug("Attachment content-length was not numeric. filename=%s content_length=%s", attachment.filename, content_length)
                     
                     logging.debug(
                         "Fetched attachment headers. filename=%s content_type=%s content_length=%s",
@@ -1653,7 +1775,15 @@ class ContextManager:
                         content_length,
                     )
                     
-                    file_bytes = await resp.read()
+                    file_bytes = await resp.content.read(max_download_bytes + 1)
+                    if len(file_bytes) > max_download_bytes:
+                        logging.warning(
+                            "Attachment response exceeded bounded read. filename=%s downloaded_bytes=%s max_download_mb=%.2f",
+                            attachment.filename,
+                            len(file_bytes),
+                            max_download_mb,
+                        )
+                        return f"[Attachment too large for processing: {attachment.filename} - larger than {max_download_mb:.1f}MB]"
                     logging.info(
                         "Attachment downloaded. filename=%s status=%s actual_content_type=%s content_length_header=%s downloaded_bytes=%s",
                         attachment.filename,

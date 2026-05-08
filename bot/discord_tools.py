@@ -325,6 +325,9 @@ class DiscordToolManager:
         guild = origin_message.guild
         if not guild:
             return {"ok": False, "tool": "list_channels", "error": "Channel listing is only available in a server."}
+        actor = self._origin_member(origin_message)
+        if not actor:
+            return {"ok": False, "tool": "list_channels", "error": "Could not verify the requesting member's channel permissions."}
 
         messageable_only = self._coerce_bool(messageable_only, default=True)
         include_threads = self._coerce_bool(include_threads, default=False)
@@ -333,8 +336,9 @@ class DiscordToolManager:
             guild,
             messageable_only=messageable_only,
             include_threads=include_threads,
+            actor=actor,
         )
-        formatted = [self._format_channel(channel) for channel in channels[:limit]]
+        formatted = [self._format_channel(channel, actor=actor) for channel in channels[:limit]]
 
         return {
             "ok": True,
@@ -358,6 +362,9 @@ class DiscordToolManager:
         guild = origin_message.guild
         if not guild:
             return {"ok": False, "tool": "resolve_channel", "error": "Channel resolution is only available in a server."}
+        actor = self._origin_member(origin_message)
+        if not actor:
+            return {"ok": False, "tool": "resolve_channel", "error": "Could not verify the requesting member's channel permissions."}
 
         query = str(query or "").strip()
         if not query:
@@ -372,14 +379,14 @@ class DiscordToolManager:
         if direct_id is not None:
             matched_by = "id"
             channel = self._resolve_channel(guild, query)
-            if channel and self._can_view_channel(channel):
+            if channel and self._can_view_channel(channel, actor=actor):
                 matches = [channel]
         else:
             query_norm = self._normalize_channel_query(query)
             if not query_norm:
                 return {"ok": False, "tool": "resolve_channel", "error": "Query is required."}
 
-            visible_channels = self._visible_channels(guild, messageable_only=False, include_threads=include_threads)
+            visible_channels = self._visible_channels(guild, messageable_only=False, include_threads=include_threads, actor=actor)
             exact_matches = []
             prefix_matches = []
             contains_matches = []
@@ -397,7 +404,7 @@ class DiscordToolManager:
 
             matches = self._dedupe_channels([*exact_matches, *prefix_matches, *contains_matches])
 
-        formatted = [self._format_channel(channel) for channel in matches[:limit]]
+        formatted = [self._format_channel(channel, actor=actor) for channel in matches[:limit]]
         return {
             "ok": True,
             "tool": "resolve_channel",
@@ -417,11 +424,14 @@ class DiscordToolManager:
         guild = origin_message.guild
         if not guild:
             return {"ok": False, "tool": "get_channel_summary", "error": "Channel summaries are only available in a server."}
+        actor = self._origin_member(origin_message)
+        if not actor:
+            return {"ok": False, "tool": "get_channel_summary", "error": "Could not verify the requesting member's channel permissions."}
 
         channel = self._resolve_channel(guild, channel_id)
         if not channel:
             return {"ok": False, "tool": "get_channel_summary", "error": "Channel was not found in the current server."}
-        if not self._can_read_history(channel):
+        if not self._can_read_history(channel, actor=actor):
             return {"ok": False, "tool": "get_channel_summary", "error": "The bot cannot read that channel's summary."}
 
         context_manager = getattr(self.bot, "context_manager", None)
@@ -440,7 +450,7 @@ class DiscordToolManager:
             "ok": True,
             "tool": "get_channel_summary",
             "guild_id": str(guild.id),
-            "channel": self._format_channel(channel),
+            "channel": self._format_channel(channel, actor=actor),
             "summary_available": summary_available,
             "summary": summary,
             "truncated": truncated,
@@ -510,7 +520,10 @@ class DiscordToolManager:
         channel = self._resolve_channel(origin_message.guild, channel_id)
         if not channel:
             return {"ok": False, "tool": "fetch_message", "error": "Channel was not found in the current server."}
-        if not self._can_read_history(channel):
+        actor = self._origin_member(origin_message)
+        if not actor:
+            return {"ok": False, "tool": "fetch_message", "error": "Could not verify the requesting member's channel permissions."}
+        if not self._can_read_history(channel, actor=actor):
             return {"ok": False, "tool": "fetch_message", "error": "The bot cannot read message history in that channel."}
         if not self._supports_fetch_message(channel):
             return {"ok": False, "tool": "fetch_message", "error": "That channel does not support fetching messages by ID."}
@@ -536,7 +549,10 @@ class DiscordToolManager:
         channel = self._resolve_channel(origin_message.guild, channel_id) if channel_id else origin_message.channel
         if not channel:
             return {"ok": False, "tool": "get_recent_messages", "error": "Channel was not found in the current server."}
-        if not self._can_read_history(channel):
+        actor = self._origin_member(origin_message)
+        if not actor:
+            return {"ok": False, "tool": "get_recent_messages", "error": "Could not verify the requesting member's channel permissions."}
+        if not self._can_read_history(channel, actor=actor):
             return {"ok": False, "tool": "get_recent_messages", "error": "The bot cannot read message history in that channel."}
         if not self._supports_history(channel):
             return {"ok": False, "tool": "get_recent_messages", "error": "That channel does not expose message history."}
@@ -900,15 +916,19 @@ class DiscordToolManager:
         channel_id: Optional[str],
         include_all_readable_channels: bool,
     ) -> List[Any]:
+        actor = self._origin_member(origin_message)
+        if not actor:
+            return []
+
         if include_all_readable_channels:
             return [
                 channel
-                for channel in self._visible_channels(origin_message.guild, messageable_only=True, include_threads=False)
-                if self._can_read_history(channel)
+                for channel in self._visible_channels(origin_message.guild, messageable_only=True, include_threads=False, actor=actor)
+                if self._can_read_history(channel, actor=actor)
             ]
 
         channel = self._resolve_channel(origin_message.guild, channel_id) if channel_id else origin_message.channel
-        if channel and self._can_read_history(channel) and self._supports_history(channel):
+        if channel and self._can_read_history(channel, actor=actor) and self._supports_history(channel):
             return [channel]
         return []
 
@@ -932,6 +952,7 @@ class DiscordToolManager:
         *,
         messageable_only: bool,
         include_threads: bool,
+        actor: Optional[Any] = None,
     ) -> List[Any]:
         channels = list(getattr(guild, "channels", []))
         if include_threads:
@@ -941,7 +962,7 @@ class DiscordToolManager:
         for channel in self._dedupe_channels(channels):
             if getattr(getattr(channel, "guild", None), "id", None) != guild.id:
                 continue
-            if not self._can_view_channel(channel):
+            if not self._can_view_channel(channel, actor=actor):
                 continue
             if messageable_only and not self._supports_history(channel):
                 continue
@@ -960,27 +981,44 @@ class DiscordToolManager:
             deduped.append(channel)
         return deduped
 
-    def _can_view_channel(self, channel: Any) -> bool:
-        permissions = self._channel_permissions(channel)
-        return bool(permissions and getattr(permissions, "view_channel", False))
-
-    def _can_read_history(self, channel: Any) -> bool:
-        permissions = self._channel_permissions(channel)
-        return bool(
-            permissions
-            and getattr(permissions, "view_channel", False)
-            and getattr(permissions, "read_message_history", False)
+    def _can_view_channel(self, channel: Any, actor: Optional[Any] = None) -> bool:
+        return self._member_has_permissions(channel, self._guild_member(getattr(channel, "guild", None)), "view_channel") and (
+            actor is None or self._member_has_permissions(channel, actor, "view_channel")
         )
 
-    def _channel_permissions(self, channel: Any) -> Optional[Any]:
+    def _can_read_history(self, channel: Any, actor: Optional[Any] = None) -> bool:
+        required = ("view_channel", "read_message_history")
+        return self._member_has_permissions(channel, self._guild_member(getattr(channel, "guild", None)), *required) and (
+            actor is None or self._member_has_permissions(channel, actor, *required)
+        )
+
+    def _member_has_permissions(self, channel: Any, member: Optional[Any], *permission_names: str) -> bool:
+        permissions = self._channel_permissions(channel, member)
+        return bool(permissions and all(getattr(permissions, name, False) for name in permission_names))
+
+    def _channel_permissions(self, channel: Any, member: Optional[Any] = None) -> Optional[Any]:
         guild = getattr(channel, "guild", None)
-        me = self._guild_member(guild)
-        if not guild or not me or not hasattr(channel, "permissions_for"):
+        subject = member or self._guild_member(guild)
+        if not guild or not subject or not hasattr(channel, "permissions_for"):
+            return None
+        subject_guild = getattr(subject, "guild", None)
+        if subject_guild and getattr(subject_guild, "id", None) != getattr(guild, "id", None):
             return None
         try:
-            return channel.permissions_for(me)
+            return channel.permissions_for(subject)
         except Exception:
             return None
+
+    def _origin_member(self, origin_message: discord.Message) -> Optional[Any]:
+        guild = getattr(origin_message, "guild", None)
+        author = getattr(origin_message, "author", None)
+        if not guild or not author:
+            return None
+        if isinstance(author, discord.Member) and getattr(getattr(author, "guild", None), "id", None) == guild.id:
+            return author
+        if hasattr(guild, "get_member") and getattr(author, "id", None) is not None:
+            return guild.get_member(author.id)
+        return None
 
     def _guild_member(self, guild: Optional[discord.Guild]) -> Optional[Any]:
         if not guild:
@@ -999,13 +1037,13 @@ class DiscordToolManager:
     def _supports_fetch_message(self, channel: Any) -> bool:
         return callable(getattr(channel, "fetch_message", None))
 
-    def _format_channel(self, channel: Any) -> Dict[str, Any]:
+    def _format_channel(self, channel: Any, actor: Optional[Any] = None) -> Dict[str, Any]:
         parent = getattr(channel, "parent", None)
         category = getattr(channel, "category", None)
         channel_id = getattr(channel, "id", "")
         parent_id = getattr(parent, "id", None)
         category_id = getattr(category, "id", None)
-        can_read_history = self._can_read_history(channel)
+        can_read_history = self._can_read_history(channel, actor=actor)
 
         return {
             "channel_id": str(channel_id),
@@ -1016,7 +1054,7 @@ class DiscordToolManager:
             "category_name": getattr(category, "name", None) if category else None,
             "parent_channel_id": str(parent_id) if parent_id is not None else None,
             "parent_channel_name": getattr(parent, "name", None) if parent else None,
-            "can_view": self._can_view_channel(channel),
+            "can_view": self._can_view_channel(channel, actor=actor),
             "can_read_history": can_read_history,
             "can_get_recent_messages": can_read_history and self._supports_history(channel),
             "can_fetch_message": can_read_history and self._supports_fetch_message(channel),

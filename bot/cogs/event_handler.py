@@ -954,11 +954,14 @@ class EventHandler(commands.Cog):
                 logging.info(f"Skipping generated reply for message {message.id}; a newer same-user message chain is pending.")
                 return False
 
+            safe_mentions = discord.AllowedMentions(users=False, roles=False, everyone=False, replied_user=False)
+
             # Handle message chunking (typing stops automatically when exiting the context)
             sent_messages = await MessageChunker.send_chunked_message(
                 target=message.channel,
                 content=content,
-                reply_to=message
+                reply_to=message,
+                allowed_mentions=safe_mentions,
             )
             self._record_generated_reply(message, chain_messages, sent_messages, content)
             logging.info("Reply sent. message_id=%s chars=%s", message.id, len(content or ""))
@@ -979,7 +982,10 @@ class EventHandler(commands.Cog):
             error_text = self.bot.llm_provider.get_last_error_message()
 
         error_text = self._safe_error_text(error_text)
-        await message.reply(f"Sorry, I couldn't generate a reply.\n```text\n{error_text}\n```")
+        await message.reply(
+            f"Sorry, I couldn't generate a reply.\n```text\n{error_text}\n```",
+            allowed_mentions=discord.AllowedMentions(users=False, roles=False, everyone=False, replied_user=False),
+        )
 
     async def _send_gif_decision(self, message: discord.Message, settings: dict, decision: dict):
         gif_key = decision.get("gif_key")
@@ -994,7 +1000,11 @@ class EventHandler(commands.Cog):
             content = f"{caption}\n{content}"
 
         try:
-            await message.reply(content, mention_author=False)
+            await message.reply(
+                content,
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions(users=False, roles=False, everyone=False, replied_user=False),
+            )
             self._mark_bot_involved(message)
         except discord.HTTPException as e:
             logging.warning(f"Failed to send GIF '{gif_key}' for message {message.id}: {e}")
@@ -1448,6 +1458,7 @@ class EventHandler(commands.Cog):
     def _sanitize_reply_content(self, content: str, guild: discord.Guild = None) -> str:
         """Remove model-leaked speaker labels from the start of a Discord reply."""
         content = content.strip()
+        content = content.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
         if not self.bot.user:
             return content
 

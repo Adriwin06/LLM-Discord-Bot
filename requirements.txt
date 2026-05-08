@@ -9,9 +9,8 @@ aiofiles
 pypdf2
 python-docx
 openpyxl
-Pillow
+Pillow>=12.2.0
 faster-whisper
-moviepy
 
 # Advanced Media Processing (Optional)
 pytesseract
