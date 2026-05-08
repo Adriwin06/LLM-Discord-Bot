@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import urllib.request
+from urllib.parse import urlparse
 from .config import Config
 
 class LiteLLMProvider:
@@ -68,7 +69,7 @@ class LiteLLMProvider:
         
         Automatically handles:
         - Rate limiting based on model type
-        - API key selection based on model provider
+        - Provider credential resolution through LiteLLM environment variables
         - Web search capabilities for supported models
         - JSON response format compatibility
         
@@ -86,13 +87,6 @@ class LiteLLMProvider:
         completion_kwargs = kwargs.copy()
         
         try:
-            # Set API keys for providers
-            litellm.api_key = self.config.OPENAI_API_KEY # default
-            if model.startswith("gemini/"):
-                litellm.gemini_api_key = self.config.GEMINI_API_KEY
-            elif model.startswith("claude-"):
-                litellm.anthropic_api_key = self.config.ANTHROPIC_API_KEY
-
             # Check if model supports web search and add web search options
             request_stats = self._message_stats(messages)
             logging.info(
@@ -301,6 +295,10 @@ class LiteLLMProvider:
             api_base = f"http://{api_base}"
         if api_base.endswith("/v1"):
             api_base = api_base[:-3]
+        parsed_api_base = urlparse(api_base)
+        if parsed_api_base.scheme not in {"http", "https"} or not parsed_api_base.netloc:
+            logging.debug("Skipping Ollama capability inspection for invalid API base: %s", api_base)
+            return None
 
         try:
             payload = json.dumps({"model": ollama_model}).encode("utf-8")
@@ -310,7 +308,8 @@ class LiteLLMProvider:
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            with urllib.request.urlopen(request, timeout=2) as response:
+            # api_base is restricted to http/https above before urllib receives it.
+            with urllib.request.urlopen(request, timeout=2) as response:  # nosec B310
                 model_info = json.load(response)
             capabilities = model_info.get("capabilities") or []
             supports = capability.lower() in {str(item).lower() for item in capabilities}

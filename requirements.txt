@@ -4,6 +4,7 @@ python-dotenv
 litellm
 aiohttp
 aiofiles
+defusedxml
 
 # Media Processing
 pypdf2

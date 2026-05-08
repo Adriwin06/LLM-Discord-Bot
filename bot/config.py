@@ -25,11 +25,6 @@ class Config:
         with open(capabilities_prompt_path, "r", encoding="utf-8") as f:
             self.CAPABILITIES_PROMPT = f.read().strip()
 
-        # API Keys
-        self.OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-        self.GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-        self.ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-
         # Rate Limiting
         self.MAIN_LLM_RATE_LIMIT_ENABLED = os.getenv("MAIN_LLM_RATE_LIMIT_ENABLED", "False").lower() == "true"
         self.MAIN_LLM_RATE_LIMIT_SECONDS = float(os.getenv("MAIN_LLM_RATE_LIMIT_SECONDS", 2))

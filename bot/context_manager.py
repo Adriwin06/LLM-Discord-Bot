@@ -861,7 +861,7 @@ class ContextManager:
             return "Attachment URLs with embedded credentials are not allowed."
 
         host = parsed.hostname.strip().lower()
-        if host in {"localhost", "0.0.0.0"} or host.endswith(".local"):
+        if host == "localhost" or host.endswith(".local"):
             return "Local or private attachment hostnames are not allowed."
 
         try:

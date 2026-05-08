@@ -88,7 +88,7 @@ class AdvancedPaginationView(discord.ui.View):
     """
     
     def __init__(self, 
-                 content: Union[List[str], List[Dict[str, Any]]], 
+                 content: Union[str, List[str], List[Dict[str, Any]]],
                  title: str,
                  color: discord.Color = discord.Color.blue(),
                  timeout: float = 300.0,
@@ -112,7 +112,10 @@ class AdvancedPaginationView(discord.ui.View):
         self.current_page = 0
         
         # Process content into pages
-        if isinstance(content, list) and content and isinstance(content[0], str):
+        if isinstance(content, str):
+            self.pages = self._split_string_content(content, max_chars_per_page)
+            self.content_type = "string"
+        elif isinstance(content, list) and content and isinstance(content[0], str):
             # Handle string content - split into pages
             self.pages = self._split_string_content(content[0] if len(content) == 1 else '\n'.join(content), max_chars_per_page)
             self.content_type = "string"

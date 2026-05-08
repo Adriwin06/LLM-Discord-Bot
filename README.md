@@ -75,7 +75,7 @@ Now, open the `.env` file in a text editor and fill in the required values:
 -   `DISCORD_TOKEN`: Your Discord bot's token. You can get this from the [Discord Developer Portal](https://discord.com/developers/applications).
 -   `MAIN_LLM_MODEL` & `DECISION_LLM_MODEL`: The model strings for your chosen LLM provider (e.g., `gpt-4o`, `gemini/gemini-1.5-pro-latest`).
 -   `DECISION_LLM_ENABLED`: Set to `False` to disable ambient reply/reaction decisions; the bot will only answer direct mentions/replies.
--   **API Keys**: Add the API keys for the LLM providers you intend to use (e.g., `OPENAI_API_KEY`, `GEMINI_API_KEY`).
+-   **API Keys**: Add the API keys for the LLM providers you intend to use. LiteLLM reads standard provider env vars directly, such as `OPENAI_API_KEY`, `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, or `MISTRAL_API_KEY`.
 -   `REPLY_CHAIN_DEBOUNCE_SECONDS`: How long the bot waits for same-user message fragments before deciding whether to reply. Defaults to `2.0`.
 -   `REPLY_CHAIN_WAIT_FOR_TYPING`, `REPLY_CHAIN_TYPING_MAX_WAIT_SECONDS`, and `REPLY_CHAIN_LONG_TYPING_SECONDS`: Let the bot wait while the user is still typing, with a max wait and optional long-typing joke/GIF decision.
 -   `GIFS_ENABLED`: Lets the decision model choose from a small curated GIF set when a GIF is funnier or more logical than text.

@@ -3,7 +3,6 @@ import logging
 import re
 import socket
 import asyncio
-import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from html import unescape
 from html.parser import HTMLParser
@@ -13,6 +12,8 @@ from urllib.parse import parse_qs, quote_plus, urlparse
 
 import aiohttp
 import discord
+from defusedxml import ElementTree as ET
+from defusedxml.common import DefusedXmlException
 
 
 class DiscordToolManager:
@@ -1418,7 +1419,7 @@ class DiscordToolManager:
     def _parse_bing_rss_results(self, xml_text: str) -> List[Dict[str, str]]:
         try:
             root = ET.fromstring(xml_text or "")
-        except ET.ParseError:
+        except (ET.ParseError, DefusedXmlException):
             return []
 
         results = []
@@ -1449,7 +1450,7 @@ class DiscordToolManager:
             return "URLs with embedded credentials are not allowed."
 
         host = parsed.hostname.strip().lower()
-        if host in {"localhost", "0.0.0.0"} or host.endswith(".local"):
+        if host == "localhost" or host.endswith(".local"):
             return "Local or private hostnames are not allowed."
 
         try:

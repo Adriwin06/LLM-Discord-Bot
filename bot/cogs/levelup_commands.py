@@ -135,6 +135,9 @@ class LevelUpCommands(commands.Cog):
         self.bot = bot
         self.levels_file = "data/levels.json"
         self.levels_data = {}
+        self._levels_lock = asyncio.Lock()
+        self._pending_levels_save_task: Optional[asyncio.Task] = None
+        self._levels_save_requested = False
         self.xp_per_message = [15, 25]
         self.cooldown_seconds = 60
         self.last_message = {}
@@ -148,15 +151,16 @@ class LevelUpCommands(commands.Cog):
     async def load_levels_data(self):
         """Load the levels.json file with UTF-8 encoding"""
         try:
-            if os.path.exists(self.levels_file):
-                async with aiofiles.open(self.levels_file, 'r', encoding='utf-8') as f:
-                    content = await f.read()
-                    self.levels_data = json.loads(content)
-                    logging.info("Loaded levels data successfully")
-            else:
-                self.levels_data = {"configs": {}}
-                await self.save_levels_data()
-                logging.info("Created new levels data file")
+            async with self._levels_lock:
+                if os.path.exists(self.levels_file):
+                    async with aiofiles.open(self.levels_file, 'r', encoding='utf-8') as f:
+                        content = await f.read()
+                        self.levels_data = json.loads(content)
+                        logging.info("Loaded levels data successfully")
+                else:
+                    self.levels_data = {"configs": {}}
+                    await self._write_levels_data_unlocked(self.levels_data)
+                    logging.info("Created new levels data file")
         except Exception as e:
             logging.error(f"Error loading levels data: {e}")
             self.levels_data = {"configs": {}}
@@ -192,13 +196,54 @@ class LevelUpCommands(commands.Cog):
         return True
     
     async def save_levels_data(self):
-        """Save the levels.json file with UTF-8 encoding"""
+        """Save the levels.json file with UTF-8 encoding using an atomic replace."""
         try:
-            os.makedirs(os.path.dirname(self.levels_file), exist_ok=True)
-            async with aiofiles.open(self.levels_file, 'w', encoding='utf-8') as f:
-                await f.write(json.dumps(self.levels_data, indent=4))
+            async with self._levels_lock:
+                snapshot = json.loads(json.dumps(self.levels_data))
+                await self._write_levels_data_unlocked(snapshot)
         except Exception as e:
             logging.error(f"Error saving levels data: {e}")
+
+    async def _write_levels_data_unlocked(self, data: Dict[str, Any]):
+        directory = os.path.dirname(self.levels_file)
+        os.makedirs(directory, exist_ok=True)
+
+        temp_path = f"{self.levels_file}.tmp"
+        try:
+            async with aiofiles.open(temp_path, 'w', encoding='utf-8') as f:
+                await f.write(json.dumps(data, indent=4))
+            os.replace(temp_path, self.levels_file)
+        except Exception:
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except OSError:
+                logging.warning("Could not remove temporary levels data file: %s", temp_path)
+            raise
+
+    def _schedule_levels_save(self):
+        self._levels_save_requested = True
+        if self._pending_levels_save_task and not self._pending_levels_save_task.done():
+            return
+
+        try:
+            self._pending_levels_save_task = asyncio.get_running_loop().create_task(self._run_scheduled_levels_save())
+            self._pending_levels_save_task.add_done_callback(self._log_scheduled_save_error)
+        except RuntimeError:
+            pass
+
+    async def _run_scheduled_levels_save(self):
+        while self._levels_save_requested:
+            self._levels_save_requested = False
+            await self.save_levels_data()
+
+    def _log_scheduled_save_error(self, task: asyncio.Task):
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logging.error("Scheduled levels data save failed: %s", e)
     
     def get_guild_config(self, guild_id: str) -> Dict[str, Any]:
         """Get or create guild config, ensuring compatibility"""
@@ -212,10 +257,7 @@ class LevelUpCommands(commands.Cog):
                 "message_xp": {"min": 3, "max": 6, "per_char": 0.0},
             }
             # Asynchronously save new config without blocking
-            import asyncio
-            try:
-                asyncio.get_running_loop().create_task(self.save_levels_data())
-            except RuntimeError: pass
+            self._schedule_levels_save()
         return self.levels_data["configs"][guild_id]
 
     def get_user_data(self, guild_id: str, user_id: str) -> Dict[str, Any]:
@@ -226,10 +268,7 @@ class LevelUpCommands(commands.Cog):
                 "xp": 0.0, "voice": 0.0, "messages": 0, "level": 0,
                 "last_active": datetime.now(timezone.utc).isoformat()
             }
-            import asyncio
-            try:
-                asyncio.get_running_loop().create_task(self.save_levels_data())
-            except RuntimeError: pass
+            self._schedule_levels_save()
         return config["users"][user_id]
 
     def _get_role_by_id(self, guild: discord.Guild, role_id) -> Optional[discord.Role]:
