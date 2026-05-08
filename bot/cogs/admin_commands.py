@@ -3,6 +3,8 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import logging
+import os
+import sys
 from typing import Literal, Optional
 from .utilities import AdvancedPaginationView, MessageChunker
 
@@ -1185,54 +1187,30 @@ class AdminCommands(commands.Cog):
             import asyncio
             await asyncio.sleep(1)
             
-            # Restart the bot
-            import sys
-            import os
-            import subprocess
-            
-            # Try to detect the virtual environment and restart appropriately
-            python_executable = sys.executable
+            # Re-exec the current process instead of spawning an untracked child process.
+            python_executable = os.path.abspath(sys.executable)
             script_path = os.path.abspath(sys.argv[0])
-            
-            # If we're in a virtual environment, use the venv's python
-            if hasattr(sys, 'real_prefix') or (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix):
-                # We're in a virtual environment
-                logging.info(f"Restarting in virtual environment using: {python_executable}")
-                
-                # Start new process
-                if os.name == 'nt':  # Windows
-                    # Use CREATE_NEW_PROCESS_GROUP to detach from current process
-                    subprocess.Popen([python_executable, script_path], 
-                                   creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
-                                   cwd=os.path.dirname(script_path))
-                else:  # Unix-like (Linux, macOS)
-                    subprocess.Popen([python_executable, script_path],
-                                   cwd=os.path.dirname(script_path),
-                                   preexec_fn=os.setsid)
-            else:
-                # Not in a virtual environment, just restart with current python
-                logging.info(f"Restarting with system Python: {python_executable}")
-                
-                if os.name == 'nt':  # Windows
-                    subprocess.Popen([python_executable, script_path],
-                                   creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
-                                   cwd=os.path.dirname(script_path))
-                else:  # Unix-like
-                    subprocess.Popen([python_executable, script_path],
-                                   cwd=os.path.dirname(script_path),
-                                   preexec_fn=os.setsid)
+            if not os.path.isfile(python_executable):
+                raise RuntimeError(f"Python executable not found: {python_executable}")
+            if not os.path.isfile(script_path):
+                raise RuntimeError(f"Bot entrypoint not found: {script_path}")
+
+            restart_args = [python_executable, script_path, *sys.argv[1:]]
+            logging.info("Restarting bot using executable=%s entrypoint=%s", python_executable, script_path)
             
             # Close the current bot instance
             logging.info("Shutting down current bot instance...")
             await self.bot.close()
+            # Restart args are built from the validated current executable and entrypoint.
+            os.execv(python_executable, restart_args)  # nosec B606
             
         except Exception as e:
             logging.error(f"Error during restart: {e}")
             try:
                 await interaction.edit_original_response(content=f"❌ **Failed to restart bot:** {str(e)}")
-            except Exception:
+            except discord.HTTPException as edit_error:
                 # If we can't edit the response, the bot might already be shutting down
-                pass
+                logging.debug("Could not edit restart failure response: %s", edit_error)
 
 async def setup(bot):
     await bot.add_cog(AdminCommands(bot))

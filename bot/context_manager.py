@@ -14,7 +14,8 @@ import os
 import re
 import shutil
 import socket
-import subprocess
+# subprocess is restricted to validated ffmpeg/ffprobe invocations.
+import subprocess  # nosec B404
 import tempfile
 import aiohttp
 import PyPDF2
@@ -995,6 +996,7 @@ class ContextManager:
         return None
 
     def _run_media_subprocess(self, command: list, timeout_seconds: float):
+        command = self._validate_media_subprocess_command(command)
         logging.debug("Running media subprocess. command=%s timeout=%.1fs", command, timeout_seconds)
         startupinfo = None
         creationflags = 0
@@ -1003,7 +1005,8 @@ class ContextManager:
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
-        return subprocess.run(
+        # Command executable is validated against ffmpeg/ffprobe and shell=False is used.
+        return subprocess.run(  # nosec B603
             command,
             capture_output=True,
             text=True,
@@ -1014,6 +1017,7 @@ class ContextManager:
         )
 
     def _run_media_subprocess_bytes(self, command: list, timeout_seconds: float):
+        command = self._validate_media_subprocess_command(command)
         logging.debug("Running media bytes subprocess. command=%s timeout=%.1fs", command, timeout_seconds)
         startupinfo = None
         creationflags = 0
@@ -1022,7 +1026,8 @@ class ContextManager:
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
-        return subprocess.run(
+        # Command executable is validated against ffmpeg/ffprobe and shell=False is used.
+        return subprocess.run(  # nosec B603
             command,
             capture_output=True,
             timeout=timeout_seconds,
@@ -1030,6 +1035,31 @@ class ContextManager:
             startupinfo=startupinfo,
             creationflags=creationflags,
         )
+
+    def _validate_media_subprocess_command(self, command: list) -> list:
+        if not isinstance(command, list) or not command:
+            raise ValueError("Media subprocess command must be a non-empty list.")
+        if not all(isinstance(part, str) for part in command):
+            raise ValueError("Media subprocess command parts must be strings.")
+
+        executable = self._normalize_executable_path(command[0])
+        allowed_executables = {
+            normalized
+            for normalized in (
+                self._normalize_executable_path(self._ffmpeg_executable()),
+                self._normalize_executable_path(self._ffprobe_executable()),
+            )
+            if normalized
+        }
+        if executable not in allowed_executables:
+            raise ValueError(f"Media subprocess executable is not allowed: {command[0]}")
+
+        return [os.path.abspath(command[0]), *command[1:]]
+
+    def _normalize_executable_path(self, path: str | None) -> str | None:
+        if not path:
+            return None
+        return os.path.normcase(os.path.abspath(path))
 
     def _ffprobe_executable(self):
         ffprobe = shutil.which("ffprobe")

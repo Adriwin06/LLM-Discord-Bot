@@ -6,6 +6,7 @@ import json
 import math
 import logging
 import re
+import secrets
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Tuple, Callable
 import aiofiles
@@ -805,12 +806,9 @@ class LevelUpCommands(commands.Cog):
                     prestigedata[prestige_str]["emoji_url"] = f"https://cdn.discordapp.com/emojis/{emoji_id}.png"
                 else:
                     # Unicode emoji - use Twemoji CDN
-                    try:
-                        # Convert emoji to hex codepoint
-                        emoji_hex = hex(ord(emoji))[2:]
+                    emoji_hex = "-".join(f"{ord(char):x}" for char in emoji)
+                    if emoji_hex:
                         prestigedata[prestige_str]["emoji_url"] = f"https://cdnjs.cloudflare.com/ajax/libs/twemoji/14.0.2/72x72/{emoji_hex}.png"
-                    except Exception:
-                        pass  # Keep without URL if conversion fails
             
             await self.save_levels_data()
             
@@ -975,13 +973,15 @@ class LevelUpCommands(commands.Cog):
             return
         self.last_message[last_key] = now
         
-        import random
-        
         # Get message XP settings, including the new 'per_char' field
         msgxp = config.get("message_xp", {"min": 15, "max": 25, "per_char": 0.0})
         
         # 1. Calculate the base random XP
-        base_xp = random.randint(msgxp.get("min", 15), msgxp.get("max", 25))
+        min_xp = int(msgxp.get("min", 15))
+        max_xp = int(msgxp.get("max", 25))
+        if max_xp < min_xp:
+            min_xp, max_xp = max_xp, min_xp
+        base_xp = min_xp + secrets.randbelow(max_xp - min_xp + 1)
         
         # 2. Calculate the bonus XP based on message length
         xp_per_char = msgxp.get("per_char", 0.0)

@@ -226,10 +226,7 @@ async def run_bot():
                 logging.error(f"Error during bot shutdown: {e}")
         
         # Wait a moment for any remaining cleanup
-        try:
-            await asyncio.sleep(0.5)
-        except Exception:
-            pass
+        await asyncio.sleep(0.5)
             
         logging.info("Bot shutdown complete.")
 
