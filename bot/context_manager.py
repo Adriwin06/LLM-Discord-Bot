@@ -365,13 +365,14 @@ class ContextManager:
             if user_profile_content:
                 messages.append({"role": "system", "content": "\n".join(user_profile_content)})
 
+        reply_chain = []
+
         # 5. Conversation History (Reply Chain + Recent Messages)
         if include_conversation_history:
             history_limit = settings.get("context", {}).get("history_messages", 15)
             reply_chain_limit = settings.get("context", {}).get("reply_chain_limit", 5)
 
             # Fetch reply chain
-            reply_chain = []
             if include_reply_chain:
                 current_message = message
                 for _ in range(reply_chain_limit):
@@ -416,6 +417,16 @@ class ContextManager:
                 context_lines.extend(self._format_message_context_line(msg) for msg in sorted_messages)
                 messages.append({"role": "system", "content": "\n".join(context_lines)})
 
+        if (
+            include_conversation_history
+            and include_reply_chain
+            and include_current_message
+            and not prompt
+            and self._should_include_reply_chain_media_context(message, reply_chain)
+        ):
+            media_context_messages = await self._reply_chain_media_context_messages(reply_chain, target_model)
+            messages.extend(media_context_messages)
+
         # 6. Current Message or Custom Prompt
         if include_current_message or prompt:
             messages.append({
@@ -443,8 +454,8 @@ class ContextManager:
                         "role": "system",
                         "content": (
                             "The next/current Discord message includes successfully attached visual input. "
-                            "Use the image when answering image-related questions. "
-                            "Do not claim the image is missing; if visual details are unreadable, say exactly that."
+                            "Use the image or extracted video frames when answering visual questions. "
+                            "Do not claim the visual input is missing; if visual details are unreadable, say exactly that."
                         ),
                     })
                 messages.append({"role": "user", "content": current_message_content})
@@ -669,6 +680,82 @@ class ContextManager:
             getattr(requester_permissions, "view_channel", False)
             and getattr(requester_permissions, "read_message_history", False)
         )
+
+    def _should_include_reply_chain_media_context(self, message: discord.Message, reply_chain: list) -> bool:
+        if not reply_chain:
+            return False
+
+        if getattr(message, "attachments", None) or getattr(message, "embeds", None):
+            return False
+
+        if not any(self._message_has_media(item) for item in reply_chain):
+            return False
+
+        content = (getattr(message, "content", "") or "").lower()
+        media_terms = {
+            "attachment",
+            "attached",
+            "file",
+            "image",
+            "picture",
+            "photo",
+            "screenshot",
+            "video",
+            "clip",
+            "frame",
+            "frames",
+            "media",
+            "visual",
+            "pdf",
+            "document",
+        }
+        return any(term in content for term in media_terms)
+
+    def _message_has_media(self, message: discord.Message) -> bool:
+        return bool(getattr(message, "attachments", None) or getattr(message, "embeds", None))
+
+    async def _reply_chain_media_context_messages(self, reply_chain: list, target_model: str) -> list:
+        media_messages = [item for item in (reply_chain or []) if self._message_has_media(item)]
+        media_messages = media_messages[-2:]
+        if not media_messages:
+            return []
+
+        context_messages = [{
+            "role": "system",
+            "content": (
+                "The current user is referring to visual/media content from the reply chain. "
+                "The following media-bearing Discord message(s) are background context, not new requests. "
+                "Use their attached images or extracted video frames when answering the current message."
+            ),
+        }]
+
+        for media_message in media_messages:
+            try:
+                processed_content = await self._format_message_content(
+                    media_message,
+                    target_model,
+                    current_message=False,
+                )
+            except Exception as e:
+                logging.exception("Could not process reply-chain media context. message_id=%s", getattr(media_message, "id", None))
+                context_messages.append({
+                    "role": "system",
+                    "content": (
+                        f"[Could not process referenced media from message {getattr(media_message, 'id', 'unknown')}: "
+                        f"{str(e)[:80]}]"
+                    ),
+                })
+                continue
+
+            context_messages.append({"role": "user", "content": processed_content})
+
+        stats = self._content_stats_for_logging(context_messages)
+        logging.info(
+            "Included reply-chain media context. source_messages=%s stats=%s",
+            [getattr(item, "id", None) for item in media_messages],
+            stats,
+        )
+        return context_messages
 
     def _safe_int(self, value, *, default: int, minimum: int, maximum: int) -> int:
         try:
@@ -1880,7 +1967,8 @@ class ContextManager:
                     frame_summary = (
                         f"--- Video Frame Samples: {attachment.filename} ---\n"
                         f"Duration: {self._format_seconds(duration if duration is not None else frame_result.get('duration'))}\n"
-                        f"Extracted {len(frames)} representative frame(s)"
+                        f"Extracted {len(frames)} representative frame(s). "
+                        "Each following image is an actual frame extracted from the video."
                     )
                     if timestamps:
                         frame_summary += f" at: {timestamps}"
@@ -1888,6 +1976,10 @@ class ContextManager:
                     if frames and self.llm_provider.supports_vision(model_name):
                         content_parts.append({"type": "text", "text": frame_summary})
                         for frame in frames:
+                            content_parts.append({
+                                "type": "text",
+                                "text": f"Video frame at {self._format_seconds(frame['timestamp'])} from {attachment.filename}:",
+                            })
                             content_parts.append({"type": "image_url", "image_url": {"url": frame["data_url"]}})
                         logging.info(
                             "Video frames attached to vision model request. filename=%s frames=%s model=%s",
