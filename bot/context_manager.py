@@ -21,7 +21,7 @@ import aiohttp
 import PyPDF2
 import docx
 import openpyxl
-from PIL import Image
+from PIL import Image, ImageOps
 import io
 from ipaddress import ip_address
 from datetime import datetime, timezone
@@ -42,7 +42,12 @@ OPENAI_WHISPER_AVAILABLE = importlib.util.find_spec("whisper") is not None
 # Optional imports for advanced document processing
 try:
     import pytesseract
-    TESSERACT_AVAILABLE = True
+    try:
+        pytesseract.get_tesseract_version()
+        TESSERACT_AVAILABLE = True
+    except Exception as e:
+        TESSERACT_AVAILABLE = False
+        logging.warning("pytesseract is installed, but the Tesseract executable is unavailable. OCR features disabled: %s", e)
 except ImportError:
     TESSERACT_AVAILABLE = False
     logging.warning("pytesseract not available. OCR features will be limited.")
@@ -144,6 +149,8 @@ class ContextManager:
                 "enabled": self.config.DEFAULT_MEDIA_IMAGES_ENABLED,
                 "max_size_mb": 10,
                 "ocr_enabled": True,
+                "include_ocr_for_vision_models": True,
+                "max_ocr_chars": 4000,
                 "description_fallback": True,
                 "gif": {
                     "extract_frames": True,
@@ -430,6 +437,16 @@ class ContextManager:
                     target_model,
                     current_message=True
                 )
+                current_message_stats = self._content_stats_for_logging([{"role": "user", "content": current_message_content}])
+                if current_message_stats["image_parts"] > 0:
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "The next/current Discord message includes successfully attached visual input. "
+                            "Use the image when answering image-related questions. "
+                            "Do not claim the image is missing; if visual details are unreadable, say exactly that."
+                        ),
+                    })
                 messages.append({"role": "user", "content": current_message_content})
 
         logging.info(
@@ -897,14 +914,144 @@ class ContextManager:
     def _is_video_file(self, mime_type: str, file_ext: str) -> bool:
         return bool((mime_type and mime_type.startswith("video/")) or file_ext in VIDEO_EXTENSIONS)
 
-    def _image_content_part(self, url: str, file_bytes: bytes = None, mime_type: str = None, model_name: str = None) -> dict:
+    def _image_content_part(self, url: str, file_bytes: bytes = None, mime_type: str = None, model_name: str = None, filename: str = None):
         image_url = url
-        if file_bytes and self.llm_provider.prefers_inline_image_data(model_name):
-            image_mime = mime_type if mime_type and mime_type.startswith("image/") else "image/jpeg"
-            encoded_image = base64.b64encode(file_bytes).decode()
-            image_url = f"data:{image_mime};base64,{encoded_image}"
+        if self.llm_provider.prefers_inline_image_data(model_name):
+            if file_bytes is None:
+                return f"[Image omitted because validated image bytes were unavailable: {filename or url or 'unknown image'}]"
+            inline_image = self._normalized_inline_image_data_url(
+                file_bytes=file_bytes,
+                mime_type=mime_type,
+                filename=filename,
+            )
+            if not inline_image:
+                return f"[Image omitted because the downloaded image data was invalid: {filename or url or 'unknown image'}]"
+            image_url = inline_image
 
         return {"type": "image_url", "image_url": {"url": image_url}}
+
+    def _normalized_inline_image_data_url(self, *, file_bytes: bytes, mime_type: str = None, filename: str = None) -> str | None:
+        """Validate and re-encode inline images before handing them to strict local providers."""
+        try:
+            normalized_bytes, normalized_mime = self._normalize_image_bytes_for_inline(file_bytes, mime_type)
+        except Exception as e:
+            logging.warning(
+                "Invalid image data omitted before LLM request. filename=%s mime_type=%s bytes=%s error_type=%s error=%s",
+                filename,
+                mime_type,
+                len(file_bytes or b""),
+                type(e).__name__,
+                e,
+            )
+            return None
+
+        encoded_image = base64.b64encode(normalized_bytes).decode("ascii")
+        return f"data:{normalized_mime};base64,{encoded_image}"
+
+    def _normalize_image_bytes_for_inline(self, file_bytes: bytes, mime_type: str = None) -> tuple[bytes, str]:
+        if not file_bytes:
+            raise ValueError("empty image payload")
+
+        with Image.open(io.BytesIO(file_bytes)) as image:
+            source_format = (image.format or "").upper()
+            image.seek(0)
+            image.load()
+            image = ImageOps.exif_transpose(image)
+            if image.width <= 0 or image.height <= 0:
+                raise ValueError(f"invalid image dimensions {image.width}x{image.height}")
+
+            compatible_image = self._image_to_compatible_rgb(image)
+            output_mime = self._inline_image_output_mime(mime_type, source_format)
+            buffer = io.BytesIO()
+            if output_mime == "image/png":
+                compatible_image.save(buffer, format="PNG")
+            else:
+                compatible_image.save(buffer, format="JPEG", quality=92, optimize=True)
+            return buffer.getvalue(), output_mime
+
+    def _image_to_compatible_rgb(self, image: Image.Image) -> Image.Image:
+        if image.mode in {"RGBA", "LA"} or (image.mode == "P" and "transparency" in image.info):
+            rgba_image = image.convert("RGBA")
+            background = Image.new("RGBA", rgba_image.size, (255, 255, 255, 255))
+            background.alpha_composite(rgba_image)
+            return background.convert("RGB")
+
+        if image.mode != "RGB":
+            return image.convert("RGB")
+
+        return image.copy()
+
+    def _inline_image_output_mime(self, mime_type: str = None, source_format: str = None) -> str:
+        source_mime = (mime_type or "").split(";", 1)[0].strip().lower()
+        source_format = (source_format or "").upper()
+        if source_mime in {"image/png", "image/gif"} or source_format in {"PNG", "GIF"}:
+            return "image/png"
+        return "image/jpeg"
+
+    def _vision_image_content_parts(
+        self,
+        *,
+        url: str,
+        file_bytes: bytes,
+        mime_type: str,
+        model_name: str,
+        filename: str,
+        images_config: dict,
+    ):
+        image_part = self._image_content_part(url, file_bytes, mime_type, model_name, filename)
+        if not isinstance(image_part, dict):
+            return image_part
+
+        parts = [
+            {
+                "type": "text",
+                "text": (
+                    f"Attached image: {filename or 'image'}. "
+                    "Use this visual attachment when answering image-related questions."
+                ),
+            }
+        ]
+
+        ocr_text = self._ocr_image_text_for_context(file_bytes, filename, images_config)
+        if ocr_text:
+            parts.append({
+                "type": "text",
+                "text": f"--- OCR text extracted from attached image: {filename or 'image'} ---\n{ocr_text}",
+            })
+
+        parts.append(image_part)
+        return parts
+
+    def _ocr_image_text_for_context(self, file_bytes: bytes, filename: str, images_config: dict) -> str:
+        if not (
+            images_config.get("ocr_enabled", True)
+            and images_config.get("include_ocr_for_vision_models", True)
+            and TESSERACT_AVAILABLE
+            and file_bytes
+        ):
+            return ""
+
+        try:
+            with Image.open(io.BytesIO(file_bytes)) as img:
+                img = ImageOps.exif_transpose(img)
+                ocr_text = pytesseract.image_to_string(img).strip()
+        except Exception as e:
+            logging.info(
+                "Image OCR context extraction skipped. filename=%s error_type=%s error=%s",
+                filename,
+                type(e).__name__,
+                e,
+            )
+            return ""
+
+        if not ocr_text:
+            logging.debug("Image OCR context extraction found no text. filename=%s", filename)
+            return ""
+
+        max_chars = self._safe_int(images_config.get("max_ocr_chars"), default=4000, minimum=500, maximum=12000)
+        ocr_text = self._truncate_context_text(ocr_text, max_chars)
+        logging.info("Image OCR context extracted. filename=%s chars=%s", filename, len(ocr_text))
+        return ocr_text
 
     async def _write_temp_file(self, file_bytes: bytes, file_ext: str) -> str:
         suffix = f".{file_ext.lstrip('.')}" if file_ext else ""
@@ -993,6 +1140,25 @@ class ContextManager:
             max_size_mb = self._safe_float(media_settings.get("other_files", {}).get("max_size_mb"), default=20.0, minimum=0.1, maximum=100.0)
 
         return max(1, int(max_size_mb * 1024 * 1024))
+
+    async def _read_bounded_response_body(self, resp, max_bytes: int) -> tuple[bytes, bool]:
+        chunks = []
+        total_bytes = 0
+        read_limit = max(1, int(max_bytes)) + 1
+
+        async for chunk in resp.content.iter_chunked(64 * 1024):
+            if not chunk:
+                continue
+
+            remaining = read_limit - total_bytes
+            if remaining > 0:
+                chunks.append(chunk[:remaining])
+            total_bytes += len(chunk)
+
+            if total_bytes > max_bytes:
+                return b"".join(chunks), True
+
+        return b"".join(chunks), False
 
     async def _get_media_duration(self, file_path: str, media_kind: str, media_config: dict = None):
         timeout_seconds = self._safe_float(
@@ -1860,6 +2026,7 @@ class ContextManager:
                     actual_content_type = resp.headers.get('content-type', '').lower()
                     actual_mime_type = actual_content_type.split(';', 1)[0].strip()
                     content_length = resp.headers.get('content-length')
+                    response_size = None
                     if content_length:
                         try:
                             response_size = int(content_length)
@@ -1881,8 +2048,8 @@ class ContextManager:
                         content_length,
                     )
                     
-                    file_bytes = await resp.content.read(max_download_bytes + 1)
-                    if len(file_bytes) > max_download_bytes:
+                    file_bytes, exceeded_download_limit = await self._read_bounded_response_body(resp, max_download_bytes)
+                    if exceeded_download_limit:
                         logging.warning(
                             "Attachment response exceeded bounded read. filename=%s downloaded_bytes=%s max_download_mb=%.2f",
                             attachment.filename,
@@ -1890,6 +2057,14 @@ class ContextManager:
                             max_download_mb,
                         )
                         return f"[Attachment too large for processing: {attachment.filename} - larger than {max_download_mb:.1f}MB]"
+                    if response_size is not None and not resp.headers.get("content-encoding") and len(file_bytes) < response_size:
+                        logging.warning(
+                            "Attachment download ended before content-length. filename=%s expected_bytes=%s downloaded_bytes=%s",
+                            attachment.filename,
+                            response_size,
+                            len(file_bytes),
+                        )
+                        return f"[Could not fetch attachment: {attachment.filename} (incomplete download)]"
                     logging.info(
                         "Attachment downloaded. filename=%s status=%s actual_content_type=%s content_length_header=%s downloaded_bytes=%s",
                         attachment.filename,
@@ -1955,7 +2130,7 @@ class ContextManager:
                                 # Validate that we have image data before trying to process it
                                 if len(file_bytes) == 0:
                                     logging.warning(f"No data received for {attachment.filename}")
-                                    return self._image_content_part(attachment.url, model_name=model_name)
+                                    return self._image_content_part(attachment.url, model_name=model_name, filename=attachment.filename)
                                 
                                 gif = Image.open(io.BytesIO(file_bytes))
                                 
@@ -2054,11 +2229,25 @@ class ContextManager:
                                     else:
                                         # Fallback to treating as static image
                                         logging.warning("Animated GIF extraction produced no frames; falling back to image. filename=%s", attachment.filename)
-                                        return self._image_content_part(attachment.url, file_bytes, mime_type, model_name)
+                                        return self._vision_image_content_parts(
+                                            url=attachment.url,
+                                            file_bytes=file_bytes,
+                                            mime_type=mime_type,
+                                            model_name=model_name,
+                                            filename=attachment.filename,
+                                            images_config=images_config,
+                                        )
                                 else:
                                     # Static GIF, treat as regular image
                                     logging.info("GIF is not animated; sending as static image. filename=%s", attachment.filename)
-                                    return self._image_content_part(attachment.url, file_bytes, mime_type, model_name)
+                                    return self._vision_image_content_parts(
+                                        url=attachment.url,
+                                        file_bytes=file_bytes,
+                                        mime_type=mime_type,
+                                        model_name=model_name,
+                                        filename=attachment.filename,
+                                        images_config=images_config,
+                                    )
                             except Exception as e:
                                 logging.warning(
                                     "Failed to process potential GIF. filename=%s error_type=%s error=%s",
@@ -2070,15 +2259,29 @@ class ContextManager:
                                 if "cannot identify image file" in str(e).lower() or "truncated" in str(e).lower():
                                     logging.info(f"Image format issue with {attachment.filename}, might not be a valid image file")
                                 # Fallback to treating as static image
-                                return self._image_content_part(attachment.url, model_name=model_name)
+                                return self._image_content_part(attachment.url, model_name=model_name, filename=attachment.filename)
                         else:
                             # GIF frame extraction disabled, treat as static image
                             logging.info("GIF frame extraction disabled; sending as static image. filename=%s", attachment.filename)
-                            return self._image_content_part(attachment.url, file_bytes, mime_type, model_name)
+                            return self._vision_image_content_parts(
+                                url=attachment.url,
+                                file_bytes=file_bytes,
+                                mime_type=mime_type,
+                                model_name=model_name,
+                                filename=attachment.filename,
+                                images_config=images_config,
+                            )
                     else:
                         # Regular static image
                         logging.info("Static image will be attached to vision model. filename=%s model=%s", attachment.filename, model_name)
-                        return self._image_content_part(attachment.url, file_bytes, mime_type, model_name)
+                        return self._vision_image_content_parts(
+                            url=attachment.url,
+                            file_bytes=file_bytes,
+                            mime_type=mime_type,
+                            model_name=model_name,
+                            filename=attachment.filename,
+                            images_config=images_config,
+                        )
                 else:
                     # Fallback: OCR for text-only models
                     logging.info("Image target model has no vision; attempting OCR fallback. filename=%s model=%s", attachment.filename, model_name)

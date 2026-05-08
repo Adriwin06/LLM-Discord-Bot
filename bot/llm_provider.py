@@ -137,6 +137,27 @@ class LiteLLMProvider:
             self._log_response_summary(model, response)
             return response
         except Exception as e:
+            if self._should_retry_without_image_parts(e, messages):
+                self._record_error(model, e)
+                logging.warning(
+                    "LiteLLM image completion error for model %s: %s. Retrying without image parts.",
+                    model,
+                    e,
+                )
+                try:
+                    response = await acompletion(
+                        model=model,
+                        messages=self._messages_without_image_parts(messages),
+                        **completion_kwargs
+                    )
+                    self.last_error = None
+                    self._log_response_summary(model, response)
+                    return response
+                except Exception as retry_error:
+                    self._record_error(model, retry_error)
+                    logging.exception(f"LiteLLM retry without image parts failed for model {model}: {retry_error}")
+                    return None
+
             if 'tools' in completion_kwargs and 'web_search_options' in completion_kwargs:
                 self._record_error(model, e)
                 logging.warning(
@@ -150,6 +171,7 @@ class LiteLLMProvider:
                         messages=messages,
                         **completion_kwargs
                     )
+                    self.last_error = None
                     self._log_response_summary(model, response)
                     return response
                 except Exception as retry_error:
@@ -207,6 +229,68 @@ class LiteLLMProvider:
 
         if content is not None:
             stats["other_parts"] += 1
+
+    def _should_retry_without_image_parts(self, error: Exception, messages: list) -> bool:
+        stats = self._message_stats(messages)
+        if stats["image_parts"] <= 0:
+            return False
+
+        error_text = str(error).lower()
+        image_markers = (
+            "image",
+            "png",
+            "jpeg",
+            "jpg",
+            "webp",
+            "gif",
+            "pixel data",
+        )
+        decode_markers = (
+            "failed to process inputs",
+            "invalid format",
+            "not enough pixel data",
+            "unsupported image",
+            "cannot identify image",
+            "invalid image",
+        )
+        return any(marker in error_text for marker in image_markers) and any(marker in error_text for marker in decode_markers)
+
+    def _messages_without_image_parts(self, messages: list) -> list:
+        stripped_messages = []
+        for message in messages or []:
+            if not isinstance(message, dict):
+                stripped_messages.append(message)
+                continue
+
+            stripped_message = dict(message)
+            stripped_message["content"] = self._content_without_image_parts(message.get("content"))
+            stripped_messages.append(stripped_message)
+        return stripped_messages
+
+    def _content_without_image_parts(self, content):
+        if isinstance(content, list):
+            stripped_items = []
+            for item in content:
+                stripped = self._content_without_image_parts(item)
+                if stripped is None:
+                    continue
+                stripped_items.append(stripped)
+            return stripped_items
+
+        if isinstance(content, dict):
+            content_type = content.get("type")
+            if content_type in {"image_url", "input_image"}:
+                return {
+                    "type": "text",
+                    "text": "[Image omitted because the model provider rejected the image data.]",
+                }
+
+            return {
+                key: self._content_without_image_parts(value)
+                for key, value in content.items()
+            }
+
+        return content
 
     def _log_response_summary(self, model: str, response):
         if not response or not getattr(response, "choices", None):
