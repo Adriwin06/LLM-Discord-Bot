@@ -42,8 +42,19 @@ class FunCommands(commands.Cog):
             "YOU LOOK AMAZING!!! And you BETTER come right back after this commercial break!!!"
         ]
 
+        self.bot_avatar_mock_responses = [
+            "You want me to roast my own avatar? That is not an avatar, that is brand infrastructure.",
+            "Mock my profile picture? Bold request from someone using Discord's cropping tool as a personality test.",
+            "My avatar is doing exactly what it needs to do: looking official while silently judging slash command choices.",
+            "I could roast my own profile picture, but quality control says the pixels are already carrying this server."
+        ]
+
     async def cog_unload(self):
         await self.session.close()
+
+    def _is_bot_target(self, user: discord.Member) -> bool:
+        bot_user = getattr(self.bot, "user", None)
+        return bool(bot_user and getattr(user, "id", None) == bot_user.id)
 
     async def _generate_fun_response(self, interaction: discord.Interaction, user: discord.Member, command_type: str):
         if await self.bot.context_manager.is_channel_llm_blacklisted(interaction.guild.id, interaction.channel.id):
@@ -53,7 +64,7 @@ class FunCommands(commands.Cog):
         await interaction.response.defer()
         
         # Check if the target user is the bot itself
-        if user.id == self.bot.user.id:
+        if self._is_bot_target(user):
             target_mention = user.mention
             if command_type == "insult":
                 examples = "\n".join([f"- {response}" for response in self.bot_insult_responses])
@@ -179,6 +190,48 @@ Generate a similar response that's playful and uplifting, but don't copy these e
         content = re.sub(r"[ \t]{2,}", " ", content)
         return f"{user.mention} {content}".strip()
 
+    async def _send_bot_avatar_mock(self, interaction: discord.Interaction, user: discord.Member):
+        examples = "\n".join([f"- {response}" for response in self.bot_avatar_mock_responses])
+        prompt = f"""Someone is trying to make me (the bot) mock my own Discord profile picture. Generate a funny, self-aware response that comments on the attempt and treats my avatar like premium bot branding. Be playful, confident, and a little sassy, but not genuinely mean.
+
+Target bot mention to include exactly once: {user.mention}
+
+Rules:
+- Do not claim to inspect visual details in the avatar.
+- Do not write fake mentions, @names, <@name> placeholders, or @unknown-user.
+- Keep it punchy (2-4 sentences).
+
+Here are some example responses for inspiration:
+{examples}
+
+Generate a similar response that's creative and self-aware, but don't copy these exactly."""
+
+        messages = [
+            {"role": "system", "content": "You are a witty Discord bot with personality. You're self-aware that you're an AI but you have humor and charm about it."},
+            {"role": "user", "content": prompt}
+        ]
+
+        response = await self.bot.llm_provider.create_completion(
+            model=self.bot.config.MAIN_LLM_MODEL,
+            messages=messages
+        )
+
+        if response and response.choices:
+            header = f"{interaction.user.display_name} tried to mock {user.display_name}'s Profile Picture"
+            content = self._ensure_target_ping(response.choices[0].message.content, user)
+            allowed_mentions = discord.AllowedMentions(users=[user], roles=False, everyone=False, replied_user=False)
+            await MessageChunker.send_chunked_message(
+                target=interaction,
+                content=f"{header}\n\n{content}",
+                ephemeral=False,
+                allowed_mentions=allowed_mentions
+            )
+        else:
+            await interaction.followup.send(
+                "I tried to mock my own avatar, but the branding department confiscated the roast.",
+                ephemeral=True
+            )
+
     @fun_group.command(name="insult", description="Generate a personalized insult for a user.")
     async def insult(self, interaction: discord.Interaction, user: discord.Member):
         await self._generate_fun_response(interaction, user, "insult")
@@ -194,6 +247,19 @@ Generate a similar response that's playful and uplifting, but don't copy these e
     @mock_group.command(name="message", description="Mock a user's last message in sPoNgEbOb TeXt format.")
     async def mock(self, interaction: discord.Interaction, user: discord.Member):
         await interaction.response.defer()
+
+        if self._is_bot_target(user):
+            mock_text = (
+                "sUrE, lEt Me MoCk MySeLf On CoMmAnD. "
+                "tHaT's DeFiNiTeLy NoT jUsT yOu HaNdInG mE tHe MiCrOpHoNe."
+            )
+
+            embed = discord.Embed(description=mock_text, color=discord.Color.gold())
+            embed.set_author(name=f"{interaction.user.display_name} tried to mock the bot:")
+            embed.set_thumbnail(url="https://en.meming.world/images/en/thumb/e/e0/Mocking_SpongeBob.jpg/300px-Mocking_SpongeBob.jpg")
+
+            await interaction.followup.send(embed=embed)
+            return
         
         last_message = None
         async for msg in interaction.channel.history(limit=100):
@@ -220,6 +286,10 @@ Generate a similar response that's playful and uplifting, but don't copy these e
             return
 
         await interaction.response.defer()
+
+        if self._is_bot_target(user):
+            await self._send_bot_avatar_mock(interaction, user)
+            return
         
         # Get the user's avatar URL. Animated Discord avatars need to be requested
         # as GIFs explicitly; the default URL can point at a static rendition.
