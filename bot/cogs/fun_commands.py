@@ -134,8 +134,45 @@ Generate a similar response that's playful and uplifting, but don't copy these e
         if not content:
             return user.mention
 
+        names = {
+            str(getattr(user, "id", "")),
+            getattr(user, "name", ""),
+            getattr(user, "display_name", ""),
+            getattr(user, "global_name", ""),
+        }
+        names = {str(name).strip() for name in names if str(name or "").strip()}
+        mention_names = sorted((re.escape(name) for name in names), key=len, reverse=True)
+        name_pattern = "|".join(mention_names)
+        bogus_name_pattern = r"unknown[-_ ]?user"
+
         mention_pattern = re.compile(rf"`?\\?<@!?{re.escape(str(user.id))}>`?")
         content = mention_pattern.sub("", content).strip()
+        if name_pattern:
+            tagged_mention_pattern = re.compile(
+                rf"`?\\?<mention\s+user=(['\"])(?:{name_pattern}|{bogus_name_pattern})\1\s*/?>`?",
+                flags=re.IGNORECASE,
+            )
+            content = tagged_mention_pattern.sub("", content).strip()
+
+            pseudo_mention_pattern = re.compile(
+                rf"`?\\?<@!?(?:{name_pattern}|{bogus_name_pattern})>`?",
+                flags=re.IGNORECASE,
+            )
+            content = pseudo_mention_pattern.sub("", content).strip()
+
+            literal_mention_pattern = re.compile(
+                rf"(?<![\w@])`?\\?@(?:{name_pattern}|{bogus_name_pattern})`?(?![\w-])",
+                flags=re.IGNORECASE,
+            )
+            content = literal_mention_pattern.sub("", content).strip()
+        else:
+            content = re.sub(
+                rf"(?<![\w@])`?\\?@{bogus_name_pattern}`?(?![\w-])",
+                "",
+                content,
+                flags=re.IGNORECASE,
+            ).strip()
+
         content = re.sub(r"^[,.;:!?]\s*", "", content)
         content = re.sub(r"\s+([,.;:!?])", r"\1", content)
         content = re.sub(r"([,;:])\s*([.!?])", r"\2", content)
@@ -273,7 +310,9 @@ Generate a similar response that's playful and uplifting, but don't copy these e
                     total_frames = processed_content.get("total_frames", "unknown")
                     extracted_frames = processed_content.get("extracted_frames", len(processed_content.get("frames", [])))
                     
-                    prompt_text = f"""Look at {user.display_name}'s animated profile picture and roast/mock it in a funny way. Be creative and witty, but keep it playful and not genuinely mean-spirited. 
+                    prompt_text = f"""Look at {user.display_name}'s animated profile picture and roast/mock it in a funny way. Be creative and witty, but keep it playful and not genuinely mean-spirited.
+
+Do not write Discord mentions, @names, <@name> placeholders, or @unknown-user. The bot will add the correct target mention after generation.
 
 This is an animated GIF with {total_frames} total frames, and I'm showing you {extracted_frames} representative frames to give you a good understanding of the animation. You can comment on:
 - Their expressions or poses across the different frames
@@ -298,7 +337,9 @@ Analyze the sequence of frames to understand the full animation and create a wit
                 elif isinstance(processed_content, dict) and processed_content.get("type") == "image_url":
                     print("DEBUG: Processing as static image")
                     # Static image
-                    prompt_text = f"""Look at {user.display_name}'s profile picture and roast/mock it in a funny way. Be creative and witty, but keep it playful and not genuinely mean-spirited. Comment on things like:
+                    prompt_text = f"""Look at {user.display_name}'s profile picture and roast/mock it in a funny way. Be creative and witty, but keep it playful and not genuinely mean-spirited.
+                    Do not write Discord mentions, @names, <@name> placeholders, or @unknown-user. The bot will add the correct target mention after generation.
+                    Comment on things like:
                     - Their expression or pose
                     - The background or setting
                     - Their style choices
@@ -312,7 +353,7 @@ Analyze the sequence of frames to understand the full animation and create a wit
                 else:
                     print(f"DEBUG: Falling back to text-only, processed_content type: {type(processed_content)}")
                     # Fallback to text-only prompt
-                    avatar_mock_prompt = f"""I want you to roast/mock {user.display_name}'s avatar in a funny way. Be creative and witty, but keep it playful and not genuinely mean-spirited. Since I couldn't process the image directly, make a creative joke about {user.display_name}'s avatar. You can reference common avatar styles, poses, or make jokes about how they probably look."""
+                    avatar_mock_prompt = f"""I want you to roast/mock {user.display_name}'s avatar in a funny way. Be creative and witty, but keep it playful and not genuinely mean-spirited. Do not write Discord mentions, @names, <@name> placeholders, or @unknown-user; the bot will add the correct target mention after generation. Since I couldn't process the image directly, make a creative joke about {user.display_name}'s avatar. You can reference common avatar styles, poses, or make jokes about how they probably look."""
                     
                     # Use the existing context manager to build context
                     messages, _ = await self.bot.context_manager.build_context(
@@ -362,7 +403,7 @@ Analyze the sequence of frames to understand the full animation and create a wit
             else:
                 print("DEBUG: Model doesn't support vision, using fallback")
                 # Fallback for non-vision models
-                avatar_mock_prompt = f"""I want you to roast/mock {user.display_name}'s avatar in a funny way. Be creative and witty, but keep it playful and not genuinely mean-spirited. Since I cannot show you the image directly, make a generic but creative joke about {user.display_name}'s avatar instead. You can reference common avatar styles, poses, or make jokes about how they probably look."""
+                avatar_mock_prompt = f"""I want you to roast/mock {user.display_name}'s avatar in a funny way. Be creative and witty, but keep it playful and not genuinely mean-spirited. Do not write Discord mentions, @names, <@name> placeholders, or @unknown-user; the bot will add the correct target mention after generation. Since I cannot show you the image directly, make a generic but creative joke about {user.display_name}'s avatar instead. You can reference common avatar styles, poses, or make jokes about how they probably look."""
                 
                 # Use the existing context manager to build context
                 messages, _ = await self.bot.context_manager.build_context(
@@ -383,10 +424,13 @@ Analyze the sequence of frames to understand the full animation and create a wit
             
             if content:
                 header = f"🎭 {interaction.user.display_name} mocked {user.display_name}'s Profile Picture"
+                content = self._ensure_target_ping(content, user)
+                allowed_mentions = discord.AllowedMentions(users=[user], roles=False, everyone=False, replied_user=False)
                 await MessageChunker.send_chunked_message(
                     target=interaction,
                     content=f"{header}\n\n{content}",
-                    ephemeral=False
+                    ephemeral=False,
+                    allowed_mentions=allowed_mentions
                 )
             else:
                 await interaction.followup.send(
