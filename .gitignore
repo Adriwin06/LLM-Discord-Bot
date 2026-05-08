@@ -209,3 +209,4 @@ __marimo__/
 # Bot data
 .backup/
 data/
+logs/
