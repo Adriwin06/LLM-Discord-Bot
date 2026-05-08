@@ -1395,13 +1395,12 @@ class EventHandler(commands.Cog):
         content = str(content or "").strip()
         cleaned = self._clean_json_response(content)
 
-        jsonish_content = self._extract_jsonish_reply_field(cleaned)
-        if jsonish_content:
-            return jsonish_content
-
         try:
             parsed = json.loads(cleaned)
         except (json.JSONDecodeError, TypeError):
+            jsonish_content = self._extract_jsonish_reply_field(cleaned)
+            if jsonish_content:
+                return jsonish_content
             return content
 
         if isinstance(parsed, dict):
@@ -1433,6 +1432,10 @@ class EventHandler(commands.Cog):
 
         quote = content[match.end() - 1]
         value_start = match.end()
+        boundary_value = self._extract_jsonish_value_until_next_key(content, value_start)
+        if boundary_value:
+            return boundary_value
+
         escaped = False
         chars = []
 
@@ -1457,6 +1460,29 @@ class EventHandler(commands.Cog):
 
         raw_value = "".join(chars)
         return raw_value.replace("\\n", "\n").replace("\\t", "\t").strip()
+
+    def _extract_jsonish_value_until_next_key(self, content: str, value_start: int) -> str:
+        tail = content[value_start:]
+        boundary = re.search(
+            r'["\']\s*,\s*["\'](?:reactions?|emoji|emojis|tool_calls?|metadata|attachments?)["\']\s*:',
+            tail,
+            flags=re.IGNORECASE,
+        )
+        if not boundary:
+            return ""
+
+        raw_value = tail[:boundary.start()]
+        raw_value = raw_value.rstrip()
+        if raw_value.endswith(("'", '"')):
+            raw_value = raw_value[:-1].rstrip()
+        return self._decode_jsonish_string(raw_value)
+
+    def _decode_jsonish_string(self, raw_value: str) -> str:
+        raw_value = str(raw_value or "")
+        try:
+            return json.loads(f'"{raw_value}"').strip()
+        except json.JSONDecodeError:
+            return raw_value.replace("\\n", "\n").replace("\\t", "\t").strip()
 
     async def _resolve_mentions(self, content: str, guild: discord.Guild) -> str:
         mention_pattern = re.compile(r'<mention (user|role)="([^"]+)">')
