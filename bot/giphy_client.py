@@ -15,6 +15,7 @@ class GiphyGif:
     id: str
     title: str
     url: str
+    media_url: str = ""
     rating: str = ""
     analytics: dict[str, Any] | None = None
 
@@ -42,19 +43,29 @@ class GiphyClient:
             await self._session.close()
 
     async def search_gif(self, query: str, *, user_key: str = "") -> GiphyGif | None:
+        gifs = await self.search_gifs(query, limit=1, user_key=user_key)
+        return gifs[0] if gifs else None
+
+    async def search_gifs(self, query: str, *, limit: int = 1, user_key: str = "") -> list[GiphyGif]:
         if not self.enabled:
             logging.info("GIPHY search skipped because GIPHY_API_KEY is not configured.")
-            return None
+            return []
 
         clean_query = self._clean_query(query)
         if not clean_query:
             logging.info("GIPHY search skipped because the query was empty after sanitization.")
-            return None
+            return []
+
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = 1
+        limit = max(1, min(limit, 25))
 
         params = {
             "api_key": self.api_key,
             "q": clean_query,
-            "limit": 1,
+            "limit": limit,
             "rating": self.rating,
             "lang": self.lang,
         }
@@ -64,19 +75,22 @@ class GiphyClient:
 
         payload = await self._get_json("/gifs/search", params)
         if not payload:
-            return None
+            return []
 
         data = payload.get("data")
         if not isinstance(data, list) or not data:
             logging.info("GIPHY search returned no results. query=%r", clean_query)
-            return None
+            return []
 
-        gif = self._gif_from_payload(data[0])
-        if not gif:
-            logging.warning("GIPHY search returned a result without a usable GIPHY URL. query=%r", clean_query)
-            return None
+        gifs = []
+        for item in data:
+            gif = self._gif_from_payload(item)
+            if gif:
+                gifs.append(gif)
 
-        return gif
+        if not gifs:
+            logging.warning("GIPHY search returned no results with usable GIPHY URLs. query=%r", clean_query)
+        return gifs
 
     async def register_sent(self, gif: GiphyGif, *, user_key: str = ""):
         analytics = gif.analytics or {}
@@ -170,6 +184,7 @@ class GiphyClient:
             return None
 
         url = self._first_giphy_url(item)
+        media_url = self._first_giphy_media_url(item)
         if not url:
             return None
 
@@ -177,6 +192,7 @@ class GiphyClient:
             id=str(item.get("id") or ""),
             title=str(item.get("title") or ""),
             url=url,
+            media_url=media_url,
             rating=str(item.get("rating") or ""),
             analytics=item.get("analytics") if isinstance(item.get("analytics"), dict) else None,
         )
@@ -196,6 +212,21 @@ class GiphyClient:
                 url = str(rendition_data.get("url") or "").strip()
                 if self._is_giphy_url(url):
                     return url
+
+        return ""
+
+    def _first_giphy_media_url(self, item: dict) -> str:
+        images = item.get("images")
+        if not isinstance(images, dict):
+            return ""
+
+        for rendition in ("original", "downsized", "fixed_height", "fixed_width"):
+            rendition_data = images.get(rendition)
+            if not isinstance(rendition_data, dict):
+                continue
+            url = str(rendition_data.get("url") or "").strip()
+            if self._is_giphy_url(url):
+                return url
 
         return ""
 

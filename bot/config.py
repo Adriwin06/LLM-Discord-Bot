@@ -41,6 +41,9 @@ class Config:
         self.GIPHY_RATING = os.getenv("GIPHY_RATING", "pg-13")
         self.GIPHY_LANG = os.getenv("GIPHY_LANG", "en")
         self.GIPHY_TIMEOUT_SECONDS = float(os.getenv("GIPHY_TIMEOUT_SECONDS", 8.0))
+        self.GIPHY_ANALYZE_BEFORE_SEND = os.getenv("GIPHY_ANALYZE_BEFORE_SEND", "False").lower() == "true"
+        self.GIPHY_ANALYSIS_MAX_CANDIDATES = int(os.getenv("GIPHY_ANALYSIS_MAX_CANDIDATES", 3))
+        self.GIPHY_ANALYSIS_MODEL = os.getenv("GIPHY_ANALYSIS_MODEL", "")
 
         # Web Search Configuration
         self.WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "True").lower() == "true"

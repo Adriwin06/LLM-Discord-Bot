@@ -16,6 +16,14 @@ from defusedxml import ElementTree as ET
 from defusedxml.common import DefusedXmlException
 
 
+class _URLAttachment:
+    def __init__(self, *, url: str, filename: str, content_type: str = "", size: int = 0):
+        self.url = url
+        self.filename = filename
+        self.content_type = content_type
+        self.size = size
+
+
 class DiscordToolManager:
     """Read-only Discord, GIPHY, and web tools exposed to tool-capable LLMs."""
 
@@ -840,9 +848,38 @@ class DiscordToolManager:
         if not query:
             return {"ok": False, "tool": "search_giphy_gif", "error": "A safe GIPHY search query is required."}
 
-        gif = await giphy_client.search_gif(query, user_key=str(origin_message.author.id))
-        if not gif:
+        analyze = self._giphy_analysis_enabled()
+        candidate_limit = self._giphy_analysis_max_candidates() if analyze else 1
+        candidates = await giphy_client.search_gifs(query, limit=candidate_limit, user_key=str(origin_message.author.id))
+        if not candidates:
             return {"ok": False, "tool": "search_giphy_gif", "query": query, "error": "No GIPHY result found."}
+
+        gif = candidates[0]
+        verification = None
+        if analyze:
+            gif = None
+            for candidate in candidates:
+                verification = await self._verify_giphy_candidate(origin_message, query, candidate, settings)
+                logging.info(
+                    "GIPHY visual verification result. message_id=%s query=%r gif_id=%s accepted=%s reason=%r",
+                    origin_message.id,
+                    query,
+                    candidate.id,
+                    verification.get("accepted"),
+                    verification.get("reason"),
+                )
+                if verification.get("accepted"):
+                    gif = candidate
+                    break
+
+            if not gif:
+                return {
+                    "ok": False,
+                    "tool": "search_giphy_gif",
+                    "query": query,
+                    "error": f"No visually suitable GIPHY result found after checking {len(candidates)} candidate(s).",
+                    "last_verification": verification,
+                }
 
         await giphy_client.register_sent(gif, user_key=str(origin_message.author.id))
         logging.info(
@@ -865,7 +902,130 @@ class DiscordToolManager:
             "caption": "",
             "recommended_reply": gif.url,
             "instruction": "To send this GIF in Discord, make your final reply exactly this URL and no caption or extra text.",
+            "verification": verification,
         }
+
+    async def _verify_giphy_candidate(
+        self,
+        origin_message: discord.Message,
+        query: str,
+        gif: Any,
+        settings: dict,
+    ) -> Dict[str, Any]:
+        context_manager = getattr(self.bot, "context_manager", None)
+        if not context_manager:
+            return {"accepted": False, "reason": "Context manager is unavailable."}
+
+        model = str(getattr(self.bot.config, "GIPHY_ANALYSIS_MODEL", "") or "").strip()
+        if not model:
+            model = settings.get("model") or getattr(self.bot.config, "MAIN_LLM_MODEL", "")
+        if not model:
+            return {"accepted": False, "reason": "No verifier model is configured."}
+
+        media_settings = (settings or {}).get("media", {})
+        media_url = getattr(gif, "media_url", "") or getattr(gif, "url", "")
+        attachment = _URLAttachment(
+            url=media_url,
+            filename=f"giphy_{getattr(gif, 'id', 'candidate')}.gif",
+            content_type="image/gif",
+        )
+
+        try:
+            processed = await context_manager._process_attachment(attachment, model, media_settings)
+        except Exception as e:
+            logging.exception("GIPHY candidate media processing failed. gif_id=%s", getattr(gif, "id", None))
+            return {"accepted": False, "reason": f"Could not process candidate GIF: {type(e).__name__}: {e}"}
+
+        content_parts = [
+            {
+                "type": "text",
+                "text": (
+                    "Verify this candidate GIPHY result before it is sent in Discord.\n"
+                    f"Original Discord message: {origin_message.content or '[empty message]'}\n"
+                    f"Intended GIPHY search query: {query}\n"
+                    f"GIPHY title: {getattr(gif, 'title', '') or '[untitled]'}\n"
+                    f"GIPHY URL to send if accepted: {getattr(gif, 'url', '')}\n"
+                    "Accept only if the visual content clearly fits the intended reaction/context. "
+                    "Reject if it is confusing, off-topic, too obscure, unsafe, or likely to look random."
+                ),
+            }
+        ]
+        content_parts.extend(self._processed_giphy_media_parts(processed))
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You verify candidate GIPHY GIFs for a Discord bot. "
+                    "Use the visual frames and OCR text when provided. "
+                    "Return only JSON with keys: accepted (boolean), reason (short string), refined_query (string or null)."
+                ),
+            },
+            {"role": "user", "content": content_parts},
+        ]
+
+        response = await self.bot.llm_provider.create_completion(
+            model=model,
+            messages=messages,
+            response_format={"type": "json_object"},
+        )
+        content = self._response_content(response)
+        if not content:
+            return {"accepted": False, "reason": "Verifier model returned no content."}
+
+        try:
+            parsed = json.loads(self._clean_json_response(content))
+        except (json.JSONDecodeError, TypeError):
+            return {"accepted": False, "reason": f"Verifier returned invalid JSON: {str(content)[:120]}"}
+
+        return {
+            "accepted": self._coerce_bool(parsed.get("accepted"), default=False),
+            "reason": str(parsed.get("reason") or "").strip()[:300],
+            "refined_query": str(parsed.get("refined_query") or "").strip()[:80] or None,
+            "model": model,
+        }
+
+    def _processed_giphy_media_parts(self, processed: Any) -> List[Dict[str, Any]]:
+        parts = []
+        if isinstance(processed, dict) and processed.get("type") == "animated_gif":
+            filename = processed.get("filename") or "GIPHY GIF"
+            total_frames = processed.get("total_frames", "unknown")
+            extracted_frames = processed.get("extracted_frames", 0)
+            parts.append({
+                "type": "text",
+                "text": f"Animated GIF candidate: {filename}. Showing {extracted_frames} representative frame(s) from {total_frames} total frame(s).",
+            })
+            ocr_text = str(processed.get("ocr_text") or "").strip()
+            if ocr_text:
+                parts.append({
+                    "type": "text",
+                    "text": f"--- OCR text extracted from candidate GIF frames ---\n{ocr_text}",
+                })
+            for frame_url in processed.get("frames") or []:
+                parts.append({"type": "image_url", "image_url": {"url": frame_url}})
+            return parts
+
+        if isinstance(processed, list):
+            return processed
+
+        if isinstance(processed, dict):
+            return [processed]
+
+        if processed:
+            return [{"type": "text", "text": str(processed)}]
+
+        return [{"type": "text", "text": "[No visual media context was extracted for this GIF candidate.]"}]
+
+    def _giphy_analysis_enabled(self) -> bool:
+        return self._coerce_bool(getattr(self.bot.config, "GIPHY_ANALYZE_BEFORE_SEND", False), default=False)
+
+    def _giphy_analysis_max_candidates(self) -> int:
+        return self._clamp_int(
+            getattr(self.bot.config, "GIPHY_ANALYSIS_MAX_CANDIDATES", 3),
+            default=3,
+            minimum=1,
+            maximum=10,
+        )
 
     async def fetch_web_page(self, url: str, max_chars: Optional[int] = None) -> Dict[str, Any]:
         if not getattr(self.bot.config, "WEB_SEARCH_ENABLED", True):
@@ -993,6 +1153,23 @@ class DiscordToolManager:
             arguments = {}
 
         return str(name or ""), arguments
+
+    def _response_content(self, response: Any) -> str:
+        if not response or not getattr(response, "choices", None):
+            return ""
+        choice = response.choices[0]
+        message = self._get(choice, "message")
+        return str(self._get(message, "content") or "")
+
+    def _clean_json_response(self, content: str) -> str:
+        content = str(content or "").strip()
+        if content.startswith("```json"):
+            content = content[7:]
+        elif content.startswith("```"):
+            content = content[3:]
+        if content.endswith("```"):
+            content = content[:-3]
+        return content.strip()
 
     def _resolve_search_channels(
         self,

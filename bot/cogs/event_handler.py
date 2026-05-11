@@ -1076,32 +1076,34 @@ class EventHandler(commands.Cog):
             logging.warning("Decision model selected GIF without a query for message %s.", message.id)
             return False
 
-        giphy_client = getattr(self.bot, "giphy_client", None)
-        if not giphy_client or not getattr(giphy_client, "enabled", False):
-            logging.info("Skipping GIF send because GIPHY is not configured. message_id=%s", message.id)
+        tool_manager = getattr(self.bot, "tool_manager", None)
+        if not tool_manager:
+            logging.info("Skipping GIF send because the GIPHY tool manager is not available. message_id=%s", message.id)
             return False
 
         try:
             async with message.channel.typing():
-                gif = await giphy_client.search_gif(gif_query, user_key=str(message.author.id))
-            if not gif:
-                logging.info("No GIPHY result found. message_id=%s query=%r", message.id, gif_query)
+                result = await tool_manager.search_giphy_gif(message, gif_query)
+            if not result.get("ok"):
+                logging.info("No suitable GIPHY result found. message_id=%s query=%r result=%s", message.id, gif_query, result)
                 return False
 
-            content = gif.url
+            content = self._giphy_tool_reply(result)
+            if not content:
+                logging.info("GIPHY tool returned no sendable URL. message_id=%s query=%r result=%s", message.id, gif_query, result)
+                return False
 
             await message.reply(
                 content,
                 mention_author=False,
                 allowed_mentions=discord.AllowedMentions(users=False, roles=False, everyone=False, replied_user=False),
             )
-            await giphy_client.register_sent(gif, user_key=str(message.author.id))
             self._mark_bot_involved(message)
             logging.info(
                 "GIPHY GIF sent. message_id=%s gif_id=%s title=%r query=%r",
                 message.id,
-                gif.id,
-                gif.title,
+                result.get("gif_id"),
+                result.get("title"),
                 gif_query,
             )
             return True

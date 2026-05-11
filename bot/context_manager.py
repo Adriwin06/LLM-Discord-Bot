@@ -871,6 +871,12 @@ class ContextManager:
                         frame_info += f" ({extracted_frames} frames)"
                     
                     content_parts.append({"type": "text", "text": frame_info})
+                    ocr_text = (processed_content.get("ocr_text") or "").strip()
+                    if ocr_text:
+                        content_parts.append({
+                            "type": "text",
+                            "text": f"--- OCR text extracted from animated GIF frames: {processed_content['filename']} ---\n{ocr_text}",
+                        })
                     for frame_data in processed_content["frames"]:
                         content_parts.append({
                             "type": "image_url", 
@@ -1138,6 +1144,40 @@ class ContextManager:
         max_chars = self._safe_int(images_config.get("max_ocr_chars"), default=4000, minimum=500, maximum=12000)
         ocr_text = self._truncate_context_text(ocr_text, max_chars)
         logging.info("Image OCR context extracted. filename=%s chars=%s", filename, len(ocr_text))
+        return ocr_text
+
+    def _ocr_image_frames_text_for_context(self, frames: list, filename: str, images_config: dict) -> str:
+        if not (
+            images_config.get("ocr_enabled", True)
+            and images_config.get("include_ocr_for_vision_models", True)
+            and TESSERACT_AVAILABLE
+            and frames
+        ):
+            return ""
+
+        lines = []
+        for frame in frames:
+            try:
+                with Image.open(io.BytesIO(frame.get("jpeg_bytes") or b"")) as img:
+                    text = pytesseract.image_to_string(img).strip()
+                if text:
+                    lines.append(f"[{frame.get('label') or 'frame'}] {text}")
+            except Exception as e:
+                logging.debug(
+                    "GIF frame OCR skipped. filename=%s label=%s error_type=%s error=%s",
+                    filename,
+                    frame.get("label"),
+                    type(e).__name__,
+                    e,
+                )
+
+        if not lines:
+            logging.debug("GIF frame OCR found no text. filename=%s frames=%s", filename, len(frames or []))
+            return ""
+
+        max_chars = self._safe_int(images_config.get("max_ocr_chars"), default=4000, minimum=500, maximum=12000)
+        ocr_text = self._truncate_context_text("\n".join(lines), max_chars)
+        logging.info("GIF frame OCR context extracted. filename=%s frames=%s chars=%s", filename, len(frames), len(ocr_text))
         return ocr_text
 
     async def _write_temp_file(self, file_bytes: bytes, file_ext: str) -> str:
@@ -2261,6 +2301,7 @@ class ContextManager:
                                     logging.info(f"Processing animated GIF {attachment.filename}: {total_frames} total frames, extracting frames at indices {frame_indices}")
                                     
                                     try:
+                                        ocr_frame_bytes = []
                                         for frame_index in frame_indices:
                                             try:
                                                 gif.seek(frame_index)
@@ -2271,8 +2312,13 @@ class ContextManager:
                                                 buffer = io.BytesIO()
                                                 frame.save(buffer, format='JPEG', quality=frame_quality)
                                                 buffer.seek(0)
-                                                frame_b64 = base64.b64encode(buffer.getvalue()).decode()
+                                                frame_bytes = buffer.getvalue()
+                                                frame_b64 = base64.b64encode(frame_bytes).decode()
                                                 frames.append(f"data:image/jpeg;base64,{frame_b64}")
+                                                ocr_frame_bytes.append({
+                                                    "label": f"frame {frame_index}",
+                                                    "jpeg_bytes": frame_bytes,
+                                                })
                                                 
                                             except (EOFError, OSError) as e:
                                                 logging.warning(f"Could not access frame {frame_index} in {attachment.filename}: {e}")
@@ -2282,6 +2328,7 @@ class ContextManager:
                                         logging.warning(f"Error extracting frames from {attachment.filename}: {frame_error}")
                                         # Try fallback method with sequential frame access
                                         frames = []
+                                        ocr_frame_bytes = []
                                         try:
                                             frame_count = 0
                                             current_frame = 0
@@ -2293,8 +2340,13 @@ class ContextManager:
                                                 buffer = io.BytesIO()
                                                 frame.save(buffer, format='JPEG', quality=frame_quality)
                                                 buffer.seek(0)
-                                                frame_b64 = base64.b64encode(buffer.getvalue()).decode()
+                                                frame_bytes = buffer.getvalue()
+                                                frame_b64 = base64.b64encode(frame_bytes).decode()
                                                 frames.append(f"data:image/jpeg;base64,{frame_b64}")
+                                                ocr_frame_bytes.append({
+                                                    "label": f"frame {current_frame}",
+                                                    "jpeg_bytes": frame_bytes,
+                                                })
                                                 
                                                 frame_count += 1
                                                 current_frame += max(1, total_frames // max_frames)
@@ -2310,13 +2362,19 @@ class ContextManager:
                                             total_frames,
                                             len(frames),
                                         )
+                                        frame_ocr_text = self._ocr_image_frames_text_for_context(
+                                            ocr_frame_bytes,
+                                            attachment.filename,
+                                            images_config,
+                                        )
                                         # Return structured data for animated GIFs that can be used in different contexts
                                         return {
                                             "type": "animated_gif",
                                             "total_frames": total_frames,
                                             "extracted_frames": len(frames),
                                             "frames": frames,
-                                            "filename": attachment.filename
+                                            "filename": attachment.filename,
+                                            "ocr_text": frame_ocr_text,
                                         }
                                     else:
                                         # Fallback to treating as static image

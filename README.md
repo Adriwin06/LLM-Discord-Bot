@@ -351,6 +351,9 @@ For Ollama models, use LiteLLM model names such as `ollama/model-name` or `ollam
 | `GIPHY_RATING` | `pg-13` | GIPHY content rating filter: `g`, `pg`, `pg-13`, or `r`. |
 | `GIPHY_LANG` | `en` | 2-letter language code for regional GIF search. |
 | `GIPHY_TIMEOUT_SECONDS` | `8.0` | Timeout for GIPHY API calls. |
+| `GIPHY_ANALYZE_BEFORE_SEND` | `False` | If true, candidate GIFs are processed into frames/OCR and checked by an LLM before sending. |
+| `GIPHY_ANALYSIS_MAX_CANDIDATES` | `3` | Maximum GIPHY candidates to inspect before giving up. |
+| `GIPHY_ANALYSIS_MODEL` | empty | Optional verifier model override. Empty uses the effective main reply model. |
 
 GIF replies use GIPHY Search dynamically. The decision model can return a short `gif_query` for ambient GIF responses, and the main reply model can call `search_giphy_gif` during direct replies. The bot sends only the canonical GIPHY URL, with no caption, and falls back to text for direct interactions if no GIF can be found.
 
