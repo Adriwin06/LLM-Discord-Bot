@@ -176,7 +176,10 @@ class GiphyClient:
             return self._session
 
         timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
-        self._session = aiohttp.ClientSession(timeout=timeout)
+        self._session = aiohttp.ClientSession(
+            timeout=timeout,
+            headers={"Accept-Encoding": "gzip, deflate"},
+        )
         return self._session
 
     def _gif_from_payload(self, item: Any) -> GiphyGif | None:

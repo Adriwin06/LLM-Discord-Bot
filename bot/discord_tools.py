@@ -302,7 +302,8 @@ class DiscordToolManager:
                     "description": (
                         "Search GIPHY for a GIF URL that can be sent in Discord. "
                         "Use this when the user asks for a GIF, when recent context says replies should be GIFs, "
-                        "or when a GIF is clearly a better low-risk response than text."
+                        "or when a GIF is clearly a better low-risk response than text. "
+                        "Prefer famous, broadly recognizable meme/reaction GIFs over obscure or literal results."
                     ),
                     "parameters": {
                         "type": "object",
@@ -310,8 +311,9 @@ class DiscordToolManager:
                             "query": {
                                 "type": "string",
                                 "description": (
-                                    "Short GIPHY search query based on the current Discord context, ideally 2 to 6 common words. "
-                                    "For short reactions, include the word reaction, e.g. 'lol wtf reaction'."
+                                    "Final GIPHY search query based on the current Discord context. "
+                                    "Use concise, GIPHY-friendly terms: a known meme name, recognizable reaction phrase, emotion, or scene description. "
+                                    "Do not pass the user's whole sentence."
                                 ),
                             },
                         },
@@ -852,13 +854,18 @@ class DiscordToolManager:
         candidate_limit = self._giphy_analysis_max_candidates() if analyze else 1
         candidates = await giphy_client.search_gifs(query, limit=candidate_limit, user_key=str(origin_message.author.id))
         if not candidates:
-            return {"ok": False, "tool": "search_giphy_gif", "query": query, "error": "No GIPHY result found."}
+            return {
+                "ok": False,
+                "tool": "search_giphy_gif",
+                "query": query,
+                "error": "No GIPHY result found.",
+            }
 
         gif = candidates[0]
         verification = None
         if analyze:
             gif = None
-            for candidate in candidates:
+            for candidate in candidates[:candidate_limit]:
                 verification = await self._verify_giphy_candidate(origin_message, query, candidate, settings)
                 logging.info(
                     "GIPHY visual verification result. message_id=%s query=%r gif_id=%s accepted=%s reason=%r",
@@ -877,7 +884,7 @@ class DiscordToolManager:
                     "ok": False,
                     "tool": "search_giphy_gif",
                     "query": query,
-                    "error": f"No visually suitable GIPHY result found after checking {len(candidates)} candidate(s).",
+                    "error": f"No visually suitable GIPHY result found after checking {min(len(candidates), candidate_limit)} candidate(s).",
                     "last_verification": verification,
                 }
 
@@ -946,6 +953,7 @@ class DiscordToolManager:
                     f"GIPHY title: {getattr(gif, 'title', '') or '[untitled]'}\n"
                     f"GIPHY URL to send if accepted: {getattr(gif, 'url', '')}\n"
                     "Accept only if the visual content clearly fits the intended reaction/context. "
+                    "Prefer famous, broadly recognizable meme/reaction GIFs over obscure personal uploads. "
                     "Reject if it is confusing, off-topic, too obscure, unsafe, or likely to look random."
                 ),
             }

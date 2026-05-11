@@ -355,7 +355,7 @@ For Ollama models, use LiteLLM model names such as `ollama/model-name` or `ollam
 | `GIPHY_ANALYSIS_MAX_CANDIDATES` | `3` | Maximum GIPHY candidates to inspect before giving up. |
 | `GIPHY_ANALYSIS_MODEL` | empty | Optional verifier model override. Empty uses the effective main reply model. |
 
-GIF replies use GIPHY Search dynamically. The decision model can return a short `gif_query` for ambient GIF responses, and the main reply model can call `search_giphy_gif` during direct replies. The bot sends only the canonical GIPHY URL, with no caption, and falls back to text for direct interactions if no GIF can be found.
+GIF replies use GIPHY Search dynamically. The decision model can return a short `gif_query` for ambient GIF responses, and the main reply model can call `search_giphy_gif` during direct replies. The model that requests the GIF is responsible for passing a concise, optimized GIPHY search query. The bot sends only the canonical GIPHY URL, with no caption, and falls back to text for direct interactions if no GIF can be found.
 
 ### Tools and Web
 

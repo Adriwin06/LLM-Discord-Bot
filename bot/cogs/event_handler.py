@@ -11,15 +11,6 @@ from datetime import datetime, timezone
 from .utilities import MessageChunker
 
 class EventHandler(commands.Cog):
-    GIF_QUERY_EXAMPLES = {
-        "typing": "typing furiously",
-        "waiting": "waiting patiently",
-        "popcorn": "popcorn drama",
-        "laugh": "laughing hard",
-        "thumbs_up": "thumbs up approval",
-        "mind_blown": "mind blown reaction",
-    }
-
     def __init__(self, bot):
         self.bot = bot
         # Lock to prevent multiple messages from triggering summaries/profiles simultaneously
@@ -777,20 +768,20 @@ class EventHandler(commands.Cog):
             return {"action": "none"}
 
     def _decision_prompt(self, *, gifs_available: bool, direct_interaction: bool) -> str:
-        gif_examples = ", ".join(self.GIF_QUERY_EXAMPLES.values())
         if gifs_available:
             gif_guidance = f"""
         The bot may send a GIPHY GIF only when a visual reaction is clearly better than text, funny or expressive, logical for the current context, and low-risk.
-        Use only GIPHY by returning a short GIPHY search query. The bot will send the best result from GIPHY Search.
+        Use only GIPHY by returning the final GIPHY search query to run.
+        Prefer a famous, broadly recognizable meme/reaction when one genuinely fits.
+        Optimize for how GIPHY search is indexed: use a known meme name, recognizable reaction phrase, emotion, or scene description. Do not return the user's whole sentence.
         Do not send GIFs for serious, sensitive, sad, medical, legal, financial, political, sexual, violent, hateful, self-harm, or moderation-related contexts.
         If a long-typing note is present, you may choose a light joke or a typing/waiting GIF if it fits.
-        GIF search query rules: 2 to 6 common words, max 50 characters, no usernames, no Discord mentions, no private details, no URLs. For short reactions, include the word "reaction"; for example, "lol wtf reaction".
+        GIF query rules: 2 to 6 words, max 50 characters, no usernames, no Discord mentions, no private details, no URLs.
         GIF messages are URL-only. Do not add captions or explanatory text.
-        Useful query examples: {gif_examples}.
         """
             gif_action_line = '1. "action": a string, either "reply", "react", "gif", or "none".'
-            gif_query_line = '3. "gif_query": a short GIPHY search query if the action is "gif", otherwise null.'
-            gif_example = '        Example: {"action": "gif", "reaction": null, "gif_query": "typing furiously", "caption": null}'
+            gif_query_line = '3. "gif_query": the final GIPHY search query if the action is "gif", otherwise null.'
+            gif_example = '        Example: {"action": "gif", "reaction": null, "gif_query": "guess whos back reaction", "caption": null}'
         else:
             gif_guidance = """
         GIF sending is unavailable because GIPHY is not configured or GIFs are disabled. Do not choose the "gif" action.
@@ -1118,7 +1109,6 @@ class EventHandler(commands.Cog):
         gif_query = (
             decision_json.get("gif_query")
             or decision_json.get("query")
-            or self.GIF_QUERY_EXAMPLES.get(str(decision_json.get("gif_key") or "").strip().lower())
         )
         gif_query = self._sanitize_gif_query(gif_query)
         if not gif_query:
