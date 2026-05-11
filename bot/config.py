@@ -37,6 +37,10 @@ class Config:
         self.REPLY_CHAIN_LONG_TYPING_SECONDS = float(os.getenv("REPLY_CHAIN_LONG_TYPING_SECONDS", 10.0))
         self.TYPING_ACTIVE_SECONDS = float(os.getenv("TYPING_ACTIVE_SECONDS", 8.0))
         self.GIFS_ENABLED = os.getenv("GIFS_ENABLED", "True").lower() == "true"
+        self.GIPHY_API_KEY = os.getenv("GIPHY_API_KEY", "")
+        self.GIPHY_RATING = os.getenv("GIPHY_RATING", "pg-13")
+        self.GIPHY_LANG = os.getenv("GIPHY_LANG", "en")
+        self.GIPHY_TIMEOUT_SECONDS = float(os.getenv("GIPHY_TIMEOUT_SECONDS", 8.0))
 
         # Web Search Configuration
         self.WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "True").lower() == "true"

@@ -84,6 +84,7 @@ class LLMDiscordBot(commands.Bot):
         from bot.llm_provider import LiteLLMProvider
         from bot.context_manager import ContextManager
         from bot.discord_tools import DiscordToolManager
+        from bot.giphy_client import GiphyClient
         logging.info("Core bot components loaded.")
 
         intents = discord.Intents.default()
@@ -99,6 +100,7 @@ class LLMDiscordBot(commands.Bot):
         self.llm_provider = LiteLLMProvider(self.config)
         self.context_manager = ContextManager(self.store, self.llm_provider, self)
         self.tool_manager = DiscordToolManager(self)
+        self.giphy_client = GiphyClient(self.config)
         self.shutdown_event = asyncio.Event()
 
     async def setup_hook(self):
@@ -181,6 +183,15 @@ class LLMDiscordBot(commands.Bot):
                     logging.warning("LLM provider cleanup timed out")
                 except Exception as e:
                     logging.error(f"Error cleaning up LLM provider: {e}")
+
+            if hasattr(self, 'giphy_client'):
+                try:
+                    await asyncio.wait_for(self.giphy_client.close(), timeout=5.0)
+                    logging.info("GIPHY client cleaned up")
+                except asyncio.TimeoutError:
+                    logging.warning("GIPHY client cleanup timed out")
+                except Exception as e:
+                    logging.error(f"Error cleaning up GIPHY client: {e}")
             
             # Give a brief moment for any remaining cleanup
             await asyncio.sleep(0.2)

@@ -17,7 +17,7 @@ from defusedxml.common import DefusedXmlException
 
 
 class DiscordToolManager:
-    """Read-only Discord tools exposed to tool-capable LLMs."""
+    """Read-only Discord, GIPHY, and web tools exposed to tool-capable LLMs."""
 
     def __init__(self, bot):
         self.bot = bot
@@ -287,6 +287,31 @@ class DiscordToolManager:
                     },
                 },
             },
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_giphy_gif",
+                    "description": (
+                        "Search GIPHY for a GIF URL that can be sent in Discord. "
+                        "Use this when the user asks for a GIF, when recent context says replies should be GIFs, "
+                        "or when a GIF is clearly a better low-risk response than text."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": (
+                                    "Short GIPHY search query based on the current Discord context, ideally 2 to 6 common words. "
+                                    "For short reactions, include the word reaction, e.g. 'lol wtf reaction'."
+                                ),
+                            },
+                        },
+                        "required": ["query"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
         ]
 
     async def execute_tool_call(self, tool_call: Any, origin_message: discord.Message) -> Dict[str, Any]:
@@ -306,6 +331,8 @@ class DiscordToolManager:
                 return await self.get_recent_messages(origin_message, **arguments)
             if name == "get_user_profile":
                 return await self.get_user_profile(origin_message, **arguments)
+            if name == "search_giphy_gif":
+                return await self.search_giphy_gif(origin_message, **arguments)
             if name == "web_search":
                 return await self.web_search(**arguments)
             if name == "fetch_web_page":
@@ -782,6 +809,62 @@ class DiscordToolManager:
             "returned": len(deduped),
             "results": deduped,
             "provider_errors": provider_errors,
+        }
+
+    async def search_giphy_gif(
+        self,
+        origin_message: discord.Message,
+        query: str,
+        caption: str = "",
+    ) -> Dict[str, Any]:
+        settings = {}
+        context_manager = getattr(self.bot, "context_manager", None)
+        if context_manager and origin_message.guild:
+            settings = await context_manager.get_guild_and_channel_settings(
+                str(origin_message.guild.id),
+                str(origin_message.channel.id),
+            )
+
+        gifs_enabled = self._coerce_bool(
+            settings.get("gifs_enabled"),
+            default=getattr(self.bot.config, "GIFS_ENABLED", True),
+        )
+        if not gifs_enabled:
+            return {"ok": False, "tool": "search_giphy_gif", "error": "GIF replies are disabled for this scope."}
+
+        giphy_client = getattr(self.bot, "giphy_client", None)
+        if not giphy_client or not getattr(giphy_client, "enabled", False):
+            return {"ok": False, "tool": "search_giphy_gif", "error": "GIPHY_API_KEY is not configured."}
+
+        query = self._sanitize_giphy_query(query)
+        if not query:
+            return {"ok": False, "tool": "search_giphy_gif", "error": "A safe GIPHY search query is required."}
+
+        gif = await giphy_client.search_gif(query, user_key=str(origin_message.author.id))
+        if not gif:
+            return {"ok": False, "tool": "search_giphy_gif", "query": query, "error": "No GIPHY result found."}
+
+        await giphy_client.register_sent(gif, user_key=str(origin_message.author.id))
+        logging.info(
+            "GIPHY tool result selected. message_id=%s query=%r gif_id=%s title=%r url=%s",
+            origin_message.id,
+            query,
+            gif.id,
+            gif.title,
+            gif.url,
+        )
+
+        return {
+            "ok": True,
+            "tool": "search_giphy_gif",
+            "query": query,
+            "gif_id": gif.id,
+            "title": gif.title,
+            "rating": gif.rating,
+            "url": gif.url,
+            "caption": "",
+            "recommended_reply": gif.url,
+            "instruction": "To send this GIF in Discord, make your final reply exactly this URL and no caption or extra text.",
         }
 
     async def fetch_web_page(self, url: str, max_chars: Optional[int] = None) -> Dict[str, Any]:
@@ -1361,6 +1444,45 @@ class DiscordToolManager:
                 return False
             return default
         return bool(value)
+
+    def _sanitize_giphy_query(self, query: str, max_length: int = 50) -> str:
+        query = str(query or "").strip()
+        if not query:
+            return ""
+
+        query = re.sub(r"https?://\S+", " ", query)
+        query = re.sub(r"<@!?\d+>|<@&\d+>|<#\d+>", " ", query)
+        query = re.sub(r"@(?:everyone|here)\b", " ", query, flags=re.IGNORECASE)
+        query = re.sub(r"\s+", " ", query).strip(" .,:;!?\"'")
+        if len(query) > max_length:
+            query = query[:max_length].rsplit(" ", 1)[0].strip() or query[:max_length].strip()
+        return "" if self._has_blocked_giphy_term(query) else query
+
+    def _sanitize_giphy_caption(self, caption: str, max_length: int = 120) -> str:
+        caption = str(caption or "").strip()
+        if not caption:
+            return ""
+        caption = caption.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+        caption = caption.replace("```", "'''")
+        caption = re.sub(r"\s+", " ", caption)
+        if len(caption) > max_length:
+            caption = caption[: max_length - 3].rstrip() + "..."
+        return caption
+
+    def _has_blocked_giphy_term(self, query: str) -> bool:
+        blocked_terms = (
+            "porn",
+            "nude",
+            "nsfw",
+            "gore",
+            "rape",
+            "suicide",
+            "self harm",
+            "nazi",
+            "hitler",
+        )
+        normalized = f" {str(query or '').lower()} "
+        return any(f" {term} " in normalized for term in blocked_terms)
 
     def _channel_sort_key(self, channel: Any) -> Tuple[int, int, str, int]:
         category = getattr(channel, "category", None)

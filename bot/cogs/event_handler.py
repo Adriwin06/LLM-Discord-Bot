@@ -11,31 +11,13 @@ from datetime import datetime, timezone
 from .utilities import MessageChunker
 
 class EventHandler(commands.Cog):
-    GIF_LIBRARY = {
-        "typing": {
-            "url": "https://media.giphy.com/media/13GIgrGdslD9oQ/giphy.gif",
-            "description": "someone intensely typing at a computer",
-        },
-        "waiting": {
-            "url": "https://media.giphy.com/media/l0HlBO7eyXzSZkJri/giphy.gif",
-            "description": "waiting patiently",
-        },
-        "popcorn": {
-            "url": "https://media.giphy.com/media/tyqcJoNjNv0Fq/giphy.gif",
-            "description": "watching drama with popcorn",
-        },
-        "laugh": {
-            "url": "https://media.giphy.com/media/10JhviFuU2gWD6/giphy.gif",
-            "description": "laughing hard",
-        },
-        "thumbs_up": {
-            "url": "https://media.giphy.com/media/111ebonMs90YLu/giphy.gif",
-            "description": "quick approval",
-        },
-        "mind_blown": {
-            "url": "https://media.giphy.com/media/26ufdipQqU2lhNA4g/giphy.gif",
-            "description": "mind blown",
-        },
+    GIF_QUERY_EXAMPLES = {
+        "typing": "typing furiously",
+        "waiting": "waiting patiently",
+        "popcorn": "popcorn drama",
+        "laugh": "laughing hard",
+        "thumbs_up": "thumbs up approval",
+        "mind_blown": "mind blown reaction",
     }
 
     def __init__(self, bot):
@@ -360,6 +342,7 @@ class EventHandler(commands.Cog):
 
         action = str(decision.get("action", "none")).lower()
         logging.info("Reply decision result. message_id=%s action=%s decision=%s", message.id, action, decision)
+        direct_interaction = force_reply or self._is_direct_interaction(message, settings)
         if action == "reply":
             await self._generate_and_send_reply(
                 message,
@@ -382,7 +365,14 @@ class EventHandler(commands.Cog):
                     decision.get("reaction"),
                 )
         elif action == "gif":
-            await self._send_gif_decision(message, settings, decision)
+            sent = await self._send_gif_decision(message, settings, decision)
+            if not sent and direct_interaction:
+                await self._generate_and_send_reply(
+                    message,
+                    settings,
+                    chain_messages=chain_messages,
+                    long_typing=long_typing,
+                )
 
     def _reply_chain_key(self, message: discord.Message) -> tuple:
         return (str(message.guild.id), str(message.channel.id), str(message.author.id))
@@ -667,9 +657,27 @@ class EventHandler(commands.Cog):
             logging.info("Decision model skipped for command message. message_id=%s", message.id)
             return {"action": "none"}
 
-        # Bypass conditions
-        if force_reply or self._is_direct_interaction(message, settings):
+        direct_interaction = force_reply or self._is_direct_interaction(message, settings)
+        gifs_available = self._gifs_available(settings)
+        direct_gif_candidate = direct_interaction and self._direct_interaction_might_want_gif(
+            message,
+            chain_messages=chain_messages,
+            long_typing=long_typing,
+        )
+
+        if direct_interaction and not (gifs_available and direct_gif_candidate):
             logging.info(f"Bypassing decision model for message {message.id} due to direct interaction.")
+            return {"action": "reply"}
+
+        if direct_interaction and not self._decision_llm_enabled(settings):
+            gif_query = self._explicit_gif_query(message, chain_messages=chain_messages)
+            if gifs_available and gif_query:
+                return {
+                    "action": "gif",
+                    "gif_query": gif_query,
+                    "caption": "",
+                }
+            logging.info("Decision model disabled for direct interaction. message_id=%s", message.id)
             return {"action": "reply"}
 
         if not self._decision_llm_enabled(settings):
@@ -694,39 +702,10 @@ class EventHandler(commands.Cog):
             decision_context, _ = await self.bot.context_manager.build_context(message, model_name=decision_model)
         decision_context = self._with_message_chain_context(decision_context, chain_messages, long_typing=long_typing)
         
-        decision_prompt = """
-        You are a decision-making model for a Discord bot.
-        Based on the provided context, decide if the bot should reply, react with an emoji, send a GIF, or do nothing.
-        The final user message is the only live message to judge; earlier conversation history is background context only.
-        If a current same-user message chain note is present, treat that chain as the live message to judge.
-        The bot should reply if it's directly addressed, asked a question, or can provide a meaningful contribution.
-        The bot should react if the message is emotional, a simple acknowledgement is needed, or contains engaging media.
-        The bot may send a GIF only when it is clearly funny, logical, and low-risk for the current context.
-        Do not send GIFs for serious, sensitive, sad, medical, legal, financial, or moderation-related contexts.
-        If a long-typing note is present, you may choose a light joke or a typing/waiting GIF if it fits.
-        Otherwise, the bot should do nothing.
-
-        Available GIF keys:
-        typing: someone intensely typing at a computer
-        waiting: waiting patiently
-        popcorn: watching drama with popcorn
-        laugh: laughing hard
-        thumbs_up: quick approval
-        mind_blown: mind blown
-        
-        Respond with a single JSON object with four keys:
-        1. "action": a string, either "reply", "react", "gif", or "none".
-        2. "reaction": a string containing a single emoji if the action is "react", otherwise null.
-           If an Available Server Emojis block is present, you may use one of those custom emojis.
-           For custom emoji reactions, return either its message_format (<:name:id> or <a:name:id>) or reaction_format (name:id).
-        3. "gif_key": one available GIF key if the action is "gif", otherwise null.
-        4. "caption": a short caption if the action is "gif" and text would improve it, otherwise null.
-        
-        Example: {"action": "reply", "reaction": null, "gif_key": null, "caption": null}
-        Example: {"action": "react", "reaction": "👍", "gif_key": null, "caption": null}
-        Example: {"action": "gif", "reaction": null, "gif_key": "typing", "caption": "bro is writing chapter 4"}
-        Example: {"action": "none", "reaction": null, "gif_key": null, "caption": null}
-        """
+        decision_prompt = self._decision_prompt(
+            gifs_available=gifs_available,
+            direct_interaction=direct_interaction,
+        )
         
         decision_context[0]["content"] = decision_prompt
 
@@ -780,13 +759,107 @@ class EventHandler(commands.Cog):
             if action == "reply":
                 return {"action": "reply"}
             if action == "react" and reaction:
+                if direct_interaction:
+                    return {"action": "reply"}
                 return {"action": "react", "reaction": reaction}
             if action == "gif":
-                return self._normalize_gif_decision(decision_json, settings)
+                gif_decision = self._normalize_gif_decision(decision_json, settings)
+                if gif_decision.get("action") == "gif":
+                    return gif_decision
+                if direct_interaction:
+                    return {"action": "reply"}
+                return {"action": "none"}
+            if direct_interaction:
+                return {"action": "reply"}
             return {"action": "none"}
         except (json.JSONDecodeError, KeyError):
             logging.exception(f"Failed to parse decision JSON: {response.choices[0].message.content}")
             return {"action": "none"}
+
+    def _decision_prompt(self, *, gifs_available: bool, direct_interaction: bool) -> str:
+        gif_examples = ", ".join(self.GIF_QUERY_EXAMPLES.values())
+        if gifs_available:
+            gif_guidance = f"""
+        The bot may send a GIPHY GIF only when a visual reaction is clearly better than text, funny or expressive, logical for the current context, and low-risk.
+        Use only GIPHY by returning a short GIPHY search query. The bot will send the best result from GIPHY Search.
+        Do not send GIFs for serious, sensitive, sad, medical, legal, financial, political, sexual, violent, hateful, self-harm, or moderation-related contexts.
+        If a long-typing note is present, you may choose a light joke or a typing/waiting GIF if it fits.
+        GIF search query rules: 2 to 6 common words, max 50 characters, no usernames, no Discord mentions, no private details, no URLs. For short reactions, include the word "reaction"; for example, "lol wtf reaction".
+        GIF messages are URL-only. Do not add captions or explanatory text.
+        Useful query examples: {gif_examples}.
+        """
+            gif_action_line = '1. "action": a string, either "reply", "react", "gif", or "none".'
+            gif_query_line = '3. "gif_query": a short GIPHY search query if the action is "gif", otherwise null.'
+            gif_example = '        Example: {"action": "gif", "reaction": null, "gif_query": "typing furiously", "caption": null}'
+        else:
+            gif_guidance = """
+        GIF sending is unavailable because GIPHY is not configured or GIFs are disabled. Do not choose the "gif" action.
+        """
+            gif_action_line = '1. "action": a string, either "reply", "react", or "none".'
+            gif_query_line = '3. "gif_query": null.'
+            gif_example = ""
+
+        direct_guidance = ""
+        if direct_interaction:
+            direct_guidance = """
+        Direct interaction note: the bot is directly addressed. Choose "reply" unless the user explicitly asked for a GIF and a GIF would satisfy the request. Do not choose "none" for direct interactions.
+        """
+
+        return f"""
+        You are a decision-making model for a Discord bot.
+        Based on the provided context, decide if the bot should reply, react with an emoji, send a GIF, or do nothing.
+        The final user message is the only live message to judge; earlier conversation history is background context only.
+        If a current same-user message chain note is present, treat that chain as the live message to judge.
+        The bot should reply if it's directly addressed, asked a question, or can provide a meaningful contribution.
+        The bot should react if the message is emotional, a simple acknowledgement is needed, or contains engaging media.
+        Otherwise, the bot should do nothing.
+        {direct_guidance}
+        {gif_guidance}
+        Respond with a single JSON object with four keys:
+        {gif_action_line}
+        2. "reaction": a string containing a single emoji if the action is "react", otherwise null.
+           If an Available Server Emojis block is present, you may use one of those custom emojis.
+           For custom emoji reactions, return either its message_format (<:name:id> or <a:name:id>) or reaction_format (name:id).
+        {gif_query_line}
+        4. "caption": always null. GIF replies are URL-only.
+
+        Example: {{"action": "reply", "reaction": null, "gif_query": null, "caption": null}}
+        Example: {{"action": "react", "reaction": "👍", "gif_query": null, "caption": null}}
+{gif_example}
+        Example: {{"action": "none", "reaction": null, "gif_query": null, "caption": null}}
+        """
+
+    def _direct_interaction_might_want_gif(
+        self,
+        message: discord.Message,
+        *,
+        chain_messages: list = None,
+        long_typing: bool = False,
+    ) -> bool:
+        if long_typing:
+            return True
+
+        for chain_message in chain_messages or [message]:
+            if re.search(r"\b(?:gif|giphy|reaction gif|meme)\b", chain_message.content or "", flags=re.IGNORECASE):
+                return True
+        return False
+
+    def _explicit_gif_query(self, message: discord.Message, *, chain_messages: list = None) -> str:
+        content = " ".join((item.content or "") for item in (chain_messages or [message])[-3:])
+        content = re.sub(rf"<@!?{getattr(self.bot.user, 'id', '')}>", " ", content)
+
+        patterns = [
+            r"\b(?:send|show|give|drop|find|post)\s+(?:me\s+)?(?:a\s+)?(?:giphy\s+)?gif(?:\s+(?:of|for|about|with)\s+)?(.+)$",
+            r"\b(?:gif|giphy)\s+(?:of|for|about|with)\s+(.+)$",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, content, flags=re.IGNORECASE)
+            if match:
+                query = self._sanitize_gif_query(match.group(1))
+                if query:
+                    return query
+
+        return self._sanitize_gif_query(content)
 
     async def _update_counters_and_triggers(self, message: discord.Message, settings: dict):
         guild_id = str(message.guild.id)
@@ -998,39 +1071,61 @@ class EventHandler(commands.Cog):
         )
 
     async def _send_gif_decision(self, message: discord.Message, settings: dict, decision: dict):
-        gif_key = decision.get("gif_key")
-        gif = self.GIF_LIBRARY.get(gif_key)
-        if not gif:
-            logging.warning(f"Decision model selected unknown GIF key '{gif_key}' for message {message.id}.")
-            return
+        gif_query = decision.get("gif_query")
+        if not gif_query:
+            logging.warning("Decision model selected GIF without a query for message %s.", message.id)
+            return False
 
-        caption = self._sanitize_gif_caption(decision.get("caption"))
-        content = gif["url"]
-        if caption:
-            content = f"{caption}\n{content}"
+        giphy_client = getattr(self.bot, "giphy_client", None)
+        if not giphy_client or not getattr(giphy_client, "enabled", False):
+            logging.info("Skipping GIF send because GIPHY is not configured. message_id=%s", message.id)
+            return False
 
         try:
+            async with message.channel.typing():
+                gif = await giphy_client.search_gif(gif_query, user_key=str(message.author.id))
+            if not gif:
+                logging.info("No GIPHY result found. message_id=%s query=%r", message.id, gif_query)
+                return False
+
+            content = gif.url
+
             await message.reply(
                 content,
                 mention_author=False,
                 allowed_mentions=discord.AllowedMentions(users=False, roles=False, everyone=False, replied_user=False),
             )
+            await giphy_client.register_sent(gif, user_key=str(message.author.id))
             self._mark_bot_involved(message)
+            logging.info(
+                "GIPHY GIF sent. message_id=%s gif_id=%s title=%r query=%r",
+                message.id,
+                gif.id,
+                gif.title,
+                gif_query,
+            )
+            return True
         except discord.HTTPException as e:
-            logging.warning(f"Failed to send GIF '{gif_key}' for message {message.id}: {e}")
+            logging.warning("Failed to send GIPHY GIF for message %s query=%r: %s", message.id, gif_query, e)
+            return False
 
     def _normalize_gif_decision(self, decision_json: dict, settings: dict) -> dict:
-        if not self._gifs_enabled(settings):
+        if not self._gifs_available(settings):
             return {"action": "none"}
 
-        gif_key = str(decision_json.get("gif_key") or "").strip().lower()
-        if gif_key not in self.GIF_LIBRARY:
+        gif_query = (
+            decision_json.get("gif_query")
+            or decision_json.get("query")
+            or self.GIF_QUERY_EXAMPLES.get(str(decision_json.get("gif_key") or "").strip().lower())
+        )
+        gif_query = self._sanitize_gif_query(gif_query)
+        if not gif_query:
             return {"action": "none"}
 
         return {
             "action": "gif",
-            "gif_key": gif_key,
-            "caption": self._sanitize_gif_caption(decision_json.get("caption")),
+            "gif_query": gif_query,
+            "caption": "",
         }
 
     def _normalize_reaction_emoji(self, reaction, guild: discord.Guild = None):
@@ -1078,6 +1173,42 @@ class EventHandler(commands.Cog):
         )
         return self._coerce_bool(value, default=True)
 
+    def _gifs_available(self, settings: dict) -> bool:
+        giphy_client = getattr(self.bot, "giphy_client", None)
+        return self._gifs_enabled(settings) and bool(giphy_client and getattr(giphy_client, "enabled", False))
+
+    def _sanitize_gif_query(self, query: str, max_length: int = 50) -> str:
+        query = str(query or "").strip()
+        if not query:
+            return ""
+
+        query = re.sub(r"https?://\S+", " ", query)
+        query = re.sub(r"<@!?\d+>|<@&\d+>|<#\d+>", " ", query)
+        query = re.sub(r"@(?:everyone|here)\b", " ", query, flags=re.IGNORECASE)
+        query = re.sub(r"\b(?:please|pls|send|show|give|drop|find|post|me|a|an|gif|giphy)\b", " ", query, flags=re.IGNORECASE)
+        query = re.sub(r"\s+", " ", query).strip(" .,:;!?\"'")
+        if len(query) > max_length:
+            query = query[:max_length].rsplit(" ", 1)[0].strip() or query[:max_length].strip()
+
+        if self._has_blocked_gif_query_term(query):
+            return ""
+        return query
+
+    def _has_blocked_gif_query_term(self, query: str) -> bool:
+        blocked_terms = (
+            "porn",
+            "nude",
+            "nsfw",
+            "gore",
+            "rape",
+            "suicide",
+            "self harm",
+            "nazi",
+            "hitler",
+        )
+        normalized = f" {str(query or '').lower()} "
+        return any(f" {term} " in normalized for term in blocked_terms)
+
     def _sanitize_gif_caption(self, caption: str, max_length: int = 180) -> str:
         caption = str(caption or "").strip()
         if not caption:
@@ -1098,6 +1229,7 @@ class EventHandler(commands.Cog):
             getattr(self.bot.config, "OPENAI_API_KEY", None),
             getattr(self.bot.config, "GEMINI_API_KEY", None),
             getattr(self.bot.config, "ANTHROPIC_API_KEY", None),
+            getattr(self.bot.config, "GIPHY_API_KEY", None),
         ]
         for value in sensitive_values:
             if value:
@@ -1128,7 +1260,11 @@ class EventHandler(commands.Cog):
         tool_messages = list(messages)
         tool_messages.append({
             "role": "system",
-            "content": "Final Discord replies must be plain message text only. Do not return JSON, do not include `content` or `reactions` fields, and do not list available tools."
+            "content": (
+                "Final Discord replies must be plain message text only. Do not return JSON, do not include "
+                "`content` or `reactions` fields, and do not list available tools. If you used search_giphy_gif, "
+                "send only the returned recommended_reply or GIPHY URL as the final Discord message, with no caption or extra text."
+            )
         })
         tools = tool_manager.tool_definitions()
         logging.info(
@@ -1211,6 +1347,15 @@ class EventHandler(commands.Cog):
                         executed_tool_results[tool_signature] = result
                         logging.info(f"Executed Discord tool '{tool_name}' for message {origin_message.id}.")
                 tool_messages.append(tool_manager.tool_result_message(tool_call, result))
+                if tool_name == "search_giphy_gif" and result.get("ok"):
+                    gif_reply = self._giphy_tool_reply(result)
+                    if gif_reply:
+                        logging.info(
+                            "Returning exact GIPHY tool result without another LLM round. message_id=%s gif_id=%s",
+                            origin_message.id,
+                            result.get("gif_id"),
+                        )
+                        return gif_reply
 
             if unavailable_tool_call:
                 forced_stop_reason = "Unavailable tool call rejected because the relevant context is already preloaded. Use the existing context to write one final Discord reply now."
@@ -1242,6 +1387,17 @@ class EventHandler(commands.Cog):
         })
         response = await self.bot.llm_provider.create_completion(model=model, messages=tool_messages)
         return self._response_content(response)
+
+    def _giphy_tool_reply(self, result: dict) -> str:
+        if not isinstance(result, dict):
+            return ""
+
+        reply = str(result.get("recommended_reply") or "").strip()
+        if reply:
+            return reply
+
+        url = str(result.get("url") or "").strip()
+        return url
 
     def _tools_enabled(self, settings: dict) -> bool:
         if not getattr(self.bot.config, "TOOLS_ENABLED", True):
