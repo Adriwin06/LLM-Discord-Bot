@@ -5,6 +5,8 @@ from discord import app_commands
 import logging
 import os
 import sys
+import io
+import json
 from typing import Literal, Optional
 from .utilities import AdvancedPaginationView, MessageChunker
 
@@ -139,6 +141,55 @@ class AdminCommands(commands.Cog):
         if value is None:
             return default
         return bool(value)
+
+    def _format_context_messages_for_markdown(
+        self,
+        context,
+        *,
+        truncate_message_bodies: bool = False,
+        include_full_image_data: bool = True
+    ) -> str:
+        context_text = ""
+        for item in context:
+            role = item.get("role", "unknown")
+            content = item.get("content", "")
+
+            if role == "system":
+                context_text += "**[SYSTEM MESSAGE]**\n"
+            elif role == "user":
+                context_text += "**[USER MESSAGE]**\n"
+            elif role == "assistant":
+                context_text += "**[BOT (YOU)]**\n"
+            elif role == "bot (you)":
+                context_text += "**[BOT (YOU)]**\n"
+            else:
+                context_text += f"**[{role.upper()}]**\n"
+
+            content_text = ""
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict):
+                        if part.get("type") == "text":
+                            content_text += part.get("text", "") + "\n"
+                        elif part.get("type") == "image_url":
+                            image_url = part.get("image_url", {}).get("url", "")
+                            if image_url.startswith("data:image/") and not include_full_image_data:
+                                content_text += f"🖼️ [Image: {image_url[:50]}...] (Base64 encoded)\n"
+                            else:
+                                content_text += f"🖼️ [Image: {image_url}]\n"
+                        else:
+                            content_text += f"📎 [Content: {part.get('type', 'unknown')}]\n"
+                    else:
+                        content_text += str(part) + "\n"
+            else:
+                content_text = str(content)
+
+            if truncate_message_bodies and len(content_text) > 500:
+                context_text += f"{content_text[:500]}...\n\n"
+            else:
+                context_text += f"{content_text}\n\n"
+
+        return context_text
 
     @channel_group.command(name="override", description="Override global settings for a specific channel.")
     @app_commands.checks.has_permissions(administrator=True)
@@ -652,11 +703,22 @@ class AdminCommands(commands.Cog):
             await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
 
     @context_group.command(name="show", description="Show the complete context that would be sent to the LLM.")
+    @app_commands.describe(
+        message_id="Optional message ID to build context from. Defaults to the latest non-bot message.",
+        raw_format="Show the raw JSON format as sent to the AI, without formatted role headers.",
+        show_gif_frames="Display extracted GIF frames as image attachments, when present.",
+        no_truncate="Display full formatted content instead of shortening each context message.",
+        json_file="Send the built context as a JSON attachment.",
+        markdown_file="Send the formatted context as a Markdown attachment."
+    )
     @app_commands.checks.has_permissions(administrator=True)
     async def show_context(self, interaction: discord.Interaction, 
                           message_id: str = None,
                           raw_format: bool = False,
                           show_gif_frames: bool = False,
+                          no_truncate: bool = False,
+                          json_file: bool = False,
+                          markdown_file: bool = False,
                           include_bot_identity: bool = True,
                           include_channel_summary: bool = True,
                           include_user_profiles: bool = True,
@@ -671,6 +733,9 @@ class AdminCommands(commands.Cog):
         - message_id: Optional message ID to build context from (defaults to latest message)
         - raw_format: Show the raw JSON format as sent to the AI, without formatting
         - show_gif_frames: Display actual GIF frames as images (may send multiple messages)
+        - no_truncate: Display the full context in Discord embeds instead of truncating message bodies
+        - json_file: Send the built context as a JSON attachment
+        - markdown_file: Send the formatted context as a Markdown attachment
         - Various include flags to control what context components to show
         """
         await interaction.response.defer(ephemeral=True)
@@ -713,57 +778,14 @@ class AdminCommands(commands.Cog):
             # Format the context for display
             if raw_format:
                 # Show raw JSON format as sent to the AI
-                import json
                 context_text = json.dumps(context, indent=2, ensure_ascii=False)
             else:
                 # Show formatted version with role headers
-                context_text = ""
-                for item in context:
-                    role = item.get("role", "unknown")
-                    content = item.get("content", "")
-                    
-                    # Add role header
-                    if role == "system":
-                        context_text += "**[SYSTEM MESSAGE]**\n"
-                    elif role == "user":
-                        context_text += "**[USER MESSAGE]**\n"
-                    elif role == "assistant":
-                        context_text += "**[BOT (YOU)]**\n"
-                    elif role == "bot (you)":
-                        context_text += "**[BOT (YOU)]**\n"
-                    else:
-                        context_text += f"**[{role.upper()}]**\n"
-                    
-                    # Handle content that can be either string or list of content parts
-                    content_text = ""
-                    if isinstance(content, list):
-                        # Handle structured content (e.g., text + images from GIF extraction)
-                        for part in content:
-                            if isinstance(part, dict):
-                                if part.get("type") == "text":
-                                    content_text += part.get("text", "") + "\n"
-                                elif part.get("type") == "image_url":
-                                    image_url = part.get("image_url", {}).get("url", "")
-                                    if image_url.startswith("data:image/"):
-                                        # Base64 image data - show as placeholder
-                                        content_text += f"🖼️ [Image: {image_url[:50]}...] (Base64 encoded)\n"
-                                    else:
-                                        # Regular URL - show the URL
-                                        content_text += f"🖼️ [Image: {image_url}]\n"
-                                else:
-                                    # Other content types
-                                    content_text += f"📎 [Content: {part.get('type', 'unknown')}]\n"
-                            else:
-                                content_text += str(part) + "\n"
-                    else:
-                        # Regular string content
-                        content_text = str(content)
-                    
-                    # Add content with some formatting
-                    if len(content_text) > 500:
-                        context_text += f"{content_text[:500]}...\n\n"
-                    else:
-                        context_text += f"{content_text}\n\n"
+                context_text = self._format_context_messages_for_markdown(
+                    context,
+                    truncate_message_bodies=not no_truncate,
+                    include_full_image_data=no_truncate,
+                )
 
             common_fields = [
                 {
@@ -789,14 +811,65 @@ class AdminCommands(commands.Cog):
                     "value": (
                         f"Model: {settings.get('model', 'N/A')}\n"
                         f"Messages: {len(context)} total\n"
-                        f"Context Length: {len(context_text)} chars"
+                        f"Context Length: {len(context_text)} chars\n"
+                        f"Display Truncation: {'Off' if no_truncate or raw_format else 'On'}"
                     ),
                     "inline": False
                 }
             ]
 
+            context_json = None
+            if json_file:
+                context_json = json.dumps(context, indent=2, ensure_ascii=False)
+                context_bytes = context_json.encode("utf-8")
+                context_file = discord.File(
+                    io.BytesIO(context_bytes),
+                    filename=f"llm_context_{target_message.id}.json"
+                )
+                await interaction.followup.send(
+                    content=(
+                        f"JSON context attachment for message `{target_message.id}` "
+                        f"({len(context)} messages, {len(context_bytes)} bytes)."
+                    ),
+                    file=context_file,
+                    ephemeral=True
+                )
+
+            if markdown_file:
+                context_markdown = self._format_context_messages_for_markdown(
+                    context,
+                    truncate_message_bodies=False,
+                    include_full_image_data=True,
+                )
+                markdown_text = (
+                    "# LLM Context Debug\n\n"
+                    "## Source Message\n"
+                    f"- ID: {target_message.id}\n"
+                    f"- Author: {target_message.author.display_name}\n"
+                    f"- Channel: #{target_message.channel.name}\n\n"
+                    "## Settings Used\n"
+                    f"- Model: {settings.get('model', 'N/A')}\n"
+                    f"- Messages: {len(context)} total\n"
+                    f"- Context Length: {len(context_markdown)} chars\n\n"
+                    "## Context\n\n"
+                    f"{context_markdown}"
+                )
+                markdown_bytes = markdown_text.encode("utf-8")
+                markdown_attachment = discord.File(
+                    io.BytesIO(markdown_bytes),
+                    filename=f"llm_context_{target_message.id}.md"
+                )
+                await interaction.followup.send(
+                    content=(
+                        f"Markdown context attachment for message `{target_message.id}` "
+                        f"({len(context)} messages, {len(markdown_bytes)} bytes)."
+                    ),
+                    file=markdown_attachment,
+                    ephemeral=True
+                )
+
             if raw_format:
-                raw_pages = MessageChunker.split_content(context_text, max_length=1800)
+                raw_pages = MessageChunker.split_content(context_json or context_text, max_length=1800)
                 page_descriptions = [f"```json\n{page}\n```" for page in raw_pages]
             else:
                 page_descriptions = MessageChunker.split_content(context_text, max_length=1800)
@@ -861,7 +934,6 @@ class AdminCommands(commands.Cog):
                                 try:
                                     # Convert base64 to bytes for Discord file upload
                                     import base64
-                                    import io
                                     
                                     # Extract the base64 data (remove data:image/jpeg;base64, prefix)
                                     if "," in frame_data:

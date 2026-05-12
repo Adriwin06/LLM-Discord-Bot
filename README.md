@@ -245,7 +245,7 @@ Commands are loaded from `bot/cogs/*.py` and synced globally by `main.py`.
 | Command | Permission | Parameters | Description |
 | --- | --- | --- | --- |
 | `/context reset` | Administrator | `target` = `channel` or `guild` | Clear stored summary context for the current channel or guild. |
-| `/context show` | Administrator | `message_id`, `raw_format`, `show_gif_frames`, `include_bot_identity`, `include_channel_summary`, `include_user_profiles`, `include_conversation_history`, `include_reply_chain`, `include_current_message`, `include_server_emojis` | Show the exact context that would be sent to the LLM. |
+| `/context show` | Administrator | `message_id`, `raw_format`, `show_gif_frames`, `no_truncate`, `json_file`, `markdown_file`, `include_bot_identity`, `include_channel_summary`, `include_user_profiles`, `include_conversation_history`, `include_reply_chain`, `include_current_message`, `include_server_emojis` | Show the exact context that would be sent to the LLM. Use `no_truncate` for full embed display, `json_file` for a JSON attachment, and `markdown_file` for a readable Markdown attachment. |
 | `/summary view` | Manage Messages | `channel` | View a channel summary. |
 | `/summary update` | Manage Messages | `channel` | Force a channel summary update. |
 | `/summary clear` | Administrator | `channel` | Clear one channel summary and reset counters. |
