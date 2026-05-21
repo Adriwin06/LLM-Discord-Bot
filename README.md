@@ -1,22 +1,50 @@
 # LLM Discord Bot
 
-Python Discord bot powered by LiteLLM. It can answer messages, react, send GIPHY GIFs, keep channel summaries and user profiles, process attachments, and let the main LLM call read-only Discord/GIPHY/web tools when extra context is needed.
+A Discord-native AI companion that can read the room, remember the server, understand attachments, use tools, send GIFs, summarize channels, profile users, and run a full leveling system. This is not a thin "ask an LLM" slash command wrapper. It is an always-on Discord bot designed to participate naturally in real conversations while still giving admins control over models, context, media, memory, and behavior.
+
+Powered by [LiteLLM](https://github.com/BerriAI/litellm), the bot can run against many model providers, including Gemini, OpenAI, Anthropic, Mistral, Ollama-compatible local models, and other LiteLLM-supported backends. It uses separate models for fast conversation decisions and high-quality final replies, so it can stay responsive without wasting the main model on every message.
+
+## Why This Bot Stands Out
+
+- **It can decide when to speak.** The decision model can watch ordinary messages and choose whether to reply, react, send a GIF, or stay silent, so the bot feels less like a command endpoint and more like a server participant.
+- **It remembers what matters.** Automatic channel summaries and AI-generated user profiles summaries give the model continuity across long-running communities without stuffing every old message into context.
+- **It understands rich Discord context.** Replies are built from server emojis, bot identity, channel summaries, mentioned-channel summaries, user notes, recent messages, reply chains, attachments, and the current message.
+- **It can inspect the server through tools.** The main model can use read-only Discord tools to resolve channels, search messages, fetch recent history, inspect user profiles, and pull stored summaries when it needs more context.
+- **It handles real files, not just text.** Images, GIFs, audio, video, PDFs, Office documents, code, logs, CSVs, JSON, Markdown, and other text files can be processed before the model answers.
+- **It has web and GIF superpowers.** The model can search the public web, extract readable web page text, search GIPHY, and send canonical GIF URLs when that is the right response.
+- **It is adminable in production.** Slash commands cover model settings, channel overrides, blacklists, summaries, profiles, media config, retries, backups, reloads, restart, and diagnostics.
+- **It includes community features.** Leveling, voice XP, leaderboards, prestige settings, role rewards, playful insults, compliments, mock commands, and avatar roasts are built in.
+
+## Capability Snapshot
+
+| Area | What it can do |
+| --- | --- |
+| Conversation | Mentions, replies, ambient decisions, reactions, GIF responses, retry/regenerate. |
+| Memory | Channel summaries, mentioned-channel recall, manual user notes, AI user profiles. |
+| Context | Recent history, reply chains, server emojis, bot identity, media context, command-specific prompts. |
+| Tools | Channel lookup, message search, message fetch, recent message fetch, profile lookup, GIPHY search, web search, web page extraction. |
+| Media | Vision inputs, OCR fallback, animated GIF frames, audio transcription, video frame/audio extraction, PDFs, Office files, plain text/code files. |
+| Admin | Per-server and per-channel model/behavior settings, LLM blacklist, media tuning, context inspection, backups, reloads, restart. |
+| Community | XP, voice XP, levels, leaderboards, level roles, prestige roles, fun commands. |
+
+## Example Things It Can Handle
+
+- "What did we decide in #dev last week?" The model can resolve the channel, read its summary, search recent visible messages, and answer with context.
+- "Can you explain this video?" The bot can extract audio, transcribe it locally, sample frames, OCR text from frames when useful, and pass the result to the model.
+- "Send the perfect reaction GIF." It can turn the conversation into a concise GIPHY query and reply with a canonical GIF URL.
+- "What does this PDF say?" It can extract PDF text or use direct PDF support when the selected model provides it.
+- "What has this user been talking about lately?" Admins can inspect manual notes, AI profile summaries, roles, activities, and profile metadata.
+- "Retry that answer." The bot can delete and regenerate its last recorded generated reply in the channel.
+- "Show me exactly what the model saw." `/context show` exposes the assembled prompt/context, with JSON or Markdown export options.
+
+## How It Works At A High Level
 
 The codebase uses a two-model flow:
 
-- `MAIN_LLM_MODEL` generates final Discord replies and LLM-driven command output.
-- `DECISION_LLM_MODEL` decides whether an ordinary message should be ignored, answered, reacted to, or answered with a GIF.
+- `DECISION_LLM_MODEL` cheaply decides whether an ordinary message should be ignored, answered, reacted to, or answered with a GIF.
+- `MAIN_LLM_MODEL` generates final Discord replies, command output, summaries, profiles, and tool-assisted answers.
 
-## What This Bot Does
-
-- Replies to direct mentions and replies to the bot.
-- Optionally makes ambient decisions on normal messages with the decision model.
-- Builds a structured context from prompts, bot identity, server emojis, channel summaries, user profile notes, recent messages, reply chains, and the current message.
-- Maintains automatic channel summaries and AI-generated user profile summaries.
-- Processes images, GIFs, audio, video, PDFs, Office files, and text files before sending context to the model.
-- Exposes read-only local tools to the main model for channel lookup, message search, user profile lookup, web search, and web page extraction.
-- Provides slash commands for administration, summaries, profiles, media settings, leveling, fun commands, retries, backups, reloads, and restart.
-- Stores runtime state in JSON files and creates timestamped backups.
+When the bot chooses to answer, it builds a structured context package, optionally lets the main model call read-only local tools, sanitizes the final response, and sends the result back to Discord.
 
 ## Requirements
 
