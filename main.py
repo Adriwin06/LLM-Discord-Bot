@@ -151,9 +151,13 @@ class LLMDiscordBot(commands.Bot):
     @tasks.loop(hours=Config().BACKUP_INTERVAL_HOURS)
     async def backup_task(self):
         """Background task to automatically back up data files."""
-        logging.info("Starting automatic backup...")
-        await self.store.backup_data()
-        logging.info("Automatic backup completed.")
+        try:
+            logging.info("Starting automatic backup...")
+            await self.store.backup_data()
+            logging.info("Automatic backup completed.")
+        except Exception as e:
+            # A transient failure must not kill the tasks.loop permanently.
+            logging.error(f"Automatic backup failed; will retry next interval: {e}")
 
     @backup_task.before_loop
     async def before_backup_task(self):

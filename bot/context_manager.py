@@ -783,6 +783,16 @@ class ContextManager:
             return False
         return default
 
+    def _truncate_document_text(self, text: str, section_config: dict) -> str:
+        """Cap extracted document text so a large file cannot blow up the LLM context."""
+        max_chars = self._safe_int(
+            (section_config or {}).get("max_context_chars"),
+            default=20000,
+            minimum=1000,
+            maximum=200000,
+        )
+        return self._truncate_context_text(text, max_chars)
+
     def _truncate_context_text(self, text: str, max_chars: int) -> str:
         text = str(text or "").strip()
         if len(text) <= max_chars:
@@ -2099,7 +2109,7 @@ class ContextManager:
             is_likely_gif = (
                 mime_type == "image/gif" or 
                 file_ext == "gif" or 
-                'gif' in attachment_url.lower() or
+                '.gif' in attachment_url.lower() or
                 'tenor.com' in attachment_url.lower() or
                 'giphy.com' in attachment_url.lower() or
                 '?format=gif' in attachment_url.lower()
@@ -2362,7 +2372,8 @@ class ContextManager:
                                             total_frames,
                                             len(frames),
                                         )
-                                        frame_ocr_text = self._ocr_image_frames_text_for_context(
+                                        frame_ocr_text = await asyncio.to_thread(
+                                            self._ocr_image_frames_text_for_context,
                                             ocr_frame_bytes,
                                             attachment.filename,
                                             images_config,
@@ -2379,7 +2390,8 @@ class ContextManager:
                                     else:
                                         # Fallback to treating as static image
                                         logging.warning("Animated GIF extraction produced no frames; falling back to image. filename=%s", attachment.filename)
-                                        return self._vision_image_content_parts(
+                                        return await asyncio.to_thread(
+                            self._vision_image_content_parts,
                                             url=attachment.url,
                                             file_bytes=file_bytes,
                                             mime_type=mime_type,
@@ -2390,7 +2402,8 @@ class ContextManager:
                                 else:
                                     # Static GIF, treat as regular image
                                     logging.info("GIF is not animated; sending as static image. filename=%s", attachment.filename)
-                                    return self._vision_image_content_parts(
+                                    return await asyncio.to_thread(
+                            self._vision_image_content_parts,
                                         url=attachment.url,
                                         file_bytes=file_bytes,
                                         mime_type=mime_type,
@@ -2413,7 +2426,8 @@ class ContextManager:
                         else:
                             # GIF frame extraction disabled, treat as static image
                             logging.info("GIF frame extraction disabled; sending as static image. filename=%s", attachment.filename)
-                            return self._vision_image_content_parts(
+                            return await asyncio.to_thread(
+                            self._vision_image_content_parts,
                                 url=attachment.url,
                                 file_bytes=file_bytes,
                                 mime_type=mime_type,
@@ -2424,7 +2438,8 @@ class ContextManager:
                     else:
                         # Regular static image
                         logging.info("Static image will be attached to vision model. filename=%s model=%s", attachment.filename, model_name)
-                        return self._vision_image_content_parts(
+                        return await asyncio.to_thread(
+                            self._vision_image_content_parts,
                             url=attachment.url,
                             file_bytes=file_bytes,
                             mime_type=mime_type,
@@ -2438,7 +2453,7 @@ class ContextManager:
                     if images_config.get("ocr_enabled", True) and TESSERACT_AVAILABLE:
                         try:
                             with Image.open(io.BytesIO(file_bytes)) as img:
-                                ocr_text = pytesseract.image_to_string(img)
+                                ocr_text = await asyncio.to_thread(pytesseract.image_to_string, img)
                                 if ocr_text.strip():
                                     logging.info("Image OCR succeeded. filename=%s chars=%s", attachment.filename, len(ocr_text.strip()))
                                     return f"--- Image OCR Text: {attachment.filename} ---\n{ocr_text.strip()}"
@@ -2530,7 +2545,7 @@ class ContextManager:
                                     else:
                                         text += page_text + "\n"
                         logging.info("PDF text extracted. filename=%s chars=%s", attachment.filename, len(text.strip()))
-                        return f"--- PDF Content: {attachment.filename} ---\n{text.strip()}"
+                        return f"--- PDF Content: {attachment.filename} ---\n{self._truncate_document_text(text, pdf_config)}"
                     except Exception as e:
                         logging.exception("PDF text extraction failed. filename=%s", attachment.filename)
                         return f"[PDF text extraction failed: {attachment.filename} - {str(e)[:50]}...]"
@@ -2570,7 +2585,7 @@ class ContextManager:
                         else:
                             text = "\n".join([para.text for para in doc.paragraphs])
                         logging.info("DOCX text extracted. filename=%s paragraphs=%s chars=%s", attachment.filename, len(doc.paragraphs), len(text.strip()))
-                        return f"--- Document Content: {attachment.filename} ---\n{text.strip()}"
+                        return f"--- Document Content: {attachment.filename} ---\n{self._truncate_document_text(text, office_config)}"
                     
                     elif file_ext == "xlsx":
                         wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
@@ -2582,7 +2597,7 @@ class ContextManager:
                             for row in sheet.iter_rows(values_only=True):
                                 text += ", ".join([str(cell) if cell is not None else "" for cell in row]) + "\n"
                         logging.info("XLSX text extracted. filename=%s sheets=%s chars=%s", attachment.filename, len(wb.sheetnames), len(text.strip()))
-                        return f"--- Excel Content: {attachment.filename} ---\n{text.strip()}"
+                        return f"--- Excel Content: {attachment.filename} ---\n{self._truncate_document_text(text, office_config)}"
                     
                     elif file_ext == "pptx" and PPTX_AVAILABLE:
                         prs = pptx.Presentation(io.BytesIO(file_bytes))
@@ -2594,7 +2609,7 @@ class ContextManager:
                                 if hasattr(shape, "text"):
                                     text += shape.text + "\n"
                         logging.info("PPTX text extracted. filename=%s slides=%s chars=%s", attachment.filename, len(prs.slides), len(text.strip()))
-                        return f"--- PowerPoint Content: {attachment.filename} ---\n{text.strip()}"
+                        return f"--- PowerPoint Content: {attachment.filename} ---\n{self._truncate_document_text(text, office_config)}"
                     elif file_ext == "pptx" and not PPTX_AVAILABLE:
                         logging.info("PPTX processing unavailable because python-pptx is not installed. filename=%s", attachment.filename)
                         return f"[PowerPoint processing unavailable - python-pptx not installed: {attachment.filename}]"
@@ -2630,7 +2645,7 @@ class ContextManager:
                     # Full content read and included as text context for both decision and main models
                     text_content = file_bytes.decode('utf-8', errors='ignore')
                     logging.info("Text file decoded. filename=%s chars=%s", attachment.filename, len(text_content))
-                    return f"--- File Content: {attachment.filename} ---\n{text_content}"
+                    return f"--- File Content: {attachment.filename} ---\n{self._truncate_document_text(text_content, text_config)}"
                 except Exception as e:
                     logging.exception("Text file reading failed. filename=%s", attachment.filename)
                     return f"[Text file reading failed: {attachment.filename} - {str(e)[:50]}...]"
@@ -2688,7 +2703,7 @@ class ContextManager:
                 if url and (
                     'tenor.com' in url.lower() or 
                     'giphy.com' in url.lower() or 
-                    'gif' in url.lower() or
+                    '.gif' in url.lower() or
                     url.endswith('.gif')
                 ):
                     logging.info(f"Processing embedded GIF from URL: {url}")
@@ -2791,8 +2806,11 @@ class ContextManager:
                 if not after_time and message_count >= history_limit:
                     break
             
-            recent_messages.reverse()  # Oldest to newest
-            
+            # channel.history yields newest-first by default but oldest-first when
+            # `after` is set, so only the no-after fetch needs reversing.
+            if not after_time:
+                recent_messages.reverse()  # Oldest to newest
+
             if not recent_messages:
                 logging.info(f"No new messages to summarize for channel {channel_id}.")
                 return

@@ -63,29 +63,67 @@ class LiteLLMProvider:
                     await asyncio.sleep(delay)
                 self.decision_llm_last_call = asyncio.get_event_loop().time()
 
+    def _model_chain(self, model: str) -> list:
+        """Build the ordered list of models to try: the requested model plus configured fallbacks."""
+        if model == self.config.DECISION_LLM_MODEL:
+            fallbacks = self.config.DECISION_LLM_FALLBACK_MODELS
+        else:
+            fallbacks = self.config.MAIN_LLM_FALLBACK_MODELS
+
+        chain = [model]
+        for fallback in fallbacks or []:
+            fallback = (fallback or "").strip()
+            if fallback and fallback not in chain:
+                chain.append(fallback)
+        return chain
+
     async def create_completion(self, model: str, messages: list, **kwargs):
         """
-        Create a completion using the specified model.
-        
+        Create a completion using the specified model, falling back through the
+        configured fallback model chain when a model fails (rate limit, outage, etc.).
+
         Automatically handles:
         - Rate limiting based on model type
         - Provider credential resolution through LiteLLM environment variables
         - Web search capabilities for supported models
         - JSON response format compatibility
-        
+
         Args:
             model: Model identifier (e.g., 'gpt-4o', 'gemini/gemini-1.5-pro')
             messages: List of message dictionaries
             **kwargs: Additional parameters for the completion
-            
+
         Returns:
-            LiteLLM response object or None if error occurred
+            LiteLLM response object or None if every model in the chain failed
         """
-        limiter_type = 'main' if model == self.config.MAIN_LLM_MODEL else 'decision'
-        await self._rate_limit(limiter_type)
         self.last_error = None
+        model_chain = self._model_chain(model)
+
+        for index, attempt_model in enumerate(model_chain):
+            if index:
+                logging.warning(
+                    "Falling back to model %s (attempt %s/%s) after failure: %s",
+                    attempt_model,
+                    index + 1,
+                    len(model_chain),
+                    self.get_last_error_summary(),
+                )
+            response = await self._attempt_completion(attempt_model, messages, kwargs)
+            if response is not None:
+                self.last_error = None
+                return response
+
+        if len(model_chain) > 1:
+            logging.error("All models in the fallback chain failed: %s", model_chain)
+        return None
+
+    async def _attempt_completion(self, model: str, messages: list, kwargs: dict):
+        # Only the dedicated decision model uses the decision limiter; fallback models
+        # and per-guild override models must pace like the main model.
+        limiter_type = 'decision' if model == self.config.DECISION_LLM_MODEL else 'main'
+        await self._rate_limit(limiter_type)
         completion_kwargs = kwargs.copy()
-        
+
         try:
             # Check if model supports web search and add web search options
             request_stats = self._message_stats(messages)
@@ -324,6 +362,22 @@ class LiteLLMProvider:
         message = self.last_error.get("message", "")
         return f"{error_type} from {model}: {message}"
 
+    def get_last_error_summary(self, max_length: int = 200) -> str:
+        """Short single-line version of the last error, safe to surface in chat."""
+        if not self.last_error:
+            return "No provider error was recorded."
+
+        error_type = self.last_error.get("type", "Error")
+        model = self.last_error.get("model", "unknown model")
+        message = str(self.last_error.get("message", "")).strip()
+        first_line = message.splitlines()[0] if message else ""
+        summary = f"{error_type} from {model}"
+        if first_line:
+            summary = f"{summary}: {first_line}"
+        if len(summary) > max_length:
+            summary = summary[:max_length - 3].rstrip() + "..."
+        return summary
+
     def supports_vision(self, model: str) -> bool:
         if not model:
             return False
@@ -401,6 +455,9 @@ class LiteLLMProvider:
             return supports
         except Exception as e:
             logging.debug(f"Could not inspect Ollama model capabilities for {ollama_model}: {e}")
+            # Cache the failure so an unreachable Ollama can't block the event loop
+            # (~2s synchronous probe) on every attachment.
+            self._capability_cache[cache_key] = False
             return None
 
     def supports_audio(self, model: str) -> bool:

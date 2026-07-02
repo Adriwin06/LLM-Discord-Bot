@@ -7,7 +7,7 @@ import json
 import re
 import asyncio
 from collections import OrderedDict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from .utilities import MessageChunker
 
 class EventHandler(commands.Cog):
@@ -17,17 +17,24 @@ class EventHandler(commands.Cog):
         self._processing_lock = asyncio.Lock()
         self._seen_message_ids = OrderedDict()
         self._seen_message_limit = 1000
-        self._summary_tasks = set()
-        self._profile_tasks = set()
+        self._summary_tasks = {}
+        self._profile_tasks = {}
         self._pending_reply_tasks = {}
         self._pending_reply_chains = {}
+        self._processing_reply_chains = {}
+        self._channel_reply_locks = {}
         self._typing_state = {}
         self._last_reply_by_channel = {}
+        self._last_ambient_reply_by_channel = {}
         self._recent_human_activity_by_channel = {}
         self._last_bot_involvement_by_channel = {}
 
     def cog_unload(self):
         for task in self._pending_reply_tasks.values():
+            task.cancel()
+        for task in self._summary_tasks.values():
+            task.cancel()
+        for task in self._profile_tasks.values():
             task.cancel()
 
     @commands.Cog.listener()
@@ -69,6 +76,10 @@ class EventHandler(commands.Cog):
             len(message.embeds or []),
             self.bot.user in message.mentions if self.bot.user else False,
         )
+
+        # discord.py only resolves reply references from its message cache, so replies
+        # to older bot messages (or after a restart) would go undetected without this.
+        await self._resolve_message_reference(message)
 
         # Use lock to prevent race conditions in message processing
         async with self._processing_lock:
@@ -194,7 +205,9 @@ class EventHandler(commands.Cog):
             )
             return
 
-        if self._should_skip_uninvolved_conversation(
+        # Only gate NEW chains on the busy-conversation check; a message that belongs to an
+        # already-pending burst must still be appended so the eventual reply covers it.
+        if not chain and self._should_skip_uninvolved_conversation(
             message,
             settings,
             force_reply=force_reply,
@@ -223,9 +236,17 @@ class EventHandler(commands.Cog):
             chain["settings"] = settings
             chain["force_reply"] = bool(chain.get("force_reply")) or force_reply
         else:
+            messages = [message]
+            processing_chain = self._processing_reply_chains.get(key)
+            if processing_chain and not processing_chain.get("handled"):
+                # A previous burst from this user is still mid-generation; its reply will be
+                # discarded in favor of this newer chain, so carry its unanswered messages
+                # and force_reply flag over instead of losing them.
+                messages = list(processing_chain.get("messages") or []) + [message]
+                force_reply = force_reply or bool(processing_chain.get("force_reply"))
             self._pending_reply_chains[key] = {
                 "started_at": self._utc_now(),
-                "messages": [message],
+                "messages": messages,
                 "latest_message": message,
                 "settings": settings,
                 "force_reply": force_reply,
@@ -245,7 +266,21 @@ class EventHandler(commands.Cog):
 
         task = asyncio.create_task(self._run_debounced_reply_decision(key, message.id, debounce_seconds))
         self._pending_reply_tasks[key] = task
+        task.add_done_callback(lambda done_task, task_key=key: self._discard_reply_task(task_key, done_task))
         logging.debug("Reply decision debounce task scheduled. key=%s latest_message_id=%s", key, message.id)
+
+    def _discard_reply_task(self, key: tuple, task: asyncio.Task):
+        if self._pending_reply_tasks.get(key) is task:
+            self._pending_reply_tasks.pop(key, None)
+
+    async def _resolve_message_reference(self, message: discord.Message):
+        reference = message.reference
+        if not reference or reference.resolved is not None or not reference.message_id:
+            return
+        try:
+            reference.resolved = await message.channel.fetch_message(reference.message_id)
+        except discord.HTTPException:
+            logging.debug("Could not resolve message reference %s.", reference.message_id)
 
     async def _run_debounced_reply_decision(self, key: tuple, latest_message_id: int, debounce_seconds: float):
         try:
@@ -266,12 +301,12 @@ class EventHandler(commands.Cog):
         if not chain or getattr(chain.get("latest_message"), "id", None) != latest_message_id:
             return
 
-        current_task = asyncio.current_task()
-        if self._pending_reply_tasks.get(key) is current_task:
-            self._pending_reply_tasks.pop(key, None)
         self._pending_reply_chains.pop(key, None)
 
         latest_message = chain["latest_message"]
+        # Keep the popped chain visible while it is being processed so a follow-up
+        # message arriving mid-generation can inherit its messages and force_reply.
+        self._processing_reply_chains[key] = chain
         try:
             logging.info(
                 "Running debounced reply decision. latest_message_id=%s chain_count=%s long_typing=%s",
@@ -288,6 +323,9 @@ class EventHandler(commands.Cog):
             )
         except Exception as e:
             logging.error(f"Debounced reply decision failed for message {latest_message.id}: {e}")
+        finally:
+            if self._processing_reply_chains.get(key) is chain:
+                self._processing_reply_chains.pop(key, None)
 
     async def _process_reply_decision(
         self,
@@ -319,51 +357,70 @@ class EventHandler(commands.Cog):
             len(chain_messages),
             long_typing,
         )
-        decision = await self._decide_message_action(
-            message,
-            settings,
-            force_reply=force_reply,
-            chain_messages=chain_messages,
-            long_typing=long_typing,
-        )
-
-        if self._has_pending_newer_chain(message):
-            logging.info(f"Skipping reply/reaction for message {message.id}; a newer same-user message chain is pending.")
-            return
-
-        action = str(decision.get("action", "none")).lower()
-        logging.info("Reply decision result. message_id=%s action=%s decision=%s", message.id, action, decision)
-        direct_interaction = force_reply or self._is_direct_interaction(message, settings)
-        if action == "reply":
-            await self._generate_and_send_reply(
+        # Serialize decisions per channel so simultaneous bursts from different users
+        # cannot produce two overlapping bot replies for the same moment.
+        channel_lock = self._channel_reply_locks.setdefault(self._channel_key(message), asyncio.Lock())
+        async with channel_lock:
+            decision = await self._decide_message_action(
                 message,
                 settings,
+                force_reply=force_reply,
                 chain_messages=chain_messages,
                 long_typing=long_typing,
             )
-        elif action == "react" and decision.get("reaction"):
-            reaction = self._normalize_reaction_emoji(decision["reaction"], message.guild)
-            if not reaction:
-                logging.warning("Decision model returned an unusable reaction for message %s: %r", message.id, decision.get("reaction"))
+
+            if self._has_pending_newer_chain(message):
+                logging.info(f"Skipping reply/reaction for message {message.id}; a newer same-user message chain is pending.")
                 return
-            try:
-                await message.add_reaction(reaction)
-                self._mark_bot_involved(message)
-            except discord.HTTPException:
-                logging.warning(
-                    "Failed to add reaction %r (normalized from %r). It might be invalid or unavailable.",
-                    reaction,
-                    decision.get("reaction"),
+
+            action = str(decision.get("action", "none")).lower()
+            logging.info("Reply decision result. message_id=%s action=%s decision=%s", message.id, action, decision)
+            direct_interaction = force_reply or self._is_direct_interaction(message, settings)
+
+            if action in ("reply", "gif") and not direct_interaction and self._ambient_reply_cooldown_active(message):
+                logging.info(
+                    "Skipping ambient %s; the bot already sent an unprompted message here recently. message_id=%s",
+                    action,
+                    message.id,
                 )
-        elif action == "gif":
-            sent = await self._send_gif_decision(message, settings, decision)
-            if not sent and direct_interaction:
-                await self._generate_and_send_reply(
+                return
+
+            if action == "reply":
+                sent = await self._generate_and_send_reply(
                     message,
                     settings,
                     chain_messages=chain_messages,
                     long_typing=long_typing,
                 )
+                if sent and not direct_interaction:
+                    self._record_ambient_reply(message)
+            elif action == "react" and decision.get("reaction"):
+                reaction = self._normalize_reaction_emoji(decision["reaction"], message.guild)
+                if not reaction:
+                    logging.warning("Decision model returned an unusable reaction for message %s: %r", message.id, decision.get("reaction"))
+                    return
+                try:
+                    await message.add_reaction(reaction)
+                    self._mark_bot_involved(message, kind="reaction")
+                    self._mark_chain_handled(message)
+                except discord.HTTPException:
+                    logging.warning(
+                        "Failed to add reaction %r (normalized from %r). It might be invalid or unavailable.",
+                        reaction,
+                        decision.get("reaction"),
+                    )
+            elif action == "gif":
+                sent = await self._send_gif_decision(message, settings, decision)
+                if sent:
+                    if not direct_interaction:
+                        self._record_ambient_reply(message)
+                elif direct_interaction:
+                    await self._generate_and_send_reply(
+                        message,
+                        settings,
+                        chain_messages=chain_messages,
+                        long_typing=long_typing,
+                    )
 
     def _reply_chain_key(self, message: discord.Message) -> tuple:
         return (str(message.guild.id), str(message.channel.id), str(message.author.id))
@@ -395,14 +452,51 @@ class EventHandler(commands.Cog):
             if (now - entry["created_at"]).total_seconds() <= max_age
         ]
 
-    def _mark_bot_involved(self, message: discord.Message):
-        self._last_bot_involvement_by_channel[self._channel_key(message)] = self._utc_now()
+    def _mark_bot_involved(self, message: discord.Message, *, kind: str = "reply"):
+        key = self._channel_key(message)
+        new_record = {"at": self._utc_now(), "kind": kind}
+        # A weak involvement (reaction) must not shorten a still-active stronger window.
+        if self._involvement_expiry(self._last_bot_involvement_by_channel.get(key)) > self._involvement_expiry(new_record):
+            return
+        self._last_bot_involvement_by_channel[key] = new_record
+
+    def _involvement_expiry(self, record) -> datetime:
+        if isinstance(record, datetime):
+            record = {"at": record, "kind": "reply"}
+        if not isinstance(record, dict) or not isinstance(record.get("at"), datetime):
+            return datetime.min.replace(tzinfo=timezone.utc)
+        if record.get("kind") == "reaction":
+            window = self._reaction_involvement_seconds()
+        else:
+            window = self._bot_conversation_idle_seconds()
+        return record["at"] + timedelta(seconds=window)
 
     def _bot_recently_involved(self, message: discord.Message) -> bool:
-        last_involved_at = self._last_bot_involvement_by_channel.get(self._channel_key(message))
-        if not isinstance(last_involved_at, datetime):
+        record = self._last_bot_involvement_by_channel.get(self._channel_key(message))
+        return self._involvement_expiry(record) >= self._utc_now()
+
+    def _mark_chain_handled(self, message: discord.Message):
+        chain = self._processing_reply_chains.get(self._reply_chain_key(message))
+        if chain:
+            chain["handled"] = True
+
+    def _record_ambient_reply(self, message: discord.Message):
+        self._last_ambient_reply_by_channel[self._channel_key(message)] = self._utc_now()
+
+    def _ambient_reply_cooldown_active(self, message: discord.Message) -> bool:
+        last = self._last_ambient_reply_by_channel.get(self._channel_key(message))
+        if not isinstance(last, datetime):
             return False
-        return (self._utc_now() - last_involved_at).total_seconds() <= self._bot_conversation_idle_seconds()
+        return (self._utc_now() - last).total_seconds() <= self._ambient_reply_cooldown_seconds()
+
+    def _ambient_reply_cooldown_seconds(self) -> float:
+        try:
+            return max(0.0, float(getattr(self.bot.config, "AMBIENT_REPLY_COOLDOWN_SECONDS", 90.0)))
+        except (TypeError, ValueError):
+            return 90.0
+
+    def _reaction_involvement_seconds(self) -> float:
+        return 30.0
 
     def _should_skip_uninvolved_conversation(
         self,
@@ -433,7 +527,7 @@ class EventHandler(commands.Cog):
             if (now - entry["created_at"]).total_seconds() <= window_seconds
         ]
         authors = {entry["author_id"] for entry in recent_activity}
-        return len(recent_activity) >= 4 and len(authors) >= 2
+        return len(recent_activity) >= 3 and len(authors) >= 2
 
     def _uninvolved_conversation_window_seconds(self) -> float:
         return 45.0
@@ -484,10 +578,12 @@ class EventHandler(commands.Cog):
         return self._coerce_bool(value, default=True)
 
     def _typing_active_seconds(self) -> float:
+        # Discord clients emit TYPING_START roughly every 9-10s while typing continues,
+        # so anything below ~12s flips to "not typing" between heartbeats.
         try:
-            return max(1.0, float(getattr(self.bot.config, "TYPING_ACTIVE_SECONDS", 8.0)))
+            return max(1.0, float(getattr(self.bot.config, "TYPING_ACTIVE_SECONDS", 12.0)))
         except (TypeError, ValueError):
-            return 8.0
+            return 12.0
 
     def _typing_max_wait_seconds(self, settings: dict) -> float:
         value = settings.get(
@@ -568,6 +664,48 @@ class EventHandler(commands.Cog):
             bypass_on_ping and mentions_bot
         )
 
+    def _reply_anchor_message(self, message: discord.Message, chain_messages: list, settings: dict) -> discord.Message:
+        """Anchor the visible Discord reply to the message that actually addressed the bot.
+
+        For a burst like "@Bot can you help? / with the build / lol", the reply should
+        attach to the mention, not to whatever trailing fragment arrived last.
+        """
+        for chain_message in chain_messages or []:
+            if self._is_direct_interaction(chain_message, settings):
+                return chain_message
+        return message
+
+    def _channel_activity_note(self, message: discord.Message) -> str:
+        now = self._utc_now()
+        channel_key = self._channel_key(message)
+
+        record = self._last_bot_involvement_by_channel.get(channel_key)
+        if isinstance(record, datetime):
+            record = {"at": record}
+        if isinstance(record, dict) and isinstance(record.get("at"), datetime):
+            seconds_since_bot = int((now - record["at"]).total_seconds())
+            bot_part = f"The bot last spoke or reacted in this channel about {seconds_since_bot} seconds ago."
+        else:
+            bot_part = "The bot has not spoken in this channel recently."
+
+        window_seconds = self._uninvolved_conversation_window_seconds()
+        recent_activity = [
+            entry
+            for entry in self._recent_human_activity_by_channel.get(channel_key, [])
+            if (now - entry["created_at"]).total_seconds() <= window_seconds
+        ]
+        authors = {entry["author_id"] for entry in recent_activity}
+        activity_part = (
+            f"In the last {int(window_seconds)} seconds there were {len(recent_activity)} human message(s) "
+            f"from {len(authors)} user(s)."
+        )
+
+        return (
+            f"Channel activity note: {bot_part} {activity_part} "
+            "If replying would mean barging into an exchange between other people, or the bot has been "
+            "talking a lot already, prefer \"none\". A real user does not comment on everything."
+        )
+
     def _has_pending_newer_chain(self, message: discord.Message) -> bool:
         chain = self._pending_reply_chains.get(self._reply_chain_key(message))
         latest_message = chain.get("latest_message") if chain else None
@@ -633,6 +771,7 @@ class EventHandler(commands.Cog):
             "content_chars": len(content or ""),
         }
         self._mark_bot_involved(origin_message)
+        self._mark_chain_handled(origin_message)
 
     async def _decide_message_action(
         self,
@@ -699,6 +838,9 @@ class EventHandler(commands.Cog):
         )
         
         decision_context[0]["content"] = decision_prompt
+        activity_note = self._channel_activity_note(message)
+        if activity_note:
+            decision_context.append({"role": "system", "content": activity_note})
 
         response = await self.bot.llm_provider.create_completion(
             model=decision_model,
@@ -720,7 +862,9 @@ class EventHandler(commands.Cog):
                 main_context, _ = await self.bot.context_manager.build_context(message, model_name=self.bot.config.MAIN_LLM_MODEL)
                 main_context = self._with_message_chain_context(main_context, chain_messages, long_typing=long_typing)
                 main_context[0]["content"] = decision_prompt
-                
+                if activity_note:
+                    main_context.append({"role": "system", "content": activity_note})
+
                 response = await self.bot.llm_provider.create_completion(
                     model=self.bot.config.MAIN_LLM_MODEL,
                     messages=main_context,
@@ -770,11 +914,15 @@ class EventHandler(commands.Cog):
     def _decision_prompt(self, *, gifs_available: bool, direct_interaction: bool) -> str:
         if gifs_available:
             gif_guidance = f"""
-        The bot may send a GIPHY GIF only when a visual reaction is clearly better than text, funny or expressive, logical for the current context, and low-risk.
+        The bot may send a GIPHY GIF, but only occasionally — a real user drops a GIF at the perfect moment, not constantly.
+        The best GIF moments are perfectly timed comebacks: someone teases, dunks on, or tries to ragebait the bot; a running joke peaks; or a sarcastic/deadpan reaction (like an "oh no... anyway" GIF after being insulted) lands better than any words could. Playful sass and light trolling through GIFs are encouraged when the chat is clearly joking around.
+        Choose "gif" when the comedic timing genuinely lands and a visual reaction beats a short text reply or emoji. If the moment is mediocre and text or an emoji works just as well, skip the GIF and save it for a moment that hits.
         Use only GIPHY by returning the final GIPHY search query to run.
         Prefer a famous, broadly recognizable meme/reaction when one genuinely fits.
-        Optimize for how GIPHY search is indexed: use a known meme name, recognizable reaction phrase, emotion, or scene description. Do not return the user's whole sentence.
+        Optimize for how GIPHY search is indexed: use a known meme name, recognizable reaction phrase, emotion, or scene description. Do not return the user's whole sentence, and do not use niche in-joke phrasing that GIPHY will not have indexed.
         Do not send GIFs for serious, sensitive, sad, medical, legal, financial, political, sexual, violent, hateful, self-harm, or moderation-related contexts.
+        Obvious jokes and banter aimed at the bot itself (like "kill it", "lobotomize it", or mock outrage) are NOT sensitive contexts — they are prime comeback material.
+        Do not send a GIF if one of the bot's last few messages in this channel was already a GIF.
         If a long-typing note is present, you may choose a light joke or a typing/waiting GIF if it fits.
         GIF query rules: 2 to 6 words, max 50 characters, no usernames, no Discord mentions, no private details, no URLs.
         GIF messages are URL-only. Do not add captions or explanatory text.
@@ -950,8 +1098,8 @@ class EventHandler(commands.Cog):
             logging.info(f"Summary update already running for channel {channel_id}; skipping duplicate trigger.")
             return
 
-        self._summary_tasks.add(key)
         task = asyncio.create_task(self.bot.context_manager.update_channel_summary(guild_id, channel_id))
+        self._summary_tasks[key] = task
         task.add_done_callback(lambda done_task, task_key=key: self._finish_background_task(done_task, self._summary_tasks, task_key, "summary"))
 
     def _schedule_profile_update(self, guild_id: str, user_id: str, guild: discord.Guild):
@@ -960,12 +1108,12 @@ class EventHandler(commands.Cog):
             logging.info(f"Profile update already running for user {user_id}; skipping duplicate trigger.")
             return
 
-        self._profile_tasks.add(key)
         task = asyncio.create_task(self.bot.context_manager.update_user_profile(guild_id, user_id, guild))
+        self._profile_tasks[key] = task
         task.add_done_callback(lambda done_task, task_key=key: self._finish_background_task(done_task, self._profile_tasks, task_key, "profile"))
 
-    def _finish_background_task(self, task: asyncio.Task, task_set: set, key: tuple, label: str):
-        task_set.discard(key)
+    def _finish_background_task(self, task: asyncio.Task, task_map: dict, key: tuple, label: str):
+        task_map.pop(key, None)
         try:
             task.result()
         except asyncio.CancelledError:
@@ -1034,7 +1182,7 @@ class EventHandler(commands.Cog):
             sent_messages = await MessageChunker.send_chunked_message(
                 target=message.channel,
                 content=content,
-                reply_to=message,
+                reply_to=self._reply_anchor_message(message, chain_messages, settings),
                 allowed_mentions=safe_mentions,
             )
             self._record_generated_reply(message, chain_messages, sent_messages, content)
@@ -1052,12 +1200,13 @@ class EventHandler(commands.Cog):
     async def _send_generation_error(self, message: discord.Message, error: Exception = None):
         if error:
             error_text = f"{type(error).__name__}: {error}"
+            error_text = error_text.splitlines()[0] if error_text else "Unknown error"
         else:
-            error_text = self.bot.llm_provider.get_last_error_message()
+            error_text = self.bot.llm_provider.get_last_error_summary()
 
-        error_text = self._safe_error_text(error_text)
+        error_text = self._safe_error_text(error_text, max_length=300)
         await message.reply(
-            f"Sorry, I couldn't generate a reply.\n```text\n{error_text}\n```",
+            f"Sorry, I couldn't generate a reply right now — try again in a moment.\n-# {error_text}",
             allowed_mentions=discord.AllowedMentions(users=False, roles=False, everyone=False, replied_user=False),
         )
 
@@ -1090,6 +1239,7 @@ class EventHandler(commands.Cog):
                 allowed_mentions=discord.AllowedMentions(users=False, roles=False, everyone=False, replied_user=False),
             )
             self._mark_bot_involved(message)
+            self._mark_chain_handled(message)
             logging.info(
                 "GIPHY GIF sent. message_id=%s gif_id=%s title=%r query=%r",
                 message.id,

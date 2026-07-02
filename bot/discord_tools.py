@@ -1,5 +1,6 @@
 import json
 import logging
+import random
 import re
 import socket
 import asyncio
@@ -851,7 +852,7 @@ class DiscordToolManager:
             return {"ok": False, "tool": "search_giphy_gif", "error": "A safe GIPHY search query is required."}
 
         analyze = self._giphy_analysis_enabled()
-        candidate_limit = self._giphy_analysis_max_candidates() if analyze else 1
+        candidate_limit = self._giphy_analysis_max_candidates() if analyze else self._giphy_candidate_pool()
         candidates = await giphy_client.search_gifs(query, limit=candidate_limit, user_key=str(origin_message.author.id))
         if not candidates:
             return {
@@ -861,23 +862,31 @@ class DiscordToolManager:
                 "error": "No GIPHY result found.",
             }
 
-        gif = candidates[0]
         verification = None
         if analyze:
-            gif = None
-            for candidate in candidates[:candidate_limit]:
-                verification = await self._verify_giphy_candidate(origin_message, query, candidate, settings)
-                logging.info(
-                    "GIPHY visual verification result. message_id=%s query=%r gif_id=%s accepted=%s reason=%r",
-                    origin_message.id,
-                    query,
-                    candidate.id,
-                    verification.get("accepted"),
-                    verification.get("reason"),
-                )
-                if verification.get("accepted"):
-                    gif = candidate
-                    break
+            gif, verification = await self._select_verified_giphy_candidate(
+                origin_message, query, candidates[:candidate_limit], settings
+            )
+
+            if not gif:
+                # One retry with the verifier's suggested refined query, if it offered one.
+                refined_query = self._sanitize_giphy_query((verification or {}).get("refined_query") or "")
+                if refined_query and refined_query.lower() != query.lower():
+                    logging.info(
+                        "Retrying GIPHY search with refined query. message_id=%s original=%r refined=%r",
+                        origin_message.id,
+                        query,
+                        refined_query,
+                    )
+                    refined_candidates = await giphy_client.search_gifs(
+                        refined_query, limit=candidate_limit, user_key=str(origin_message.author.id)
+                    )
+                    if refined_candidates:
+                        gif, verification = await self._select_verified_giphy_candidate(
+                            origin_message, refined_query, refined_candidates[:candidate_limit], settings
+                        )
+                        if gif:
+                            query = refined_query
 
             if not gif:
                 return {
@@ -887,6 +896,10 @@ class DiscordToolManager:
                     "error": f"No visually suitable GIPHY result found after checking {min(len(candidates), candidate_limit)} candidate(s).",
                     "last_verification": verification,
                 }
+        else:
+            # GIPHY orders by relevance; picking among the top few keeps results
+            # on-topic while avoiding always sending the exact same GIF.
+            gif = random.choice(candidates[: self._giphy_pick_top_n()])
 
         await giphy_client.register_sent(gif, user_key=str(origin_message.author.id))
         logging.info(
@@ -912,6 +925,28 @@ class DiscordToolManager:
             "verification": verification,
         }
 
+    async def _select_verified_giphy_candidate(
+        self,
+        origin_message: discord.Message,
+        query: str,
+        candidates: List[Any],
+        settings: dict,
+    ) -> Tuple[Any, Optional[Dict[str, Any]]]:
+        verification = None
+        for candidate in candidates:
+            verification = await self._verify_giphy_candidate(origin_message, query, candidate, settings)
+            logging.info(
+                "GIPHY visual verification result. message_id=%s query=%r gif_id=%s accepted=%s reason=%r",
+                origin_message.id,
+                query,
+                candidate.id,
+                verification.get("accepted"),
+                verification.get("reason"),
+            )
+            if verification.get("accepted"):
+                return candidate, verification
+        return None, verification
+
     async def _verify_giphy_candidate(
         self,
         origin_message: discord.Message,
@@ -930,7 +965,11 @@ class DiscordToolManager:
             return {"accepted": False, "reason": "No verifier model is configured."}
 
         media_settings = (settings or {}).get("media", {})
-        media_url = getattr(gif, "media_url", "") or getattr(gif, "url", "")
+        media_url = getattr(gif, "media_url", "")
+        if not media_url:
+            # Without a direct media rendition the "GIF" would be the giphy.com page HTML;
+            # downloading and vision-checking that is a wasted LLM call.
+            return {"accepted": False, "reason": "Candidate has no direct media rendition URL."}
         attachment = _URLAttachment(
             url=media_url,
             filename=f"giphy_{getattr(gif, 'id', 'candidate')}.gif",
@@ -1033,6 +1072,22 @@ class DiscordToolManager:
             default=3,
             minimum=1,
             maximum=10,
+        )
+
+    def _giphy_candidate_pool(self) -> int:
+        return self._clamp_int(
+            getattr(self.bot.config, "GIPHY_CANDIDATE_POOL", 5),
+            default=5,
+            minimum=1,
+            maximum=25,
+        )
+
+    def _giphy_pick_top_n(self) -> int:
+        return self._clamp_int(
+            getattr(self.bot.config, "GIPHY_PICK_TOP_N", 3),
+            default=3,
+            minimum=1,
+            maximum=self._giphy_candidate_pool(),
         )
 
     async def fetch_web_page(self, url: str, max_chars: Optional[int] = None) -> Dict[str, Any]:

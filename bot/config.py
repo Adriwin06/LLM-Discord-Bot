@@ -3,6 +3,10 @@ import os
 from dotenv import load_dotenv
 
 class Config:
+    @staticmethod
+    def _parse_model_list(raw: str) -> list:
+        return [item.strip() for item in (raw or "").split(",") if item.strip()]
+
     def __init__(self):
         load_dotenv()
 
@@ -15,6 +19,9 @@ class Config:
         self.MAIN_LLM_MODEL = os.getenv("MAIN_LLM_MODEL", "gemini/gemini-2.5-flash")
         self.DECISION_LLM_MODEL = os.getenv("DECISION_LLM_MODEL", "gemini/gemini-2.5-flash-lite")
         self.DECISION_LLM_ENABLED = os.getenv("DECISION_LLM_ENABLED", "True").lower() == "true"
+        # Comma-separated model lists tried in order when the primary model fails (rate limits, outages, etc.)
+        self.MAIN_LLM_FALLBACK_MODELS = self._parse_model_list(os.getenv("MAIN_LLM_FALLBACK_MODELS", ""))
+        self.DECISION_LLM_FALLBACK_MODELS = self._parse_model_list(os.getenv("DECISION_LLM_FALLBACK_MODELS", ""))
 
         # Prompt Configuration
         behavior_prompt_path = os.path.join(os.path.dirname(__file__), "../prompts/BEHAVIOR_PROMPT.md")
@@ -35,7 +42,8 @@ class Config:
         self.REPLY_CHAIN_WAIT_FOR_TYPING = os.getenv("REPLY_CHAIN_WAIT_FOR_TYPING", "True").lower() == "true"
         self.REPLY_CHAIN_TYPING_MAX_WAIT_SECONDS = float(os.getenv("REPLY_CHAIN_TYPING_MAX_WAIT_SECONDS", 12.0))
         self.REPLY_CHAIN_LONG_TYPING_SECONDS = float(os.getenv("REPLY_CHAIN_LONG_TYPING_SECONDS", 10.0))
-        self.TYPING_ACTIVE_SECONDS = float(os.getenv("TYPING_ACTIVE_SECONDS", 8.0))
+        self.TYPING_ACTIVE_SECONDS = float(os.getenv("TYPING_ACTIVE_SECONDS", 12.0))
+        self.AMBIENT_REPLY_COOLDOWN_SECONDS = float(os.getenv("AMBIENT_REPLY_COOLDOWN_SECONDS", 90.0))
         self.GIFS_ENABLED = os.getenv("GIFS_ENABLED", "True").lower() == "true"
         self.GIPHY_API_KEY = os.getenv("GIPHY_API_KEY", "")
         self.GIPHY_RATING = os.getenv("GIPHY_RATING", "pg-13")
@@ -44,6 +52,8 @@ class Config:
         self.GIPHY_ANALYZE_BEFORE_SEND = os.getenv("GIPHY_ANALYZE_BEFORE_SEND", "False").lower() == "true"
         self.GIPHY_ANALYSIS_MAX_CANDIDATES = int(os.getenv("GIPHY_ANALYSIS_MAX_CANDIDATES", 3))
         self.GIPHY_ANALYSIS_MODEL = os.getenv("GIPHY_ANALYSIS_MODEL", "")
+        self.GIPHY_CANDIDATE_POOL = int(os.getenv("GIPHY_CANDIDATE_POOL", 5))
+        self.GIPHY_PICK_TOP_N = int(os.getenv("GIPHY_PICK_TOP_N", 3))
 
         # Web Search Configuration
         self.WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "True").lower() == "true"

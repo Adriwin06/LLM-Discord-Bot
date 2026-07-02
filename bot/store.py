@@ -47,8 +47,17 @@ class Store:
                 if not content.strip():
                     return {}
                 return json.loads(content)
-        except (FileNotFoundError, json.JSONDecodeError) as e:
-            logging.warning(f"Error reading JSON file {path}: {e}. Returning empty dict.")
+        except FileNotFoundError:
+            return {}
+        except json.JSONDecodeError as e:
+            # Quarantine the corrupt file so a follow-up save cannot silently replace
+            # all stored settings/summaries/profiles with an empty object.
+            quarantine_path = f"{path}.corrupt-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+            try:
+                os.replace(path, quarantine_path)
+                logging.error(f"JSON file {path} is corrupt ({e}). Moved to {quarantine_path}; starting fresh.")
+            except OSError as move_error:
+                logging.error(f"JSON file {path} is corrupt ({e}) and could not be quarantined: {move_error}")
             return {}
         except Exception as e:
             logging.error(f"Unexpected error reading JSON file {path}: {e}")

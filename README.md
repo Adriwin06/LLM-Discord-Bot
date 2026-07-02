@@ -355,6 +355,8 @@ See `.env.example` for the complete template. The code reads these variables in 
 | `MAIN_LLM_MODEL` | `gemini/gemini-2.5-flash` | Model used for final replies and LLM command output. |
 | `DECISION_LLM_MODEL` | `gemini/gemini-2.5-flash-lite` | Model used for reply/react/gif/none decisions. |
 | `DECISION_LLM_ENABLED` | `True` | Enables ambient decisions. If false, only mentions/replies trigger normal replies. |
+| `MAIN_LLM_FALLBACK_MODELS` | empty | Comma-separated models tried in order when the main (or per-guild override) model fails, e.g. rate limits. |
+| `DECISION_LLM_FALLBACK_MODELS` | empty | Comma-separated fallback chain for the decision model. |
 | `MAIN_LLM_RATE_LIMIT_ENABLED` | `False` | Enables main model request pacing. |
 | `MAIN_LLM_RATE_LIMIT_SECONDS` | `2` | Minimum spacing for main model calls. |
 | `DECISION_LLM_RATE_LIMIT_ENABLED` | `False` | Enables decision model request pacing. |
@@ -373,7 +375,8 @@ For Ollama models, use LiteLLM model names such as `ollama/model-name` or `ollam
 | `REPLY_CHAIN_WAIT_FOR_TYPING` | `True` | Wait while the user appears to still be typing. |
 | `REPLY_CHAIN_TYPING_MAX_WAIT_SECONDS` | `12.0` | Maximum typing wait. |
 | `REPLY_CHAIN_LONG_TYPING_SECONDS` | `10.0` | Threshold for long-typing decision context. |
-| `TYPING_ACTIVE_SECONDS` | `8.0` | How long a Discord typing event is treated as active. |
+| `TYPING_ACTIVE_SECONDS` | `12.0` | How long a Discord typing event is treated as active (clients pulse every ~9-10s). |
+| `AMBIENT_REPLY_COOLDOWN_SECONDS` | `90` | Minimum gap between unprompted (non-mention) bot replies/GIFs per channel. |
 | `GIFS_ENABLED` | `True` | Allows GIPHY GIF responses when `GIPHY_API_KEY` is configured. |
 | `GIPHY_API_KEY` | none | GIPHY REST API key used for GIF search. Use the GIPHY API option when creating the key. |
 | `GIPHY_RATING` | `pg-13` | GIPHY content rating filter: `g`, `pg`, `pg-13`, or `r`. |
@@ -382,6 +385,8 @@ For Ollama models, use LiteLLM model names such as `ollama/model-name` or `ollam
 | `GIPHY_ANALYZE_BEFORE_SEND` | `False` | If true, candidate GIFs are processed into frames/OCR and checked by an LLM before sending. |
 | `GIPHY_ANALYSIS_MAX_CANDIDATES` | `3` | Maximum GIPHY candidates to inspect before giving up. |
 | `GIPHY_ANALYSIS_MODEL` | empty | Optional verifier model override. Empty uses the effective main reply model. |
+| `GIPHY_CANDIDATE_POOL` | `5` | Candidates fetched per search when analysis is off. |
+| `GIPHY_PICK_TOP_N` | `3` | The GIF is picked randomly among the top N relevance-ranked candidates for variety. |
 
 GIF replies use GIPHY Search dynamically. The decision model can return a short `gif_query` for ambient GIF responses, and the main reply model can call `search_giphy_gif` during direct replies. The model that requests the GIF is responsible for passing a concise, optimized GIPHY search query. The bot sends only the canonical GIPHY URL, with no caption, and falls back to text for direct interactions if no GIF can be found.
 
