@@ -309,8 +309,21 @@ class ContextManager:
         capabilities_prompt = capabilities_override or self.config.CAPABILITIES_PROMPT
         behavior_prompt = behavior_override or settings.get("behavior_prompt", self.config.BEHAVIOR_PROMPT)
         system_prompt = f"{capabilities_prompt}\n\n{behavior_prompt}"
-        
+
         messages = [{"role": "system", "content": system_prompt}]
+
+        # Developer override: when a trusted developer/operator authored the current message,
+        # inject a high-priority instruction so the bot obeys operational commands/meta questions
+        # directly instead of deflecting in-character. The prompt is conditional: the bot stays in
+        # character for casual chat and only breaks persona for actual requests. Keyed on Discord
+        # user ID, which cannot be spoofed.
+        if self._is_developer_message(message):
+            messages.append({"role": "system", "content": self.config.DEVELOPER_PROMPT})
+            logging.info(
+                "Developer override applied. message_id=%s author_id=%s",
+                getattr(message, "id", None),
+                user_id,
+            )
 
         # Add bot identity info as a system message
         if include_bot_identity and self.bot and self.bot.user:
@@ -534,6 +547,22 @@ class ContextManager:
         }
         logging.debug("Loaded server emojis for context. guild_id=%s emoji_count=%s", guild_id, len(emojis))
         return emojis
+
+    def _is_developer_message(self, message: discord.Message) -> bool:
+        """Return True when the message author is a configured, trusted developer/operator."""
+        if not getattr(self.config, "DEVELOPER_OVERRIDE_ENABLED", False):
+            return False
+        developer_ids = getattr(self.config, "DEVELOPER_USER_IDS", None)
+        if not developer_ids:
+            return False
+        author = getattr(message, "author", None)
+        author_id = getattr(author, "id", None)
+        if author_id is None:
+            return False
+        # Never let a bot (including this one) trigger the developer override.
+        if getattr(author, "bot", False):
+            return False
+        return str(author_id) in developer_ids
 
     def _message_channel_mention_ids(self, message: discord.Message) -> set:
         return {

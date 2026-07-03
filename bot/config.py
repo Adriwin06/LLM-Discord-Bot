@@ -1,6 +1,7 @@
 # c:/Users/adri1/Documents/GitHub/LLM-Discord-Bot/bot/config.py
 import logging
 import os
+import re
 from dotenv import load_dotenv
 
 class Config:
@@ -16,6 +17,20 @@ class Config:
                     f"{'gemini' if 'gemini' in model.lower() else 'mistral' if 'mistral' in model.lower() else 'anthropic' if 'claude' in model.lower() else 'ollama'}/{model}",
                 )
         return models
+
+    @staticmethod
+    def _parse_id_list(raw: str) -> set:
+        """Parse a comma/space-separated list of Discord IDs into a set of strings."""
+        ids = set()
+        for item in re.split(r"[\s,]+", raw or ""):
+            item = item.strip()
+            if not item:
+                continue
+            if item.isdigit():
+                ids.add(item)
+            else:
+                logging.warning("Ignoring non-numeric Discord ID in ID list: %r", item)
+        return ids
 
     def __init__(self):
         load_dotenv()
@@ -41,6 +56,17 @@ class Config:
         capabilities_prompt_path = os.path.join(os.path.dirname(__file__), "../prompts/CAPABILITIES_PROMPT.md")
         with open(capabilities_prompt_path, "r", encoding="utf-8") as f:
             self.CAPABILITIES_PROMPT = f.read().strip()
+
+        developer_prompt_path = os.path.join(os.path.dirname(__file__), "../prompts/DEVELOPER_PROMPT.md")
+        with open(developer_prompt_path, "r", encoding="utf-8") as f:
+            self.DEVELOPER_PROMPT = f.read().strip()
+
+        # Developer Override Configuration
+        # Comma/space-separated Discord user IDs treated as trusted developers/operators.
+        # When one of them sends a message, a high-priority override is injected so the bot
+        # obeys them directly instead of deflecting in-character.
+        self.DEVELOPER_USER_IDS = self._parse_id_list(os.getenv("DEVELOPER_USER_IDS", ""))
+        self.DEVELOPER_OVERRIDE_ENABLED = os.getenv("DEVELOPER_OVERRIDE_ENABLED", "True").lower() == "true"
 
         # Rate Limiting
         self.MAIN_LLM_RATE_LIMIT_ENABLED = os.getenv("MAIN_LLM_RATE_LIMIT_ENABLED", "False").lower() == "true"
