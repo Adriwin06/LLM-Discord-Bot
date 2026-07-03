@@ -6,6 +6,7 @@ import logging
 import json
 import re
 import asyncio
+from contextlib import nullcontext
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from .utilities import MessageChunker
@@ -357,10 +358,15 @@ class EventHandler(commands.Cog):
             len(chain_messages),
             long_typing,
         )
+        # For direct interactions, show typing from the very start: with fallback model
+        # chains the decision phase alone can take several seconds of visible silence.
+        direct_interaction = force_reply or self._is_direct_interaction(message, settings)
+        typing_context = message.channel.typing() if direct_interaction else nullcontext()
+
         # Serialize decisions per channel so simultaneous bursts from different users
         # cannot produce two overlapping bot replies for the same moment.
         channel_lock = self._channel_reply_locks.setdefault(self._channel_key(message), asyncio.Lock())
-        async with channel_lock:
+        async with typing_context, channel_lock:
             decision = await self._decide_message_action(
                 message,
                 settings,
@@ -375,7 +381,6 @@ class EventHandler(commands.Cog):
 
             action = str(decision.get("action", "none")).lower()
             logging.info("Reply decision result. message_id=%s action=%s decision=%s", message.id, action, decision)
-            direct_interaction = force_reply or self._is_direct_interaction(message, settings)
 
             if action in ("reply", "gif") and not direct_interaction and self._ambient_reply_cooldown_active(message):
                 logging.info(

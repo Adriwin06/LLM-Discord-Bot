@@ -1,11 +1,21 @@
 # c:/Users/adri1/Documents/GitHub/LLM-Discord-Bot/bot/config.py
+import logging
 import os
 from dotenv import load_dotenv
 
 class Config:
     @staticmethod
     def _parse_model_list(raw: str) -> list:
-        return [item.strip() for item in (raw or "").split(",") if item.strip()]
+        models = [item.strip() for item in (raw or "").split(",") if item.strip()]
+        for model in models:
+            if "/" not in model and any(hint in model.lower() for hint in ("gemini", "mistral", "claude", "llama")):
+                logging.warning(
+                    "Configured model %r has no provider prefix; LiteLLM may route it to the wrong "
+                    "backend (e.g. bare gemini-* goes to Vertex AI, not AI Studio). Did you mean %r?",
+                    model,
+                    f"{'gemini' if 'gemini' in model.lower() else 'mistral' if 'mistral' in model.lower() else 'anthropic' if 'claude' in model.lower() else 'ollama'}/{model}",
+                )
+        return models
 
     def __init__(self):
         load_dotenv()
