@@ -106,6 +106,32 @@ python main.py
 
 On Windows PowerShell you can also run `.\run_bot.ps1`, which uses the repo's `venv` explicitly.
 
+## Run with Docker
+
+`Dockerfile` and `compose.yaml` run the bot with `ffmpeg`, `ffprobe` and Tesseract already installed. The image holds no secrets or state: `.env`, `data/`, `logs/`, `.backup/` and `prompts/` are mounted from the checkout, so the bot keeps its memory across rebuilds and prompt edits apply on the next restart.
+
+```bash
+cp .env.example .env              # then set DISCORD_TOKEN and a model provider key
+mkdir -p data logs .backup        # create them first so they belong to you, not root
+docker compose up -d --build
+docker compose logs -f bot
+```
+
+The container runs as uid/gid 1000. If the account that owns the checkout has other ids, set `BOT_UID` and `BOT_GID` (from `id -u` and `id -g`) before building. `requirements.lock` pins the package versions the image installs; to upgrade a package, remove its line, rebuild, then refresh the file with `docker compose run --rm --no-deps bot pip freeze > requirements.lock`.
+
+### Run as a service
+
+On a Linux server, `deploy/llm-discord-bot.service` starts the Compose project at boot and stops it cleanly on shutdown:
+
+```bash
+sudo cp deploy/llm-discord-bot.service /etc/systemd/system/
+sudo nano /etc/systemd/system/llm-discord-bot.service   # set WorkingDirectory to your checkout
+sudo systemctl daemon-reload
+sudo systemctl enable --now llm-discord-bot
+```
+
+After a `git pull`, `sudo systemctl reload llm-discord-bot` rebuilds the image and restarts the bot if anything changed. `docker compose logs -f bot` shows the console log; the full debug log is still written to `logs/bot.log`.
+
 ## Runtime Flow
 
 For every human server message, `bot/cogs/event_handler.py` performs this flow:

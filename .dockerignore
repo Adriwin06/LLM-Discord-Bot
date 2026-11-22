@@ -1,0 +1,21 @@
+# Secrets, runtime state and local environments stay out of the image. compose.yaml mounts
+# .env, data/, logs/, .backup/ and prompts/ when the container runs.
+.git
+.github
+.vscode
+.env
+.env.*
+venv
+venv.*
+.venv
+__pycache__
+**/__pycache__
+*.py[cod]
+.cache
+data
+logs
+.backup
+*.log
+deploy
+run_bot.ps1
+run_bot.sh

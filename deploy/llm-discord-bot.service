@@ -1,0 +1,23 @@
+# Keeps the bot's Docker Compose project running under systemd: it starts at boot and stops
+# cleanly on shutdown. Install (adjust WorkingDirectory to your checkout first):
+#   sudo cp deploy/llm-discord-bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now llm-discord-bot
+# After a git pull, `sudo systemctl reload llm-discord-bot` rebuilds and restarts if needed.
+[Unit]
+Description=LLM Discord Bot (Docker)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/home/adriwin/LLM-Discord-Bot
+ExecStart=/usr/bin/docker compose up --detach --remove-orphans
+ExecReload=/usr/bin/docker compose up --detach --build --remove-orphans
+ExecStop=/usr/bin/docker compose stop
+# The first start may build the image.
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target

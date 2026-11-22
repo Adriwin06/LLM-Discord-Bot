@@ -1,0 +1,44 @@
+# LLM Discord Bot in Docker. On a server, deploy/llm-discord-bot.service runs this project
+# under systemd so it starts at boot; see "Run with Docker" in the README.
+name: llm-discord-bot
+
+services:
+  bot:
+    build:
+      context: .
+      args:
+        # The account that owns data/, logs/ and .backup/ (id -u / id -g).
+        APP_UID: ${BOT_UID:-1000}
+        APP_GID: ${BOT_GID:-1000}
+    image: llm-discord-bot:local
+    container_name: llm-discord-bot
+    restart: unless-stopped
+    init: true
+    # main.py shuts down cleanly on Ctrl+C; SIGTERM would skip its cleanup.
+    stop_signal: SIGINT
+    stop_grace_period: 30s
+    volumes:
+      # Mounted rather than baked in: the image holds no secrets, the bot's memory survives
+      # rebuilds, and prompt edits apply on the next restart.
+      - type: bind
+        source: ./.env
+        target: /app/.env
+        read_only: true
+        bind:
+          create_host_path: false
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./.backup:/app/.backup
+      - ./prompts:/app/prompts:ro
+      # faster-whisper downloads its speech-to-text model here on first use.
+      - model-cache:/home/bot/.cache
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  model-cache:
