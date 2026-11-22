@@ -2,7 +2,8 @@
 # cleanly on shutdown. Install (adjust WorkingDirectory to your checkout first):
 #   sudo cp deploy/llm-discord-bot.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now llm-discord-bot
-# After a git pull, `sudo systemctl reload llm-discord-bot` rebuilds and restarts if needed.
+# The container runs the checkout's code, so after a git pull /restart is enough; when
+# requirements.txt changed, `sudo systemctl reload llm-discord-bot` rebuilds the image first.
 [Unit]
 Description=LLM Discord Bot (Docker)
 Requires=docker.service

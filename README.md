@@ -108,7 +108,7 @@ On Windows PowerShell you can also run `.\run_bot.ps1`, which uses the repo's `v
 
 ## Run with Docker
 
-`Dockerfile` and `compose.yaml` run the bot with `ffmpeg`, `ffprobe` and Tesseract already installed. The image holds no secrets or state: `.env`, `data/`, `logs/`, `.backup/` and `prompts/` are mounted from the checkout, so the bot keeps its memory across rebuilds and prompt edits apply on the next restart.
+`Dockerfile` and `compose.yaml` run the bot with `ffmpeg`, `ffprobe` and Tesseract already installed. The image holds the Python environment; the container runs the code from your checkout, mounted read-only, with `data/`, `logs/` and `.backup/` writable. So `/restart` picks up code, prompt and `.env` changes just like a bot run from a virtualenv, and the bot keeps its memory across rebuilds. Rebuild only when `requirements.txt` changes.
 
 ```bash
 cp .env.example .env              # then set DISCORD_TOKEN and a model provider key
@@ -130,7 +130,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now llm-discord-bot
 ```
 
-After a `git pull`, `sudo systemctl reload llm-discord-bot` rebuilds the image and restarts the bot if anything changed. `docker compose logs -f bot` shows the console log; the full debug log is still written to `logs/bot.log`.
+After a `git pull`, `/restart` (or `sudo systemctl restart llm-discord-bot`) runs the new code. If `requirements.txt` changed, `sudo systemctl reload llm-discord-bot` rebuilds the image first. `docker compose logs -f bot` shows the console log; the full debug log is still written to `logs/bot.log`.
 
 ## Runtime Flow
 

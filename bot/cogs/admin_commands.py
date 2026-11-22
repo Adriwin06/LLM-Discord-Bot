@@ -1272,12 +1272,18 @@ class AdminCommands(commands.Cog):
 
             restart_args = [python_executable, script_path, *sys.argv[1:]]
             logging.info("Restarting bot using executable=%s entrypoint=%s", python_executable, script_path)
-            
+
+            # Start the new process with the environment the bot was launched with (main.py
+            # keeps it), so it reads .env again. Inheriting os.environ would carry the old .env
+            # values over, and load_dotenv() does not override variables that are already set.
+            launch_environment = getattr(sys.modules.get("__main__"), "LAUNCH_ENVIRONMENT", None)
+            restart_environment = dict(launch_environment) if launch_environment is not None else dict(os.environ)
+
             # Close the current bot instance
             logging.info("Shutting down current bot instance...")
             await self.bot.close()
             # Restart args are built from the validated current executable and entrypoint.
-            os.execv(python_executable, restart_args)  # nosec B606
+            os.execve(python_executable, restart_args, restart_environment)  # nosec B606
             
         except Exception as e:
             logging.error(f"Error during restart: {e}")

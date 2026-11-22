@@ -18,18 +18,17 @@ services:
     stop_signal: SIGINT
     stop_grace_period: 30s
     volumes:
-      # Mounted rather than baked in: the image holds no secrets, the bot's memory survives
-      # rebuilds, and prompt edits apply on the next restart.
+      # The checkout itself, read-only, over the image's copy of the code: /restart re-runs
+      # main.py and picks up code, prompt and .env changes from here, as it did before Docker.
+      # Rebuild only when requirements change.
       - type: bind
-        source: ./.env
-        target: /app/.env
+        source: .
+        target: /app
         read_only: true
-        bind:
-          create_host_path: false
+      # The bot's state, writable, so its memory survives rebuilds.
       - ./data:/app/data
       - ./logs:/app/logs
       - ./.backup:/app/.backup
-      - ./prompts:/app/prompts:ro
       # faster-whisper downloads its speech-to-text model here on first use.
       - model-cache:/home/bot/.cache
     cap_drop: [ALL]

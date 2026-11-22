@@ -9,6 +9,11 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from dotenv import load_dotenv
 
+# The environment the bot was launched with, before .env is applied. /restart starts the new
+# process with it, so .env is read afresh: load_dotenv() never overrides a variable that is
+# already set, and os.environ by then holds the previous .env values.
+LAUNCH_ENVIRONMENT = dict(os.environ)
+
 load_dotenv()
 
 
